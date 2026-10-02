@@ -111,8 +111,9 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         local_port: int,
+        transport: TransportConfig | None = None,
     ) -> Tunnel:
-        transport = target.transport
+        transport = transport or target.transport
         if transport.kind == "direct":
             if not await probe(transport.remote_host, transport.remote_port):
                 raise TunnelError(
@@ -123,6 +124,8 @@ class TunnelManager:
         argv = ["ssh"]
         if self.ssh.config:
             argv += ["-F", self.ssh.config]
+        if transport.proxy_jump:
+            argv += ["-J", transport.proxy_jump]
         argv += [
             "-N",
             "-o", "BatchMode=yes",
@@ -155,18 +158,23 @@ class TunnelManager:
         self,
         target: TargetConfig,
         on_route: callable | None = None,
+        transport: TransportConfig | None = None,
     ) -> Tunnel:
-        """Try each configured route in order; return the first working tunnel."""
+        """Try each configured route in order; return the first working tunnel.
 
-        transport = target.transport
+        ``transport`` overrides the target's static transport, which the gateway
+        uses to inject an endpoint discovered by a provisioning command.
+        """
+
+        transport = transport or target.transport
         if transport.kind == "direct":
-            return await self.open_for_route(target, "direct", transport.remote_port)
+            return await self.open_for_route(target, "direct", transport.remote_port, transport)
 
         last_error: Exception | None = None
         for route in transport.ssh_targets:
             local_port = allocate_loopback_port(self.ssh, self._reserved)
             try:
-                tunnel = await self.open_for_route(target, route, local_port)
+                tunnel = await self.open_for_route(target, route, local_port, transport)
                 log.info("target %s connected via route %s on 127.0.0.1:%d",
                          target.name, route, local_port)
                 return tunnel

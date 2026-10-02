@@ -341,6 +341,79 @@ targets = ["hal", "fwk394"]
   {'name': 'hal', 'state': 'connected', ...}
   ```
 
+- HPC / Slurm targets: a fixed login node can be reached with `proxy_jump`,
+  while the dynamic compute node is discovered at connect time by a trusted
+  `provision_command` (see the next subsection).
+
+### HPC / Slurm: dynamic compute nodes
+
+On an HPC system the login node is fixed but the development container runs in
+a Slurm job on a compute node whose name and forwarded port only exist once the
+job starts. Two TOML knobs cover this:
+
+- `proxy_jump = "<alias>"` makes the gateway run `ssh -J <alias> <ssh_target>`
+  for the gateway → login hop. Both hops use the gateway user's own keys.
+- `provision_command = ["..."]` is a trusted argv (run **without a shell**, from
+  the TOML only — never client input) executed before the tunnel is opened. It
+  should start or attach the job and arrange a forward to the container's SSH
+  port, then print the endpoint as `host:port` (an optional `ENDPOINT ` prefix
+  and other log lines are allowed; the first valid endpoint line wins).
+  `provision_timeout` bounds it.
+
+```toml
+[targets.rosi5]
+user = "agent"
+client_key = "/home/USER/.ssh/terok_compute_container"
+host_key_sha256 = "SHA256:..."
+ssh_targets = ["rosi5"]        # SSH config alias for the login node
+provision_command = ["/home/USER/.config/terok-compute-gateway/rosi5-provision.sh"]
+provision_timeout = 900.0
+```
+
+Example `rosi5-provision.sh` (operator-written, self-started job — this is the
+"start with" mode; a later mode can let the gateway own `sbatch`). It acquires a
+node, then arranges a listener **on the login node** that forwards to the
+container, and prints the login-node endpoint the gateway should dial:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOGIN="rosi5"                 # SSH alias of the fixed login node
+JOB_NAME="terok-dev"
+CONTAINER_PORT=2222
+LOGIN_FORWARD_PORT=2200
+
+# 1. Reuse a running job, or request a node (interactive allocation kept alive
+#    by the job itself; adapt to your site's sbatch/squeue policy).
+NODE="$(squeue -h -u "$USER" -n "$JOB_NAME" -o '%N' | head -n1 || true)"
+if [ -z "$NODE" ]; then
+    NODE="$(sbatch --parsable --job-name "$JOB_NAME" --nodes=1 \
+            --wrap 'srun --nodes=1 bash -c "hostname; sleep infinity"' || true)"
+    # ...poll squeue until the job starts and extract its node...
+    NODE="$(squeue -h -j "$NODE" -o '%N' | head -n1)"
+fi
+
+# 2. On the login node, open a forward to the compute node's container port.
+#    The login -> compute hop uses the login node's own keys/agent.
+ssh "$LOGIN" "nohup ssh -N -o ExitOnForwardFailure=yes \
+    -L 127.0.0.1:${LOGIN_FORWARD_PORT}:${NODE}:${CONTAINER_PORT} ${NODE} \
+    >/dev/null 2>&1 &"
+
+# 3. Tell the gateway where to connect (through ssh_targets = ["rosi5"]).
+printf 'ENDPOINT 127.0.0.1:%s\n' "$LOGIN_FORWARD_PORT"
+```
+
+The gateway then opens `ssh -N -L 127.0.0.1:<local>:127.0.0.1:2200 rosi5` and
+logs into the container over that path. The compute node and its port may change
+per job; the contract is only the printed endpoint. `refresh` re-runs the
+provision command and follows the new endpoint.
+
+If instead your site lets the gateway reach the compute node directly (both
+hops accept the gateway's key), skip the login-node listener: print
+`ENDPOINT <compute-node>:<port>` and add `proxy_jump = "rosi5"` so the tunnel
+goes `ssh -J rosi5 <ssh_target>`.
+
 - File transfer: small files use `compute_file_read`/`compute_file_write`
   (content in the response). For large or binary files use
   `compute_file_upload`/`compute_file_download`, which stream over SFTP and

@@ -476,6 +476,108 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
         await client.close()
 
 
+def test_parse_provision_endpoint():
+    from terok_compute.gateway import _parse_provision_endpoint
+
+    assert _parse_provision_endpoint("cn123:2345\n") == ("cn123", 2345)
+    assert _parse_provision_endpoint("ENDPOINT 10.0.0.5:2222\n") == ("10.0.0.5", 2222)
+    assert _parse_provision_endpoint("job 123 running\nENDPOINT cn1:9\n") == ("cn1", 9)
+    assert _parse_provision_endpoint("no endpoint here\n") is None
+    assert _parse_provision_endpoint("host:99999\n") is None
+    # the first valid line wins
+    assert _parse_provision_endpoint("a:1\nb:2\n") == ("a", 1)
+
+
+async def test_provision_runs_command_and_overrides_endpoint(tmp_path, monkeypatch):
+    gw = make_gateway()
+    import dataclasses
+
+    target = gw.config.targets["hal"]
+    target = dataclasses.replace(
+        target, transport=TransportConfig(kind="tunnel", ssh_targets=("rosi5",))
+    )
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(
+                target, provision_command=("printf", "cmd01:2200\n")
+            ),
+        },
+    )
+    transport = await gw._provision(gw.config.targets["hal"])
+    assert transport.remote_host == "cmd01"
+    assert transport.remote_port == 2200
+
+
+async def test_provision_failure_raises(tmp_path, monkeypatch):
+    from terok_compute.gateway import ProvisionError
+
+    gw = make_gateway()
+    import dataclasses
+
+    target = gw.config.targets["hal"]
+    target = dataclasses.replace(
+        target, transport=TransportConfig(kind="tunnel", ssh_targets=("rosi5",))
+    )
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(
+                target,
+                provision_command=(
+                    "python3", "-c", "import sys; sys.stderr.write('no nodes'); sys.exit(3)"
+                ),
+            ),
+        },
+    )
+    with pytest.raises(ProvisionError):
+        await gw._provision(gw.config.targets["hal"])
+
+
+async def test_connect_uses_provisioned_transport(monkeypatch):
+    gw = make_gateway()
+    import dataclasses
+
+    target = gw.config.targets["hal"]
+    target = dataclasses.replace(
+        target, transport=TransportConfig(kind="tunnel", ssh_targets=("rosi5",))
+    )
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(
+                target, provision_command=("printf", "cn9:3210\n")
+            ),
+        },
+    )
+    seen = {}
+
+    async def fake_connect(target, on_route=None, transport=None):
+        seen["transport"] = transport or target.transport
+        return _FakeTunnel(target, transport or target.transport)
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    runtime = gw.runtimes["hal"]
+    await gw._connect_locked(gw.config.targets["hal"], runtime)
+    assert seen["transport"].remote_host == "cn9"
+    assert seen["transport"].remote_port == 3210
+    assert runtime.provisioned_endpoint == "cn9:3210"
+
+
+class _FakeTunnel:
+    def __init__(self, target, transport):
+        self.target = target
+        self.route = "direct"
+        self.local_port = transport.remote_port
+        self.process = None
+
+    async def stop(self):
+        return None
+
+
 async def test_interactive_prompter_prompts_when_console_active(monkeypatch):
     gw = make_gateway()
     gw._interactive = True

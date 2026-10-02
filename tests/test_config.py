@@ -78,6 +78,28 @@ def test_interactive_auth_default_and_true():
     assert parse_config(base_raw(interactive_auth=True)).targets["hal"].interactive_auth is True
 
 
+def test_proxy_jump_parsed_for_tunnel():
+    cfg = parse_config(base_raw(proxy_jump="rosi5"))
+    assert cfg.targets["hal"].transport.proxy_jump == "rosi5"
+
+
+def test_proxy_jump_rejected_for_direct():
+    raw = base_raw(transport="direct", ssh_targets=[], proxy_jump="rosi5")
+    with pytest.raises(ConfigError):
+        parse_config(raw)
+
+
+def test_provision_command_parsed():
+    cfg = parse_config(base_raw(provision_command=["/bin/prov.sh", "--x"]))
+    assert cfg.targets["hal"].provision_command == ("/bin/prov.sh", "--x")
+
+
+def test_provision_command_rejected_for_direct():
+    raw = base_raw(transport="direct", ssh_targets=[], provision_command=["/bin/x"])
+    with pytest.raises(ConfigError):
+        parse_config(raw)
+
+
 def test_invalid_target_name_rejected():
     raw = base_raw()
     raw["targets"]["bad name!"] = raw["targets"].pop("hal")

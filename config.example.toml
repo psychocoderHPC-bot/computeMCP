@@ -89,6 +89,26 @@ auto_connect = true
 connect_backoff_initial = 1.0
 connect_backoff_max = 60.0
 
+# --- HPC target: Slurm compute node behind a fixed login node --------------
+# The login node (e.g. rosi5) is fixed; the compute node and the container's
+# forwarded port are produced by Slurm, so they are discovered at connect time
+# by a trusted provisioning command.  Both hops use the gateway user's keys.
+#
+# [targets.rosi5]
+# user = "agent"
+# client_key = "/home/USER/.ssh/terok_compute_container"
+# host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+# host_key_algorithms = ["ssh-ed25519"]
+# # Gateway reaches the login node via this SSH config alias.
+# ssh_targets = ["rosi5"]
+# # Optional: jump through another alias (results in `ssh -J <alias> ...`).
+# proxy_jump = "rosi5"
+# # Trusted argv (no shell). It starts/attaches the Slurm job, sets up a
+# # forward from the login node to the compute container, and prints
+# # `host:port` (optionally prefixed with ENDPOINT) on stdout.
+# provision_command = ["/home/USER/.config/terok-compute-gateway/rosi5-provision.sh"]
+# provision_timeout = 900.0
+
 # A target reachable without a tunnel (e.g. gateway co-located with the
 # container, or the dev-hal test setup in this repository).
 [targets.hal-direct]

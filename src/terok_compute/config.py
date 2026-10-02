@@ -44,6 +44,9 @@ class TransportConfig:
     remote_host: str = "127.0.0.1"
     remote_port: int = 2222
     ssh_targets: tuple[str, ...] = ()
+    # Optional ProxyJump alias for the gateway -> login-node hop, e.g.
+    # ``proxy_jump = "rosi5"`` results in ``ssh -J rosi5 <ssh_target>``.
+    proxy_jump: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in ("tunnel", "direct"):
@@ -52,6 +55,8 @@ class TransportConfig:
             raise ConfigError(f"invalid remote_port {self.remote_port!r}")
         if self.kind == "tunnel" and not self.ssh_targets:
             raise ConfigError("tunnel transport requires at least one ssh_target")
+        if self.proxy_jump is not None and self.kind != "tunnel":
+            raise ConfigError("proxy_jump is only valid with tunnel transport")
 
 
 @dataclass(frozen=True)
@@ -65,11 +70,20 @@ class TargetConfig:
     host_key_algorithms: tuple[str, ...] = ()
     connect_mode: str = "shared"
     interactive_auth: bool = False
+    # Optional trusted provisioning command (argv, no shell).  Run before the
+    # tunnel is opened to discover a dynamic endpoint (e.g. a Slurm job's
+    # compute node + port).  The first ``host:port`` token on stdout wins.
+    provision_command: tuple[str, ...] = ()
+    provision_timeout: float = 900.0
     auto_connect: bool = False
     connect_backoff_initial: float = 1.0
     connect_backoff_max: float = 60.0
 
     def __post_init__(self) -> None:
+        if self.provision_command and self.transport.kind != "tunnel":
+            raise ConfigError(
+                f"target {self.name!r} provision_command requires tunnel transport"
+            )
         validate_target_name(self.name)
         if not self.user:
             raise ConfigError(f"target {self.name!r} has no user")
@@ -178,6 +192,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         remote_host=remote_host,
         remote_port=remote_port,
         ssh_targets=ssh_targets,
+        proxy_jump=value.get("proxy_jump"),
     )
 
     return TargetConfig(
@@ -190,6 +205,10 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         host_key_algorithms=tuple(value.get("host_key_algorithms", ())),
         connect_mode=value.get("connect_mode", "shared"),
         interactive_auth=bool(value.get("interactive_auth", False)),
+        provision_command=tuple(value.get("provision_command", ())),
+        provision_timeout=_float(
+            value.get("provision_timeout"), "provision_timeout", 900.0
+        ),
         auto_connect=bool(value.get("auto_connect", False)),
         connect_backoff_initial=_float(
             value.get("connect_backoff_initial"), "connect_backoff_initial", 1.0

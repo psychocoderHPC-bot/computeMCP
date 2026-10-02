@@ -19,9 +19,13 @@ from terok_compute.tunnel import (
 )
 
 FAKE_SSH = r'''
-import socket, sys, time, signal
+import os, socket, sys, time, signal
 
 args = sys.argv[1:]
+_capture = os.environ.get("FAKE_SSH_ARGV")
+if _capture:
+    with open(_capture, "w") as _fh:
+        _fh.write(" ".join(args))
 if any("broken" in a for a in args):
     sys.stderr.write("simulated failure\n")
     sys.exit(255)
@@ -117,6 +121,32 @@ async def test_stop_releases_port(fake_ssh):
     mgr.release(tunnel)
     assert port not in mgr.reserved
     assert not await probe("127.0.0.1", port, timeout=1.0)
+
+
+async def test_proxy_jump_and_dynamic_endpoint_in_argv(fake_ssh, tmp_path, monkeypatch):
+    # Capture the argv the fake ssh is invoked with.
+    capture = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_SSH_ARGV", str(capture))
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31400, internal_port_max=31410))
+    target = make_target("rosi5", ["rosi5-alias"])
+    transport = TransportConfig(
+        kind="tunnel",
+        ssh_targets=("rosi5-alias",),
+        proxy_jump="rosi5",
+        remote_host="cn123",
+        remote_port=2345,
+    )
+    tunnel = await mgr.connect(target, transport=transport)
+    try:
+        assert tunnel.route == "rosi5-alias"
+        # the forwarded target must be the dynamically provisioned endpoint
+        argv_text = capture.read_text()
+        assert "cn123:2345" in argv_text
+        assert "-J" in argv_text and "rosi5" in argv_text
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
 
 
 async def test_direct_transport_uses_endpoint(tmp_path):

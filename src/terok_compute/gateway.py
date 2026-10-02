@@ -12,6 +12,7 @@ import dataclasses
 import getpass
 import logging
 import posixpath
+import re
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -51,6 +52,10 @@ log = logging.getLogger("terok_compute.gateway")
 RECOVERY_POLL_SECONDS = 5.0
 
 
+class ProvisionError(RuntimeError):
+    """A target's provisioning command failed or printed no usable endpoint."""
+
+
 class InteractiveAuthRequired(RuntimeError):
     """A target needs interactive authentication but no console is available."""
 
@@ -75,6 +80,7 @@ class TargetRuntime:
     connected_since: datetime | None = None
     needs_refresh: bool = False
     backoff: float = 0.0
+    provisioned_endpoint: str | None = None
     recovery_task: asyncio.Task | None = field(default=None, repr=False)
 
     def public(self, clients: int = 0) -> dict:
@@ -89,6 +95,7 @@ class TargetRuntime:
             else None,
             "clients": clients,
             "needs_refresh": self.needs_refresh,
+            "provisioned_endpoint": self.provisioned_endpoint,
         }
 
 
@@ -187,10 +194,24 @@ class Gateway:
     async def _connect_locked(self, target: TargetConfig, runtime: TargetRuntime) -> TargetRuntime:
         runtime.state = "connecting"
         runtime.last_error = None
+        transport = target.transport
+        if target.provision_command:
+            try:
+                transport = await self._provision(target)
+            except ProvisionError as exc:
+                runtime.state = "failed"
+                runtime.last_error = str(exc)
+                runtime.active_route = None
+                runtime.local_port = None
+                raise TunnelError(str(exc)) from exc
+            runtime.provisioned_endpoint = (
+                f"{transport.remote_host}:{transport.remote_port}"
+            )
         try:
             tunnel = await self.tunnels.connect(
                 target,
                 on_route=lambda route, exc: log.debug("route %s failed: %s", route, exc),
+                transport=transport,
             )
         except TunnelError as exc:
             runtime.state = "failed"
@@ -334,6 +355,56 @@ class Gateway:
                     runtime.backoff = min(runtime.backoff * 2, target.connect_backoff_max)
         except asyncio.CancelledError:
             raise
+
+    # -- dynamic provisioning (Slurm and similar) ------------------------
+    async def _provision(self, target: TargetConfig) -> "TransportConfig":
+        """Run the target's trusted provisioning command and parse an endpoint.
+
+        The command must be from the trusted TOML (never client input).  It is
+        executed without a shell.  It should start/attach a job (e.g. a Slurm
+        allocation) and arrange a forward to the container's SSH port, then
+        print ``host:port`` (or ``ENDPOINT host:port``) on stdout.  The gateway
+        tunnels through an ssh alias to that discovered endpoint.
+        """
+        argv = list(target.provision_command)
+        log.info("provisioning target %s: %s", target.name, " ".join(argv))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, ValueError) as exc:
+            raise ProvisionError(
+                f"target {target.name!r} provisioning command could not start: {exc}"
+            ) from exc
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=target.provision_timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            raise ProvisionError(
+                f"target {target.name!r} provisioning timed out after "
+                f"{target.provision_timeout:.0f}s"
+            ) from None
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip() or "no stderr"
+            raise ProvisionError(
+                f"target {target.name!r} provisioning exited {proc.returncode}: {detail}"
+            )
+        endpoint = _parse_provision_endpoint(stdout.decode(errors="replace"))
+        if endpoint is None:
+            raise ProvisionError(
+                f"target {target.name!r} provisioning printed no host:port endpoint"
+            )
+        host, port = endpoint
+        log.info("target %s provisioned endpoint %s:%d", target.name, host, port)
+        return dataclasses.replace(
+            target.transport, remote_host=host, remote_port=port
+        )
 
     # -- interactive authentication --------------------------------------
     async def _prompt_line(self, prompt: str, echo: bool) -> str | None:
@@ -1088,6 +1159,28 @@ class Gateway:
                 f"{runtime.local_port if runtime.local_port else '-':<8}"
                 f"{self.sessions.count_for_target(name):<8}{uptime}"
             )
+
+
+_ENDPOINT_RE = re.compile(
+    r"^(?:ENDPOINT\s+)?(?P<host>[A-Za-z0-9_.\-]+):(?P<port>\d{1,5})\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_provision_endpoint(output: str) -> tuple[str, int] | None:
+    """Return the first ``host:port`` line from provisioning stdout.
+
+    A leading ``ENDPOINT`` marker is accepted but optional, so a script can
+    print other diagnostic lines and one final endpoint line.
+    """
+    for line in output.splitlines():
+        match = _ENDPOINT_RE.match(line.strip())
+        if not match:
+            continue
+        port = int(match.group("port"))
+        if 0 < port < 65536:
+            return match.group("host"), port
+    return None
 
 
 def _decode(value) -> str:
