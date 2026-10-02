@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
+import asyncio
 import base64
 import json
+import time
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -125,8 +127,10 @@ async def test_exec_uses_backend(monkeypatch):
         stdout = b"container-host\n"
         stderr = b""
 
-    async def fake_run(conn, command, cwd=None, timeout=None):
-        assert cwd is None
+    seen = {}
+
+    async def fake_run(conn, command, cwd=None, timeout=None, env=None, stdin=None):
+        seen.update(command=command, cwd=cwd, env=env, stdin=stdin)
         return FakeResult()
 
     async def fake_provider(name):
@@ -147,12 +151,35 @@ async def test_exec_uses_backend(monkeypatch):
         assert body["exit_status"] == 0
         assert body["stdout"] == "container-host\n"
 
+        # env and stdin are forwarded to the backend
+        resp = await client.post(
+            "/v1/exec",
+            headers=auth("alpaka-token"),
+            json={
+                "target": "hal",
+                "command": "cat",
+                "env": {"FOO": "bar"},
+                "stdin": "hello\n",
+            },
+        )
+        assert resp.status == 200
+        assert seen["env"] == {"FOO": "bar"}
+        assert seen["stdin"] == "hello\n"
+
         resp = await client.post(
             "/v1/exec",
             headers=auth("alpaka-token"),
             json={"target": "gpu03", "command": "hostname"},
         )
         assert resp.status == 403
+
+        # a malformed env is rejected
+        resp = await client.post(
+            "/v1/exec",
+            headers=auth("alpaka-token"),
+            json={"target": "hal", "command": "x", "env": "not-an-object"},
+        )
+        assert resp.status == 400
     finally:
         await client.close()
 
@@ -203,6 +230,125 @@ async def test_session_isolation_between_clients(monkeypatch):
         # Owner can.
         resp = await client.get(f"/v1/sessions/{sid}", headers=auth("admin-token"))
         assert resp.status == 200
+    finally:
+        await client.close()
+
+
+async def test_session_read_wait_blocks_then_returns(monkeypatch):
+    gw = make_gateway()
+
+    class _NeverEndingStdout:
+        async def read(self, n):
+            await asyncio.sleep(3600)
+
+    class FakeProcess:
+        stdin = type("S", (), {"write": lambda self, d: None})()
+        channel = type("C", (), {"change_terminal_size": lambda self, c, r: None})()
+        exit_status = None
+        stdout = _NeverEndingStdout()
+
+        async def wait_closed(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    async def fake_provider(name):
+        return gw.config.targets[name], object()
+
+    async def fake_create(conn, cwd, columns, rows, term="xterm-256color"):
+        return FakeProcess()
+
+    monkeypatch.setattr(gw.sessions, "provider", fake_provider)
+    monkeypatch.setattr(gw.backend, "create_session", fake_create)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/sessions", headers=auth("alpaka-token"), json={"target": "hal"}
+        )
+        sid = (await resp.json())["session_id"]
+
+        # simulate output arriving shortly after the waiting read starts
+        async def produce():
+            await asyncio.sleep(0.3)
+            session = gw.sessions._sessions[sid]
+            session.output_buffer.extend(b"late output\n")
+            session.updated_at = time.time()
+
+        producer = asyncio.create_task(produce())
+
+        # non-waiting read returns immediately and empty
+        resp = await client.post(
+            f"/v1/sessions/{sid}/read",
+            headers=auth("alpaka-token"),
+            json={"max_bytes": 0, "wait": 0},
+        )
+        assert (await resp.json())["data"] == ""
+
+        # waiting read blocks until the output appears
+        resp = await client.post(
+            f"/v1/sessions/{sid}/read",
+            headers=auth("alpaka-token"),
+            json={"max_bytes": 0, "wait": 2.0},
+        )
+        assert "late output" in (await resp.json())["data"]
+        await producer
+    finally:
+        await client.close()
+
+
+async def test_file_chmod_endpoint(monkeypatch):
+    gw = make_gateway()
+
+    class FakeSFTP:
+        def __init__(self):
+            self.calls = []
+
+        def exit(self):
+            pass
+
+        async def chmod(self, path, mode):
+            self.calls.append((path, mode))
+
+    holder = {}
+
+    class FakeSftpCtx:
+        def __init__(self, conn):
+            self._sftp = FakeSFTP()
+            holder["sftp"] = self._sftp
+
+        async def __aenter__(self):
+            return self._sftp
+
+        async def __aexit__(self, *a):
+            return False
+
+    async def fake_provider(name):
+        return gw.config.targets[name], object()
+
+    monkeypatch.setattr(gw, "_connection_provider", fake_provider)
+    monkeypatch.setattr("terok_compute.gateway.sftp_client", lambda conn: FakeSftpCtx(conn))
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/files/chmod",
+            headers=auth("alpaka-token"),
+            params={"target": "hal"},
+            json={"path": "/work/x.sh", "mode": "755"},
+        )
+        assert resp.status == 200, await resp.text()
+        assert holder["sftp"].calls == [("/work/x.sh", 0o755)]
+
+        # invalid mode rejected
+        resp = await client.post(
+            "/v1/files/chmod",
+            headers=auth("alpaka-token"),
+            params={"target": "hal"},
+            json={"path": "/work/x.sh", "mode": "99z"},
+        )
+        assert resp.status == 502
     finally:
         await client.close()
 
@@ -330,7 +476,7 @@ async def test_dedicated_exec_opens_and_closes_connection(monkeypatch):
         opened.append(target.name)
         return object()
 
-    async def fake_run(conn, command, cwd=None, timeout=None):
+    async def fake_run(conn, command, cwd=None, timeout=None, env=None, stdin=None):
         return FakeResult()
 
     async def fake_close(conn):

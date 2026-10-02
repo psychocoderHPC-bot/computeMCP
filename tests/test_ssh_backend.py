@@ -82,3 +82,23 @@ def test_host_key_pin_still_enforced():
 def test_no_pin_means_no_host_key_accepted():
     client = InteractiveSSHClient(pin=None, prompter=None)
     assert client.validate_host_public_key("h", "1.2.3.4", 22, FakeKey()) is False
+
+
+def test_sh_identifier_rejects_injection():
+    from terok_compute.ssh_backend import _sh_identifier, SSHError
+
+    assert _sh_identifier("PATH") == "PATH"
+    assert _sh_identifier("_X1") == "_X1"
+    for bad in ["A B", "A;B", "A$(x)", "1ABC", "", "A-B", "A\nB"]:
+        try:
+            _sh_identifier(bad)
+        except SSHError:
+            continue
+        raise AssertionError(f"accepted unsafe name {bad!r}")
+
+
+def test_shquote_escapes():
+    from terok_compute.ssh_backend import _shquote
+
+    assert _shquote("abc") == "'abc'"
+    assert _shquote("a'b") == "'a'\\''b'"

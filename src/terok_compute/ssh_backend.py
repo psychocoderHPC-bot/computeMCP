@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Protocol
 
@@ -41,6 +42,7 @@ class ManagedSession:
     created_at: float
     last_activity: float
     output_buffer: bytearray = field(default_factory=bytearray)
+    updated_at: float = 0.0
     exit_status: int | None = None
     closed: bool = False
     dedicated_conn: asyncssh.SSHClientConnection | None = None
@@ -234,16 +236,31 @@ class SSHBackend:
         command: str,
         cwd: str | None = None,
         timeout: float | None = None,
+        env: dict[str, str] | None = None,
+        stdin: bytes | str | None = None,
     ):
         full = command
+        if env:
+            # Export in the *remote* shell rather than relying on the remote
+            # sshd's AcceptEnv (commonly disabled), so env works everywhere.
+            # Values are shell-quoted; the resulting string is interpreted by
+            # the shell inside the container and never by a local shell.
+            exports = " ".join(
+                f"export {_sh_identifier(k)}={_shquote(str(v))};"
+                for k, v in env.items()
+            )
+            full = f"{exports} {full}"
         if cwd:
             # The command string is intentionally interpreted by the shell
             # *inside the remote container*; it is never interpolated into a
             # local shell.
-            full = f"cd {_shquote(cwd)} && {command}"
+            full = f"cd {_shquote(cwd)} && {full}"
+        if isinstance(stdin, str):
+            stdin = stdin.encode()
         try:
             return await asyncio.wait_for(
-                conn.run(full, check=False, encoding=None), timeout=timeout
+                conn.run(full, check=False, encoding=None, input=stdin),
+                timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
             raise SSHError("remote command timed out") from exc
@@ -279,3 +296,13 @@ class SSHBackend:
 
 def _shquote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sh_identifier(name: str) -> str:
+    """Validate an environment variable name so it cannot inject shell syntax."""
+    if not _ENV_NAME_RE.match(name):
+        raise SSHError(f"invalid environment variable name {name!r}")
+    return name

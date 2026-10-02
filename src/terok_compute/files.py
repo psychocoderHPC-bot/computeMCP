@@ -106,6 +106,30 @@ async def rename(sftp: asyncssh.SFTPClient, source: str, destination: str) -> di
     return {"source": source, "destination": destination, "renamed": True}
 
 
+async def chmod(sftp: asyncssh.SFTPClient, path: str, mode: int) -> dict:
+    try:
+        await sftp.chmod(path, mode)
+    except (asyncssh.Error, OSError) as exc:
+        raise _sftp_error(exc) from exc
+    return {"path": path, "mode": oct(mode)}
+
+
+def parse_mode(mode: str | int) -> int:
+    """Accept ``644``, ``"644"`` or ``"0o644"`` and return an int mode."""
+    if isinstance(mode, int):
+        return mode
+    text = str(mode).strip().lower()
+    if text.startswith("0o"):
+        text = text[2:]
+    try:
+        value = int(text, 8)
+    except ValueError as exc:
+        raise SSHError(f"invalid mode {mode!r}") from exc
+    if not 0 <= value <= 0o7777:
+        raise SSHError(f"mode out of range: {mode!r}")
+    return value
+
+
 def _type_of(attrs) -> str:
     perms = attrs.permissions or 0
     if stat_module.S_ISDIR(perms):

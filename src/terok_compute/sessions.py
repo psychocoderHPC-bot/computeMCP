@@ -161,9 +161,26 @@ class SessionManager:
         session.last_activity = time.time()
         return len(payload)
 
-    def read(self, session_id: str, client_id: str, max_bytes: int) -> dict:
+    async def read(
+        self,
+        session_id: str,
+        client_id: str,
+        max_bytes: int,
+        wait: float = 0.0,
+    ) -> dict:
         session = self._get(session_id, client_id)
         session.last_activity = time.time()
+        if wait > 0:
+            # Block until there is new output, the session closes, or timeout,
+            # then report whatever arrived.  Mirrors a waiting PTY read so an
+            # agent watching a build does not have to poll + sleep.
+            deadline = time.monotonic() + wait
+            while (
+                not session.output_buffer
+                and not session.closed
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.1)
         buf = session.output_buffer
         if max_bytes <= 0:
             chunk = bytes(buf)
@@ -260,6 +277,7 @@ class SessionManager:
                     break
                 buf = session.output_buffer
                 buf.extend(data)
+                session.updated_at = time.time()
                 overflow = len(buf) - self.config.output_buffer_bytes
                 if overflow > 0:
                     del buf[:overflow]

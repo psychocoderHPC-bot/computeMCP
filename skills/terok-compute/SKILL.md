@@ -57,9 +57,19 @@ compute_exec(target="hal", command="cmake --build build -j", cwd="/work/picongpu
 ```
 
 - `cwd` is a directory **inside the remote container** (the shell runs there).
+- `env` sets environment variables for the command (e.g. `OMP_NUM_THREADS`,
+  `CUDA_VISIBLE_DEVICES`, `LD_LIBRARY_PATH`). They are exported in the remote
+  shell, so they work even when the container sshd does not accept env.
+- `stdin` pipes text to the command's standard input.
 - `timeout` is in seconds; use it for commands that may hang.
 - For anything expected to run more than a few seconds (builds, tests,
   debuggers, servers), use a persistent session instead — see below.
+
+```
+compute_exec(target="hal", command="make -j", cwd="/work/proj",
+             env={"OMP_NUM_THREADS": "32", "CUDA_VISIBLE_DEVICES": "0"})
+compute_exec(target="hal", command="wc -l", stdin="a\nb\nc\n")
+```
 
 ## 3. Persistent and parallel sessions
 
@@ -86,9 +96,14 @@ compute_session_close(sid)              # terminates the remote process
 Rules of thumb:
 
 - `compute_session_write` sends raw input; end commands with `\n`.
-- `compute_session_read` **returns and clears** the buffer. Read periodically
-  for long jobs; the response carries `exit_status` (set once the process
-  exits) and `closed`.
+- `compute_session_read` **returns and clears** the buffer. Pass `wait=<seconds>`
+  to block until new output arrives, the session closes, or the timeout — this
+  is the right way to watch a build without polling. The response carries
+  `exit_status` (set once the process exits) and `closed`.
+
+  ```
+  compute_session_read(sid, wait=30)     # wait for the next output, up to 30 s
+  ```
 - Always `compute_session_close` sessions you no longer need.
 - `compute_sessions(target=None)` lists your sessions (optionally per target).
 
@@ -112,12 +127,25 @@ compute_file_upload(target="hal", local_path="/tmp/build.tar.gz", remote_path="/
 compute_file_download(target="hal", remote_path="/work/results.dat", local_path="/tmp/results.dat")
 ```
 
+**Whole directory trees — also streamed per file:**
+
+```
+compute_file_upload_tree(target="hal", local_path="/work/src", remote_path="/work/src")
+compute_file_download(target="hal", remote_path="/work/build", local_path="/tmp/build", recursive=True)
+```
+
+`compute_file_upload_tree` mirrors a directory tree. It is incremental: re-run
+with `skip_existing=True` to send only files still missing remotely, and use
+`include=["*.cpp", "*.h"]` / `exclude=["build/*", "*.o"]` to filter.
+`compute_file_download(..., recursive=True)` mirrors a remote tree to disk.
+
 - For `compute_file_upload`/`compute_file_download`, `local_path` is **in this
   container**, `remote_path` is **in the remote container**. Prefer these for
   anything large so file bytes never enter the conversation.
 - Other file tools: `compute_file_list(target, path)`,
   `compute_file_stat(target, path)`, `compute_file_mkdir`,
-  `compute_file_remove`, `compute_file_rename(target, source, destination)`.
+  `compute_file_remove`, `compute_file_rename(target, source, destination)`,
+  `compute_file_chmod(target, path, mode)` (octal, e.g. `"755"`).
 - All paths are paths **inside the remote container**. The gateway host
   filesystem is not accessible.
 
@@ -127,18 +155,20 @@ compute_file_download(target="hal", remote_path="/work/results.dat", local_path=
 | --- | --- |
 | `compute_targets()` | List available systems + `sharing` (do this first) |
 | `compute_status(target)` | State/route/clients/`sharing`/errors for one system |
-| `compute_exec(target, command, cwd?, timeout?)` | Short non-interactive command |
+| `compute_exec(target, command, cwd?, timeout?, env?, stdin?)` | Short non-interactive command |
 | `compute_session_create(target, cwd?, columns?, rows?)` | New PTY session |
 | `compute_session_write(session_id, data)` | Send input to a session |
-| `compute_session_read(session_id, max_bytes?)` | Read+clear buffered output |
+| `compute_session_read(session_id, max_bytes?, wait?)` | Read+clear output; `wait` blocks for new output |
 | `compute_session_resize(session_id, columns, rows)` | Resize terminal |
 | `compute_session_close(session_id)` | Close session (kills remote process) |
 | `compute_sessions(target?)` | List your sessions |
 | `compute_file_read(target, path)` | Read text file |
 | `compute_file_read_base64(target, path)` | Read binary file |
 | `compute_file_write(target, path, content, encoding?)` | Write text/base64 |
-| `compute_file_upload(target, local_path, remote_path, append?, parents?)` | Stream upload |
-| `compute_file_download(target, remote_path, local_path)` | Stream download |
+| `compute_file_upload(target, local_path, remote_path, append?, parents?, recursive?)` | Stream upload (file or dir) |
+| `compute_file_upload_tree(target, local_path, remote_path, skip_existing?, include?, exclude?)` | Recursive incremental upload |
+| `compute_file_download(target, remote_path, local_path, recursive?)` | Stream download (file or dir) |
+| `compute_file_chmod(target, path, mode)` | Change permissions |
 | `compute_file_list(target, path)` | List directory |
 | `compute_file_stat(target, path)` | Stat a path |
 | `compute_file_mkdir(target, path)` | Create directory (+parents) |

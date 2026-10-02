@@ -480,7 +480,13 @@ shown as `provisioned_endpoint` in `status`/`GET /v1/targets/{name}`.
 - File transfer: small files use `compute_file_read`/`compute_file_write`
   (content in the response). For large or binary files use
   `compute_file_upload`/`compute_file_download`, which stream over SFTP and
-  never place file bytes in the tool output.
+  never place file bytes in the tool output. `compute_file_upload_tree` mirrors
+  a whole directory incrementally (`skip_existing`, `include`/`exclude` globs),
+  and `compute_file_download(..., recursive=True)` mirrors a remote tree.
+  Permissions can be set with `compute_file_chmod`.
+- Command execution supports `env` (exported in the remote shell, so it works
+  even when the container sshd does not accept env) and `stdin`. Persistent
+  reads accept `wait=<seconds>` to block for new output instead of polling.
 
 ## HTTP API (all requests require `Authorization: Bearer <token>`)
 
@@ -497,7 +503,7 @@ GET    /v1/clients ; GET /v1/clients/{name}          # admin: token/ACL/sessions
 GET    /v1/clients/{name}/sessions                   # admin
 DELETE /v1/clients/{name}/sessions                   # admin: close its sessions
 GET    /v1/files/stat|list|read ; PUT /v1/files/write|upload
-POST   /v1/files/mkdir|remove|rename
+POST   /v1/files/mkdir|remove|rename|chmod
 ```
 
 `GET /v1/files/read?encoding=stream` streams raw bytes; `PUT /v1/files/upload`

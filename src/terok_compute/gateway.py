@@ -30,8 +30,10 @@ from .config import (
     load_config,
 )
 from .files import sftp_client
+from .files import chmod as files_chmod
 from .files import list_dir as files_list
 from .files import mkdir as files_mkdir
+from .files import parse_mode as files_parse_mode
 from .files import read as files_read
 from .files import remove as files_remove
 from .files import rename as files_rename
@@ -624,9 +626,18 @@ class Gateway:
         timeout = body.get("timeout")
         if timeout is None:
             timeout = self.config.server.exec_timeout
+        env = body.get("env")
+        if env is not None and not isinstance(env, dict):
+            raise web.HTTPBadRequest(text="'env' must be an object of strings")
+        env = {str(k): str(v) for k, v in env.items()} if env else None
         try:
             result = await self.backend.run(
-                conn, command, cwd=body.get("cwd"), timeout=float(timeout)
+                conn,
+                command,
+                cwd=body.get("cwd"),
+                timeout=float(timeout),
+                env=env,
+                stdin=body.get("stdin"),
             )
         finally:
             if target.connect_mode == "dedicated":
@@ -707,9 +718,11 @@ class Gateway:
             with contextlib.suppress(Exception):
                 body = await request.json()
         max_bytes = int(body.get("max_bytes", 0))
-        return web.json_response(
-            self.sessions.read(request.match_info["session"], client.client_id, max_bytes)
+        wait = float(body.get("wait", 0) or 0)
+        result = await self.sessions.read(
+            request.match_info["session"], client.client_id, max_bytes, wait=wait
         )
+        return web.json_response(result)
 
     async def h_session_resize(self, request: web.Request) -> web.Response:
         client = self._auth(request)
@@ -946,6 +959,13 @@ class Gateway:
                 await files_rename(sftp, body["source"], body["destination"])
             )
 
+    async def h_file_chmod(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        body = await request.json()
+        mode = files_parse_mode(body["mode"])
+        async with self._sftp_session(client, request) as sftp:
+            return web.json_response(await files_chmod(sftp, body["path"], mode))
+
     async def h_health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "version": __version__})
 
@@ -981,6 +1001,7 @@ class Gateway:
         router.add_post("/v1/files/mkdir", self.h_file_mkdir)
         router.add_post("/v1/files/remove", self.h_file_remove)
         router.add_post("/v1/files/rename", self.h_file_rename)
+        router.add_post("/v1/files/chmod", self.h_file_chmod)
         app.on_startup.append(self._on_startup)
         app.on_cleanup.append(self._on_cleanup)
         return app
