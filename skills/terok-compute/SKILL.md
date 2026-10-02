@@ -43,8 +43,12 @@ Each target also carries a **`sharing`** field, which matters for benchmarks:
 Before running or reporting a benchmark, check `sharing` and say which it was.
 
 If `compute_targets` does not return a system you expect, or a target shows
-`state != "connected"` with an error, report the gateway status. **Do not try
-to bypass the gateway** (no direct `ssh`, no host access).
+`state != "connected"` with an error, report the gateway status. If the MCP
+cannot reach the gateway at all (connection refused/timeout while
+`TEROK_COMPUTE_GATEWAY` is set), the Terok Shield is likely blocking the
+destination — the project `shield.allow`/`override` must permit the gateway host
+(see the project's `project.toml`). **Do not try to bypass the gateway** (no
+direct `ssh`, no host access).
 
 If the `compute` MCP is not configured at all (no tools available, or
 `TEROK_COMPUTE_GATEWAY`/`TEROK_COMPUTE_TOKEN` unset), you can request access

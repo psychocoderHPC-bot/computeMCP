@@ -366,6 +366,34 @@ Container-side writing:
 Turn it off with `[server] allow_enrollment = false`. `enroll_ttl` (default
 600 s) and `enroll_max_pending` (default 32) bound the unauthenticated surface.
 
+## Allow the gateway in the Terok Shield
+
+Terok Shield is default-deny: a task container cannot open a TCP connection to
+the gateway until the project explicitly allows the destination. If the MCP
+fails with a connection error even though the gateway is healthy, this is the
+cause. Add the gateway host to the project's `project.toml`:
+
+```toml
+shield:
+  allow:
+    - localhost:2222
+  override:
+    - host: 10.0.2.2
+      reason: Temporary access to the HAL development tunnel
+      expires: 2027-10-06
+```
+
+- `override.host` must be the **gateway host as the container sees it** — the
+  address `host.containers.internal` resolves to inside the task (commonly
+  `10.0.2.2`; verify with `getent hosts host.containers.internal`). It is not a
+  host interface address, so do not try to bind it on the host.
+- The `override` grants access to that exact gateway address (all ports to that
+  address, not a specific port); set a **short, future `expires`** and remove it
+  when no longer needed.
+- A new task must be created after changing the Shield config; an existing task
+  does not pick up later project changes.
+- Adjust the port (`2222` above) to match `[server] port` in the gateway config.
+
 ## Install the MCP inside a Terok container
 
 ```bash
