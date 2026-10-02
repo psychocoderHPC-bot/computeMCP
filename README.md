@@ -32,7 +32,8 @@ src/terok_compute/
   files.py        SFTP file operations
   gateway.py      state machine, HTTP API, interactive console
   mcp_server.py   MCP server (stdio) exposing compute_* tools
-tests/            unit tests (35)
+  control.py      terok-compute-gatewayctl operator CLI
+tests/            unit tests (69)
 config.example.toml
 systemd/terok-compute-gateway.service
 ```
@@ -53,6 +54,86 @@ Create a dedicated gateway-to-container key (never the user's normal key):
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/terok_compute_container -C terok-compute-gateway
 # install only the .pub half in the remote development containers
+```
+
+## Example configuration
+
+The full annotated file is [`config.example.toml`](config.example.toml); a
+minimal working `~/.config/terok-compute-gateway/config.toml` is:
+
+```toml
+[server]
+# Bind where Terok/Podman reaches the host (often host.containers.internal).
+# Keep it loopback unless containers must connect from another address.
+listen = "127.0.0.1"
+port = 2222
+exec_timeout = 900.0
+
+[ssh]
+internal_port_min = 31000
+internal_port_max = 31999
+
+[sessions]
+idle_timeout = 3600.0
+max_per_client = 16
+
+[auth]
+# Filled in by `--generate-tokens` (hashes only; keep plaintext out of it).
+token_file = "/home/USER/.config/terok-compute-gateway/tokens.toml"
+
+# Each Terok project gets its own token (the hash comes from the token file)
+# and an explicit list of the targets it may use. "*" means every target.
+[clients.alpaka]
+label = "alpaka CI"
+targets = ["hal", "fwk394"]
+
+[clients.picongpu]
+label = "PIConGPU"
+targets = ["hal"]
+
+[clients.admin]
+label = "operator"
+targets = ["*"]
+
+# A target reached through an SSH tunnel. `ssh_targets` are aliases from the
+# gateway user's SSH config, tried in order.
+[targets.hal]
+ssh_targets = ["hal", "ex_hal"]
+remote_host = "127.0.0.1"
+remote_port = 2222
+user = "agent"
+client_key = "/home/USER/.ssh/terok_compute_container"
+# Mandatory: pin the container host key (see "Configuration notes").
+host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+host_key_algorithms = ["ssh-ed25519"]
+auto_connect = true
+
+# A second target, reached without a tunnel (gateway co-located with the
+# container, or a test endpoint). No `ssh_targets` => transport = "direct".
+[targets.hal-direct]
+transport = "direct"
+remote_host = "host.containers.internal"
+remote_port = 2222
+user = "agent"
+client_key = "/home/USER/.ssh/terok_compute_container"
+known_hosts = "/home/USER/.ssh/known_hosts"
+
+# Another tunnelled target, used by the `alpaka` client above.
+[targets.fwk394]
+ssh_targets = ["fwk394", "ex_fwk394"]
+remote_host = "127.0.0.1"
+remote_port = 2222
+user = "agent"
+client_key = "/home/USER/.ssh/terok_compute_container"
+host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+```
+
+After editing, generate token hashes, then start the gateway:
+
+```bash
+terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml \
+    --generate-tokens ~/.config/terok-compute-gateway/tokens.toml
+terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml
 ```
 
 ### Generate project tokens
