@@ -16,6 +16,28 @@ The connection model is:
 you (this container) --> compute MCP --> gateway --> remote dev container
 ```
 
+## 0. Tool names and client namespacing
+
+This document names tools as the MCP server defines them (`compute_targets`,
+`compute_exec`, `compute_file_upload`, `compute_session_*`, …).
+
+Some MCP clients name-space every tool with the **server name**. This server is
+registered as `compute`, so such a client exposes the server tool name with an
+extra `compute_` prefix — for example, under **opencode**:
+
+| Server tool (this doc) | opencode-visible tool |
+| --- | --- |
+| `compute_exec` | `compute_compute_exec` |
+| `compute_targets` | `compute_compute_targets` |
+| `compute_file_upload` | `compute_compute_file_upload` |
+| `compute_session_read` | `compute_compute_session_read` |
+
+The doubled **`compute_compute_`** prefix is expected, not an error: it is the
+server name (`compute`) plus the tool name (`compute_*`). Call whatever name the
+client exposes; do not rename the server to remove it, and do not "fix" the
+prefix. Clients that do not name-space (or a direct MCP call) use the bare
+`compute_*` names above.
+
 ## 1. Always discover first
 
 Call `compute_targets()` before anything else. It lists the systems this task
