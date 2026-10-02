@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-
 [Unit]
 Description=Terok Compute Gateway
 After=network-online.target
@@ -10,6 +9,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/terok-compute-gateway --config %h/.config/terok-compute-gateway/config.toml --no-console
+# `systemctl --user reload terok-compute-gateway` re-reads the config and
+# token file without dropping live tunnels.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
 # The service must never run as root.

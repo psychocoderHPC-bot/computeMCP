@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-
 import textwrap
 from pathlib import Path
 

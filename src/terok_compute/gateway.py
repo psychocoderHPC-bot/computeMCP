@@ -484,14 +484,25 @@ class Gateway:
         target = request.query.get("target")
         if target is not None:
             client.require_target(target)
+        all_clients = self._query_bool(request, "all")
+        client_filter = request.query.get("client")
+        if all_clients or client_filter is not None:
+            # Cross-client view is admin-only.
+            client.require_admin()
+            return web.json_response(
+                {"sessions": self.sessions.list_all(target, client_filter)}
+            )
         return web.json_response({"sessions": self.sessions.list(client.client_id, target)})
 
     async def h_session_get(self, request: web.Request) -> web.Response:
         client = self._auth(request)
-        session = self.sessions.get_public(request.match_info["session"], client.client_id)
+        session = self.sessions.get_public(
+            request.match_info["session"], client.client_id, admin=client.is_admin
+        )
         return web.json_response(
             {
                 "session_id": session.id,
+                "client": session.client_id,
                 "target": session.target,
                 "closed": session.closed,
                 "exit_status": session.exit_status,
@@ -532,8 +543,76 @@ class Gateway:
 
     async def h_session_delete(self, request: web.Request) -> web.Response:
         client = self._auth(request)
-        await self.sessions.close(request.match_info["session"], owner=client.client_id)
+        owner = None if client.is_admin else client.client_id
+        await self.sessions.close(request.match_info["session"], owner=owner)
         return web.json_response({"closed": True})
+
+    # -- operator / admin endpoints ---------------------------------------
+    def _query_bool(self, request: web.Request, name: str) -> bool:
+        return request.query.get(name, "").lower() in ("1", "true", "yes")
+
+    def _client_public(self, cfg) -> dict:
+        return {
+            "name": cfg.client_id,
+            "label": cfg.label,
+            "allow_all": cfg.allow_all,
+            "targets": sorted(self.config.targets) if cfg.allow_all else list(cfg.targets),
+            "session_count": self.sessions.count_for_client(cfg.client_id),
+        }
+
+    async def h_list_clients(self, request: web.Request) -> web.Response:
+        """List every configured client/token with its ACL and live sessions.
+
+        Admin-only.  Never returns token values, only a short hash prefix used
+        as a stable fingerprint.
+        """
+        client = self._auth(request)
+        client.require_admin()
+        clients = []
+        for cfg in self.config.clients.values():
+            item = self._client_public(cfg)
+            digest = cfg.token_sha256.split(":", 1)[-1]
+            item["token_fingerprint"] = "sha256:" + digest[:12]
+            item["sessions"] = self.sessions.list(client_id=cfg.client_id)
+            clients.append(item)
+        return web.json_response({"clients": clients})
+
+    async def h_get_client(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        client.require_admin()
+        name = request.match_info["client"]
+        cfg = self.config.clients.get(name)
+        if cfg is None:
+            raise web.HTTPNotFound(text="unknown client")
+        item = self._client_public(cfg)
+        digest = cfg.token_sha256.split(":", 1)[-1]
+        item["token_fingerprint"] = "sha256:" + digest[:12]
+        item["sessions"] = self.sessions.list(client_id=cfg.client_id)
+        return web.json_response(item)
+
+    async def h_client_sessions(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        client.require_admin()
+        name = request.match_info["client"]
+        cfg = self.config.clients.get(name)
+        if cfg is None:
+            raise web.HTTPNotFound(text="unknown client")
+        return web.json_response({"sessions": self.sessions.list(client_id=name)})
+
+    async def h_client_sessions_close(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        client.require_admin()
+        name = request.match_info["client"]
+        if name not in self.config.clients:
+            raise web.HTTPNotFound(text="unknown client")
+        closed = await self.sessions.close_all_for_client(name, reason="admin closed")
+        return web.json_response({"client": name, "closed": closed})
+
+    async def h_reload(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        client.require_admin()
+        report = await self.reload()
+        return web.json_response({"reloaded": True, "report": report})
 
     # files
     @contextlib.asynccontextmanager
@@ -708,6 +787,11 @@ class Gateway:
         router.add_post("/v1/sessions/{session}/write", self.h_session_write)
         router.add_post("/v1/sessions/{session}/read", self.h_session_read)
         router.add_post("/v1/sessions/{session}/resize", self.h_session_resize)
+        router.add_post("/v1/reload", self.h_reload)
+        router.add_get("/v1/clients", self.h_list_clients)
+        router.add_get("/v1/clients/{client}", self.h_get_client)
+        router.add_get("/v1/clients/{client}/sessions", self.h_client_sessions)
+        router.add_delete("/v1/clients/{client}/sessions", self.h_client_sessions_close)
         router.add_get("/v1/files/stat", self.h_file_stat)
         router.add_get("/v1/files/list", self.h_file_list)
         router.add_get("/v1/files/read", self.h_file_read)
@@ -754,7 +838,10 @@ class Gateway:
         if cmd == "help":
             print(
                 "targets | status [target] | connect <t> | refresh <t> | "
-                "reconnect <t> | stop <t> | connect-all | stop-all | reload | quit"
+                "reconnect <t> | stop <t> | connect-all | stop-all | reload |\n"
+                "clients | client <name> | client-refresh <name> | "
+                "client-connect <name> | client-stop <name> | client-kill <name> |\n"
+                "sessions [target] | close-session <id> | quit"
             )
         elif cmd == "targets":
             for name in self.config.targets:
@@ -783,9 +870,95 @@ class Gateway:
             print("all stopped")
         elif cmd == "reload":
             print(await self.reload())
+        elif cmd == "clients":
+            self._print_clients_table()
+        elif cmd == "client":
+            self._print_client(args[0])
+        elif cmd in ("client-refresh", "client-connect", "client-stop"):
+            await self._client_target_action(cmd, args)
+        elif cmd == "client-kill":
+            if not args:
+                print("usage: client-kill <client>")
+                return True
+            closed = await self.sessions.close_all_for_client(args[0], reason="console")
+            print(f"closed {closed} session(s) for client {args[0]}")
+        elif cmd == "sessions":
+            target = args[0] if args else None
+            for s in self.sessions.list_all(target):
+                print(
+                    f"{s['session_id']}  client={s['client']}  target={s['target']}  "
+                    f"age={s['age']}  idle={s['idle']}  {s['connection']}"
+                )
+        elif cmd == "close-session":
+            if not args:
+                print("usage: close-session <session-id>")
+                return True
+            await self.sessions.close(args[0], owner=None, reason="console")
+            print(f"closed {args[0]}")
         else:
             print(f"unknown command: {cmd}")
         return True
+
+    def _client_targets(self, cfg) -> list[str]:
+        if cfg.allow_all:
+            return list(self.config.targets)
+        return list(cfg.targets)
+
+    def _print_clients_table(self) -> None:
+        print(f"{'CLIENT':<18}{'LABEL':<22}{'TARGETS':<40}{'SESSIONS'}")
+        for cfg in self.config.clients.values():
+            targets = "*" if cfg.allow_all else ",".join(self._client_targets(cfg))
+            print(
+                f"{cfg.client_id:<18}{(cfg.label or '-'):<22}{targets:<40}"
+                f"{self.sessions.count_for_client(cfg.client_id)}"
+            )
+
+    def _print_client(self, name: str) -> None:
+        cfg = self.config.clients.get(name)
+        if cfg is None:
+            print(f"unknown client: {name}")
+            return
+        digest = cfg.token_sha256.split(":", 1)[-1]
+        print(f"client:      {cfg.client_id}")
+        print(f"label:       {cfg.label or '-'}")
+        print(f"token fp:    sha256:{digest[:12]}")
+        print(f"allow_all:   {cfg.allow_all}")
+        print(f"targets:     {', '.join(self._client_targets(cfg)) or '-'}")
+        print(f"sessions:    {self.sessions.count_for_client(name)}")
+        for s in self.sessions.list(client_id=name):
+            print(
+                f"  {s['session_id']}  target={s['target']}  idle={s['idle']}  "
+                f"{s['connection']}"
+            )
+
+    async def _client_target_action(self, cmd: str, args: list[str]) -> None:
+        if not args:
+            print(f"usage: {cmd} <client> [target]")
+            return
+        action, name = cmd[len("client-"):], args[0]
+        cfg = self.config.clients.get(name)
+        if cfg is None:
+            print(f"unknown client: {name}")
+            return
+        allowed = set(self._client_targets(cfg))
+        targets = [args[1]] if len(args) > 1 else sorted(allowed)
+        for target in targets:
+            if target not in allowed:
+                print(f"client {name} has no access to {target}")
+                continue
+            if target not in self.config.targets:
+                print(f"unknown target: {target}")
+                continue
+            try:
+                if action == "refresh":
+                    result = await self.refresh_target(target)
+                elif action == "connect":
+                    result = await self.connect_target(target)
+                else:
+                    result = await self.stop_target(target)
+                print(f"{name}: {target} -> {result['state']}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"{name}: {target} -> error: {exc}")
 
     def _print_status_table(self) -> None:
         print(f"{'TARGET':<16}{'STATE':<14}{'ROUTE':<14}{'LOCAL':<8}{'CLIENTS':<8}UPTIME")
@@ -957,10 +1130,22 @@ async def _amain(args: argparse.Namespace) -> int:
     def _signal(*_):
         stop_event.set()
 
+    async def _reload_signal():
+        try:
+            report = await gateway.reload()
+            log.info("reloaded via SIGHUP: %s", report)
+        except Exception:  # noqa: BLE001
+            log.exception("reload via SIGHUP failed; keeping previous configuration")
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _signal)
+    if hasattr(signal, "SIGHUP"):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(
+                signal.SIGHUP, lambda: asyncio.create_task(_reload_signal())
+            )
 
     if args.no_console or not sys.stdin.isatty():
         await stop_event.wait()

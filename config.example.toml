@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-
 # Terok Compute Gateway configuration.
 #
 # Copy to ~/.config/terok-compute-gateway/config.toml and edit.

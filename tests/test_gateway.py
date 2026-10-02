@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-
 import base64
+import json
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -44,6 +44,7 @@ def make_gateway():
                 client_id="alpaka",
                 token_sha256=hash_token("alpaka-token"),
                 targets=("hal",),
+                label="alpaka project",
             ),
             "admin": ClientConfig(
                 client_id="admin",
@@ -473,6 +474,193 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
         assert bytes(stored) == payload
     finally:
         await client.close()
+
+
+async def test_clients_endpoint_admin_only_and_lists_acl(monkeypatch):
+    gw = make_gateway()
+    client = await make_client(gw)
+    try:
+        # non-admin denied
+        resp = await client.get("/v1/clients", headers=auth("alpaka-token"))
+        assert resp.status == 403
+
+        resp = await client.get("/v1/clients", headers=auth("admin-token"))
+        assert resp.status == 200
+        body = await resp.json()
+        by_name = {c["name"]: c for c in body["clients"]}
+        assert set(by_name) == {"alpaka", "admin"}
+        assert by_name["alpaka"]["label"] == "alpaka project"
+        assert by_name["alpaka"]["targets"] == ["hal"]
+        assert by_name["alpaka"]["allow_all"] is False
+        assert by_name["admin"]["allow_all"] is True
+        assert by_name["admin"]["targets"] == ["gpu03", "hal"]
+        assert by_name["alpaka"]["token_fingerprint"].startswith("sha256:")
+        assert "alpaka-token" not in json.dumps(body)
+
+        resp = await client.get("/v1/clients/alpaka", headers=auth("admin-token"))
+        assert resp.status == 200
+        assert (await resp.json())["name"] == "alpaka"
+
+        resp = await client.get("/v1/clients/nope", headers=auth("admin-token"))
+        assert resp.status == 404
+    finally:
+        await client.close()
+
+
+async def test_admin_sees_all_sessions_but_client_only_own(monkeypatch):
+    gw = make_gateway()
+
+    class FakeProcess:
+        stdin = type("S", (), {"write": lambda self, d: None})()
+        channel = type("C", (), {"change_terminal_size": lambda self, c, r: None})()
+        exit_status = None
+
+        async def wait_closed(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    async def fake_provider(name):
+        return gw.config.targets[name], object()
+
+    async def fake_create(conn, cwd, columns, rows, term="xterm-256color"):
+        return FakeProcess()
+
+    monkeypatch.setattr(gw.sessions, "provider", fake_provider)
+    monkeypatch.setattr(gw.backend, "create_session", fake_create)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/sessions", headers=auth("alpaka-token"), json={"target": "hal"}
+        )
+        sid = (await resp.json())["session_id"]
+
+        # owner sees one
+        resp = await client.get("/v1/sessions", headers=auth("alpaka-token"))
+        assert len((await resp.json())["sessions"]) == 1
+
+        # non-admin cannot ask for the all view
+        resp = await client.get("/v1/sessions?all=true", headers=auth("alpaka-token"))
+        assert resp.status == 403
+
+        # admin sees it and the owner field
+        resp = await client.get("/v1/sessions?all=true", headers=auth("admin-token"))
+        sessions = (await resp.json())["sessions"]
+        assert len(sessions) == 1
+        assert sessions[0]["client"] == "alpaka"
+
+        # admin can fetch and close another client's session
+        resp = await client.get(f"/v1/sessions/{sid}", headers=auth("admin-token"))
+        assert resp.status == 200
+        assert (await resp.json())["client"] == "alpaka"
+
+        resp = await client.get(f"/v1/clients/alpaka/sessions", headers=auth("admin-token"))
+        assert len((await resp.json())["sessions"]) == 1
+
+        resp = await client.delete(f"/v1/sessions/{sid}", headers=auth("admin-token"))
+        assert resp.status == 200
+
+        resp = await client.delete(
+            "/v1/clients/alpaka/sessions", headers=auth("admin-token")
+        )
+        assert (await resp.json())["closed"] == 0
+    finally:
+        await client.close()
+
+
+async def test_clients_kill_closes_sessions(monkeypatch):
+    gw = make_gateway()
+
+    class FakeProcess:
+        stdin = type("S", (), {"write": lambda self, d: None})()
+        channel = type("C", (), {"change_terminal_size": lambda self, c, r: None})()
+        exit_status = None
+
+        async def wait_closed(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    async def fake_provider(name):
+        return gw.config.targets[name], object()
+
+    async def fake_create(conn, cwd, columns, rows, term="xterm-256color"):
+        return FakeProcess()
+
+    monkeypatch.setattr(gw.sessions, "provider", fake_provider)
+    monkeypatch.setattr(gw.backend, "create_session", fake_create)
+
+    client = await make_client(gw)
+    try:
+        for _ in range(2):
+            await client.post(
+                "/v1/sessions", headers=auth("alpaka-token"), json={"target": "hal"}
+            )
+        resp = await client.delete(
+            "/v1/clients/alpaka/sessions", headers=auth("admin-token")
+        )
+        assert (await resp.json())["closed"] == 2
+        resp = await client.get("/v1/clients/alpaka", headers=auth("admin-token"))
+        assert (await resp.json())["session_count"] == 0
+    finally:
+        await client.close()
+
+
+async def test_reload_endpoint_admin_only(tmp_path):
+    from terok_compute.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        """
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    gw = Gateway(load_config(cfg_file))
+    client = await make_client(gw)
+    try:
+        resp = await client.post("/v1/reload", headers=auth("admin-token"))
+        assert resp.status == 200
+        assert (await resp.json())["reloaded"] is True
+    finally:
+        await client.close()
+
+
+async def test_console_clients_and_actions(monkeypatch):
+    gw = make_gateway()
+    import io
+    import contextlib
+
+    # console listing
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await gw._console_command("clients")
+    out = buf.getvalue()
+    assert "alpaka" in out and "admin" in out and "alpaka project" in out
+
+    # client-refresh only touches allowed targets of that client
+    calls = []
+
+    async def fake_refresh(target):
+        calls.append(target)
+        return {"state": "connected", "active_route": target}
+
+    monkeypatch.setattr(gw, "refresh_target", fake_refresh)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await gw._console_command("client-refresh alpaka")
+    assert calls == ["hal"], calls
 
 
 async def test_generate_tokens_writes_hashes_and_authenticates(tmp_path):

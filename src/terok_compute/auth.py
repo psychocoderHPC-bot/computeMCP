@@ -28,6 +28,15 @@ class Client:
     client_id: str
     allow_all: bool
     targets: frozenset[str]
+    label: str | None = None
+
+    @property
+    def is_admin(self) -> bool:
+        return self.allow_all
+
+    def require_admin(self) -> None:
+        if not self.allow_all:
+            raise ForbiddenTarget("*")
 
     def may_access(self, target: str) -> bool:
         return self.allow_all or target in self.targets
@@ -87,6 +96,7 @@ class Authenticator:
             client_id=client.client_id,
             allow_all=client.allow_all,
             targets=frozenset(client.targets),
+            label=client.label,
         )
 
     def known_client(self, token: str) -> Client | None:
@@ -97,4 +107,5 @@ class Authenticator:
             client_id=client.client_id,
             allow_all=client.allow_all,
             targets=frozenset(client.targets),
+            label=client.label,
         )

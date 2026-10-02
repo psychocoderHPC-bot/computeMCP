@@ -129,17 +129,28 @@ class SessionManager:
         )
         return session
 
-    def _get(self, session_id: str, client_id: str) -> ManagedSession:
+    def _get(
+        self, session_id: str, client_id: str, *, admin: bool = False
+    ) -> ManagedSession:
         session = self._sessions.get(session_id)
         if session is None:
             raise SessionNotFound(session_id)
-        if session.client_id != client_id:
+        if not admin and session.client_id != client_id:
             # Do not reveal whether the session exists.
             raise SessionNotFound(session_id)
         return session
 
-    def get_public(self, session_id: str, client_id: str) -> ManagedSession:
-        return self._get(session_id, client_id)
+    def get_public(
+        self, session_id: str, client_id: str, *, admin: bool = False
+    ) -> ManagedSession:
+        return self._get(session_id, client_id, admin=admin)
+
+    async def close_all_for_client(self, client_id: str, reason: str = "admin") -> int:
+        ids = [s.id for s in self._sessions.values() if s.client_id == client_id]
+        for session_id in ids:
+            with contextlib.suppress(SessionError):
+                await self.close(session_id, owner=None, reason=reason)
+        return len(ids)
 
     async def write(self, session_id: str, client_id: str, data: str | bytes) -> int:
         session = self._get(session_id, client_id)
@@ -201,22 +212,38 @@ class SessionManager:
             session.dedicated_conn = None
         log.info("session %s closed (%s)", session_id, reason)
 
+    def _public(self, s: ManagedSession, now: float) -> dict:
+        return {
+            "session_id": s.id,
+            "client": s.client_id,
+            "target": s.target,
+            "age": round(now - s.created_at, 3),
+            "idle": round(now - s.last_activity, 3),
+            "closed": s.closed,
+            "exit_status": s.exit_status,
+            "buffered_bytes": len(s.output_buffer),
+            "connection": "dedicated" if s.dedicated_conn is not None else "shared",
+        }
+
     def list(self, client_id: str, target: str | None = None) -> list[dict]:
         now = time.time()
         return [
-            {
-                "session_id": s.id,
-                "target": s.target,
-                "age": round(now - s.created_at, 3),
-                "idle": round(now - s.last_activity, 3),
-                "closed": s.closed,
-                "exit_status": s.exit_status,
-                "buffered_bytes": len(s.output_buffer),
-                "connection": "dedicated" if s.dedicated_conn is not None else "shared",
-            }
+            self._public(s, now)
             for s in self._sessions.values()
             if s.client_id == client_id and (target is None or s.target == target)
         ]
+
+    def list_all(self, target: str | None = None, client_id: str | None = None) -> list[dict]:
+        now = time.time()
+        return [
+            self._public(s, now)
+            for s in self._sessions.values()
+            if (target is None or s.target == target)
+            and (client_id is None or s.client_id == client_id)
+        ]
+
+    def count_for_client(self, client_id: str) -> int:
+        return sum(1 for s in self._sessions.values() if s.client_id == client_id)
 
     def count_for_target(self, target: str) -> int:
         return sum(1 for s in self._sessions.values() if s.target == target)

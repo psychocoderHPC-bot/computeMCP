@@ -117,6 +117,7 @@ class ClientConfig:
     token_sha256: str
     targets: tuple[str, ...] = ()
     allow_all: bool = False
+    label: str | None = None
 
     def may_access(self, target: str) -> bool:
         return self.allow_all or target in self.targets
@@ -232,11 +233,13 @@ def _load_clients(
                 raise ConfigError(
                     f"[clients.{client_id}] references unknown target {target!r}"
                 )
+        label = value.get("label")
         clients[client_id] = ClientConfig(
             client_id=client_id,
             token_sha256=token_hash,
             targets=tuple(t for t in allowed if t != "*"),
             allow_all="*" in allowed,
+            label=str(label) if label is not None else None,
         )
     return clients
 

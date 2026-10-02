@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -23,6 +22,7 @@ test = ["pytest>=8", "pytest-asyncio>=0.24"]
 [project.scripts]
 terok-compute-gateway = "terok_compute.gateway:main"
 terok-compute-mcp = "terok_compute.mcp_server:main"
+terok-compute-gatewayctl = "terok_compute.control:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

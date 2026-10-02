@@ -1,4 +1,4 @@
-# Terok Compute Gateway
+is # Terok Compute Gateway
 
 Secure host-side gateway and single MCP bridge that let AI agents running
 inside Terok containers use remote development/compute containers without ever
@@ -121,12 +121,94 @@ terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml --no-
 ```
 
 Console commands: `targets`, `status [target]`, `connect`, `refresh`,
-`reconnect`, `stop`, `connect-all`, `stop-all`, `reload`, `quit`.
+`reconnect`, `stop`, `connect-all`, `stop-all`, `reload`, `clients`,
+`client <name>`, `client-refresh|connect|stop <name> [target]`,
+`client-kill <name>`, `sessions [target]`, `close-session <id>`, `quit`.
 
 `reload` fully parses and validates the TOML before replacing the active
 configuration; on failure the old configuration is retained. Unchanged
 connected targets keep their tunnels, removed targets are stopped, and changed
-targets are marked `needs_refresh`.
+targets are marked `needs_refresh`. `reload` also re-reads the token file, so
+adding or rotating a project token is a reload away.
+
+## Operator terminal: refresh config and manage API keys
+
+Under systemd the gateway runs `--no-console`, so use the
+`terok-compute-gatewayctl` operator CLI. It talks to the running gateway's
+authenticated API (nothing needs to be stopped or restarted) and reads the
+plaintext token from `[auth] token_file` or `TEROK_COMPUTE_TOKEN`.
+
+### Refresh the configuration
+
+```bash
+# re-read config.toml + tokens.toml on the running gateway
+terok-compute-gatewayctl --config ~/.config/terok-compute-gateway/config.toml reload
+
+# under systemd, equivalent and cleaner:
+systemctl --user reload terok-compute-gateway     # sends SIGHUP
+```
+
+`systemctl --user reload` sends `SIGHUP`; the daemon re-parses the config and
+token file without dropping live tunnels. A malformed file is logged and the
+previous configuration is kept.
+
+### See each API key (Terok client), its systems and live sessions
+
+```bash
+$ terok-compute-gatewayctl --config config.toml clients
+CLIENT            LABEL                 TARGETS                SESSIONS
+alpaka            alpaka CI             hal                    1
+picongpu          PIConGPU              hal-dedicated          0
+admin             operator              *                      0
+
+$ terok-compute-gatewayctl --config config.toml client alpaka
+client:    alpaka
+label:     alpaka CI
+token fp:  sha256:dfa2d0e94f1f        # fingerprint only; the token is never shown
+allow_all: False
+targets:   hal
+sessions:  1
+  4rF8_FtwECBBLc_Vmq4WzRp4  target=hal  idle=3.2
+```
+
+### Activate / refresh / stop connections for one API key
+
+```bash
+# activate every target this key may use
+terok-compute-gatewayctl --config config.toml client-connect alpaka
+# refresh (re-run route failover) only that key's targets
+terok-compute-gatewayctl --config config.toml client-refresh alpaka
+# or a single target of that key
+terok-compute-gatewayctl --config config.toml client-refresh alpaka hal
+terok-compute-gatewayctl --config config.toml client-stop alpaka
+```
+
+Only targets inside the key's ACL are touched; anything else is refused.
+
+### Other options
+
+```bash
+terok-compute-gatewayctl --config config.toml status
+terok-compute-gatewayctl --config config.toml target-connect hal
+terok-compute-gatewayctl --config config.toml target-refresh hal
+terok-compute-gatewayctl --config config.toml target-stop hal
+terok-compute-gatewayctl --config config.toml sessions          # all clients (admin)
+terok-compute-gatewayctl --config config.toml client-kill alpaka # close its sessions
+terok-compute-gatewayctl --config config.toml --json clients
+terok-compute-gatewayctl --config config.toml --client alpaka clients  # ACL-checked
+```
+
+`clients`, `client*` and the all-clients `sessions` view require an admin
+(`targets = ["*"]`) token; other clients receive `403`. Token values and full
+hashes are never returned — only a short `sha256:` fingerprint.
+
+Add a human label to any client so the listings are readable:
+
+```toml
+[clients.alpaka]
+label = "alpaka CI"
+targets = ["hal", "fwk394"]
+```
 
 ## Configuration notes
 
@@ -167,6 +249,10 @@ POST   /v1/targets/{target}/connect | /refresh | /stop
 POST   /v1/exec
 POST   /v1/sessions ; GET /v1/sessions ; GET|DELETE /v1/sessions/{id}
 POST   /v1/sessions/{id}/write | /read | /resize
+POST   /v1/reload                          # admin: re-read config + tokens
+GET    /v1/clients ; GET /v1/clients/{name}          # admin: token/ACL/sessions
+GET    /v1/clients/{name}/sessions                   # admin
+DELETE /v1/clients/{name}/sessions                   # admin: close its sessions
 GET    /v1/files/stat|list|read ; PUT /v1/files/write|upload
 POST   /v1/files/mkdir|remove|rename
 ```
@@ -176,6 +262,9 @@ streams the request body into SFTP without buffering. Both support large files.
 
 `GET /v1/targets` returns only targets allowed by the authenticated client's
 ACL. An unauthorized target produces `403` without revealing whether it exists.
+`GET /v1/sessions` lists only the caller's sessions; admins may add `?all=true`
+or `?client=<name>`. Admin-only endpoints never return token values, only a
+short `sha256:` fingerprint.
 
 ## Security invariants
 
