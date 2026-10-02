@@ -343,8 +343,8 @@ def build_server(client: GatewayClient) -> MCPServer:
 
         - `cwd`: working directory inside the container.
         - `env`: extra environment variables (e.g. module/CUDA/OMP settings).
-          These are passed via SSH `env` and require the container sshd to
-          accept them (AcceptEnv); otherwise export them inside `command`.
+          These are exported in the remote shell, so they work even when the
+          container sshd does not accept env (AcceptEnv).
         - `stdin`: text piped to the command's standard input.
         - `timeout`: seconds; use persistent sessions for long-running commands.
         """

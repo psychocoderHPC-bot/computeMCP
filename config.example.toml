@@ -41,15 +41,19 @@ output_buffer_bytes = 4194304
 [auth]
 # Recommended: generate tokens and store only their hashes here.
 #   terok-compute-gateway --config <this> --generate-tokens tokens.toml
-# Then uncomment the line below (and remove the inline `token` entries in
-# [clients.*]).
+# Then uncomment the line below AND delete every inline `token = ...` in
+# [clients.*].  IMPORTANT: an inline `token` takes precedence over `token_file`.
+# If you enable token_file but leave the example's inline
+# `token = "REPLACE_WITH_..."`, the gateway authenticates against the
+# placeholder hash and every client request fails with "invalid token".
 # token_file = "/home/USER/.config/terok-compute-gateway/tokens.toml"
 
 # ---------------------------------------------------------------------------
 # Clients. Each Terok project gets a dedicated high-entropy token.  Prefer
-# `--generate-tokens` + token_file.  Inline `token` (hashed on load) or
-# `token_hash` is accepted for bootstrapping.  Never reuse an SSH key or a
-# GitHub token here.
+# `--generate-tokens` + token_file (above); the inline `token` below exists only
+# to bootstrap a quick test and is hashed on load.  Once you enable token_file,
+# DELETE these inline tokens or they silently take precedence and every request
+# fails with "invalid token".  Never reuse an SSH key or a GitHub token here.
 # ---------------------------------------------------------------------------
 [clients.alpaka]
 token = "REPLACE_WITH_PROJECT_TOKEN"

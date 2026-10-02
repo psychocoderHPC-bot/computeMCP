@@ -309,14 +309,15 @@ python3 -m venv /home/dev/.local/share/terok-compute/venv
 ln -s /home/dev/.local/share/terok-compute/venv/bin/terok-compute-mcp /home/dev/.local/bin/terok-compute-mcp
 ```
 
-Configure the task environment (do not commit the token into `opencode.json`):
+Configure the task environment. The MCP process reads two variables at start:
 
 ```
 TEROK_COMPUTE_GATEWAY=http://host.containers.internal:2222
 TEROK_COMPUTE_TOKEN=<project-specific-token>
 ```
 
-Register a single MCP in OpenCode:
+Pass them either through the environment or, more robustly, directly in the MCP
+entry:
 
 ```json
 {
@@ -324,11 +325,23 @@ Register a single MCP in OpenCode:
     "compute": {
       "type": "local",
       "command": ["/home/dev/.local/bin/terok-compute-mcp"],
-      "enabled": true
+      "enabled": true,
+      "environment": {
+        "TEROK_COMPUTE_GATEWAY": "http://host.containers.internal:2222",
+        "TEROK_COMPUTE_TOKEN": "<project-specific-token>"
+      }
     }
   }
 }
 ```
+
+Prefer the explicit `environment` block: an `export` in `~/.bashrc` (or a
+login-shell config) does **not** reliably reach an already-running agent/TUI
+because a long-lived `tmux`/session manager keeps its original environment.
+Setting the variables in the MCP entry makes the token independent of shell
+inheritance. The token then lives in `opencode.json`; keep that file out of any
+repository and treat it as a secret, or inject it from a file the MCP reads, and
+never commit it.
 
 The MCP does not need SSH credentials and never learns `hal`, `ex_hal`,
 ProxyJump aliases or internal forward ports.
