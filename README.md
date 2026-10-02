@@ -65,6 +65,106 @@ ssh-copy-id -i ~/.ssh/terok_compute_container.pub agent@<container-host>
 > `SSH connection to target '<t>' failed: [Errno 2] No such file or directory`.
 > Set the real absolute path for `client_key`, `token_file`, etc.
 
+## Create the remote development container
+
+The gateway needs a persistent SSH server to dial. Any host with Docker/Podman
+and an OpenSSH sshd works; a plain `ubuntu:24.04` container with
+`openssh-server` is enough and is the setup the gateway was verified against.
+The container is intentionally minimal — the agent installs its own toolchain
+later — and **persistent** (no `--rm`).
+
+Recipe (adapted from the HAL remote-development handoff,
+`agent-config/terok/hal-remote-development-handoff.md`). Run this **on the
+remote host**, after generating `~/.ssh/terok_compute_container` on the gateway
+host (previous step). Paste only the **public** key; never copy the private key.
+The `HOST_HOME` bind mount is what makes the toolchain persistent across
+container recreation; its `uid:gid` is reused for the `agent` user.
+
+```bash
+mkdir -p ~/workspace/terok/terok-dev
+
+bash <<'BASH'
+set -euo pipefail
+
+CONTAINER_NAME="terok-dev"
+HOST_HOME="$HOME/workspace/terok/terok-dev"
+SSH_PUBLIC_KEY='REPLACE_WITH_TEROK_CONTAINER_PUBLIC_KEY'   # .pub half only
+
+if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  echo "STOP: $CONTAINER_NAME already exists; it was not modified."
+  exit 1
+fi
+
+if [ ! -d "$HOST_HOME" ]; then
+  echo "STOP: home directory not found: $HOST_HOME"
+  exit 1
+fi
+
+if [ -n "$(find "$HOST_HOME" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+  echo "STOP: $HOST_HOME is no longer empty; nothing was changed."
+  exit 1
+fi
+
+AGENT_UID="$(stat -c %u "$HOST_HOME")"
+AGENT_GID="$(stat -c %g "$HOST_HOME")"
+printf 'Container home will use %s (uid:gid %s:%s)\n' "$HOST_HOME" "$AGENT_UID" "$AGENT_GID"
+
+docker run -d \
+  --name "$CONTAINER_NAME" \
+  --restart unless-stopped \
+  --device /dev/dri:/dev/dri \
+  --gpus all \
+  -p 127.0.0.1:2222:22 \
+  --mount "type=bind,src=$HOST_HOME,dst=/home/agent" \
+  -e "SSH_PUBLIC_KEY=$SSH_PUBLIC_KEY" \
+  -e "AGENT_UID=$AGENT_UID" \
+  -e "AGENT_GID=$AGENT_GID" \
+  ubuntu:24.04 \
+  bash -euc '
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
+    groupadd --gid "$AGENT_GID" agent
+    useradd --uid "$AGENT_UID" --gid "$AGENT_GID" \
+      --home-dir /home/agent --no-create-home --shell /bin/bash agent
+    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
+    chmod 440 /etc/sudoers.d/agent
+    install -d -m 700 -o agent -g agent /home/agent/.ssh
+    printf "%s\n" "$SSH_PUBLIC_KEY" > /home/agent/.ssh/authorized_keys
+    chown agent:agent /home/agent/.ssh/authorized_keys
+    chmod 600 /home/agent/.ssh/authorized_keys
+    printf "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nPubkeyAuthentication yes\n" \
+      > /etc/ssh/sshd_config.d/00-terok.conf
+    mkdir -p /run/sshd
+    ssh-keygen -A
+    /usr/sbin/sshd -t
+    exec /usr/sbin/sshd -D -e
+  '
+BASH
+```
+
+Notes and invariants:
+
+- **Bind the SSH port to loopback only** (`127.0.0.1:2222`), never `0.0.0.0`.
+  The gateway reaches it through its own `ssh -N -L` tunnel; the container port
+  must not be exposed publicly.
+- **Persistence:** `--restart unless-stopped` and the bind-mounted `HOST_HOME`
+  keep the toolchain and `agent` home across container recreation. Never recreate
+  the container merely to restart it.
+- **Install `ssh-keygen -A` before first boot** (as above): the container needs
+  its own host keys, and the gateway pins that key.
+- **GPU flags are creation-time only.** `--device`, `--gpus`, `--group-add`,
+  `--security-opt` and `-p` are frozen in `HostConfig`; `stop`/`start` cannot add
+  them. To change devices later, snapshot (`docker commit --change 'CMD
+  ["/usr/sbin/sshd","-D","-e"]' terok-dev terok-dev-snapshot`), rename the old
+  container, and re-run under the same name — never delete it blindly. Keep the
+  image tag free of an environment suffix.
+- **Driver policy:** the NVIDIA kernel driver lives on the host and MUST NOT be
+  installed inside the container. Verify with `docker exec terok-dev nvidia-smi`.
+- The `agent` user, `sudo` without password, and key-only auth (no passwords, no
+  root login) match the gateway's default target (`user = "agent"`).
+- For the next step, the sshd the gateway pins is this container's — read it from
+  inside (`/etc/ssh/ssh_host_ed25519_key.pub`) or scan the loopback port.
+
 ### Obtain the container host-key fingerprint
 
 For a tunnelled target, set `host_key_sha256` to the fingerprint of the sshd the
