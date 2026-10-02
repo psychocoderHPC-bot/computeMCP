@@ -1034,6 +1034,21 @@ async def test_console_clients_and_actions(monkeypatch):
     assert calls == ["hal"], calls
 
 
+async def test_console_target_commands_without_argument_print_usage():
+    """Bare connect/refresh/reconnect/stop/client must not raise IndexError."""
+    import io
+    import contextlib
+
+    gw = make_gateway()
+    for cmd in ("connect", "refresh", "reconnect", "stop", "client"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            keep_going = await gw._console_command(cmd)
+        out = buf.getvalue()
+        assert keep_going is True
+        assert out.startswith(f"usage: {cmd} <"), (cmd, out)
+
+
 async def test_generate_tokens_writes_hashes_and_authenticates(tmp_path):
     from terok_compute.auth import hash_token
     from terok_compute.gateway import generate_tokens

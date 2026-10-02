@@ -53,8 +53,50 @@ Create a dedicated gateway-to-container key (never the user's normal key):
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/terok_compute_container -C terok-compute-gateway
-# install only the .pub half in the remote development containers
+# install only the .pub half in the remote development containers, as the
+# `authorized_keys` of the target `user` (default "agent"):
+ssh-copy-id -i ~/.ssh/terok_compute_container.pub agent@<container-host>
 ```
+
+> **Replace every `/home/USER` placeholder.** `config.example.toml` uses
+> `/home/USER/...` so it is obviously a template; a target that keeps the
+> literal string `USER` (e.g. `client_key = "/home/USER/.ssh/..."`) *parses*
+> fine but every `exec`/session fails with
+> `SSH connection to target '<t>' failed: [Errno 2] No such file or directory`.
+> Set the real absolute path for `client_key`, `token_file`, etc.
+
+### Obtain the container host-key fingerprint
+
+For a tunnelled target, set `host_key_sha256` to the fingerprint of the sshd the
+gateway dials — the development **container's** sshd (`remote_port`, usually
+2222), not the host's own sshd on port 22. A `known_hosts` file cannot be used
+reliably here because a tunnel maps an ephemeral local port.
+
+Run this on the host, using an SSH alias that actually reaches the container:
+
+```bash
+# If the alias drops you into the container, read its own host key:
+ssh <alias> 'cat /etc/ssh/ssh_host_ed25519_key.pub' | ssh-keygen -lf - | awk '{print $2}'
+
+# Otherwise, have the alias scan the port-2222 sshd on its own loopback:
+ssh <alias> 'ssh-keyscan -t ed25519 -p 2222 127.0.0.1 2>/dev/null' \
+    | ssh-keygen -lf - | awk '{print $2}'
+# => SHA256:l/zxYjSYKwDVXFzcUwD/buQoCiznnL+eMZaxL7GsNEE
+```
+
+Beware of entries for the plain hostname in `~/.ssh/known_hosts`: an unqualified
+`hostname` means **port 22**, so its fingerprint is usually the wrong key. Look
+for an explicitly port-qualified entry (`[host]:2222`) instead:
+
+```bash
+grep -i '<container-host>' ~/.ssh/known_hosts
+ssh-keygen -lf ~/.ssh/known_hosts
+```
+
+Because a DNS name may only resolve on one network (e.g. a company LAN) and not
+another (home/VPN), put both routes in `ssh_targets` so the gateway can fail
+over: the first alias is tried, then the next. The pin is route-independent —
+every route reaches the same container sshd, so one fingerprint covers them all.
 
 ## Example configuration
 

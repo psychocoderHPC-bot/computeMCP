@@ -6,6 +6,10 @@
 # Copy to ~/.config/terok-compute-gateway/config.toml and edit.
 # The gateway TOML is the single source of truth for targets.  Values here are
 # never accepted from MCP clients.
+#
+# Replace every "/home/USER" placeholder with your real home directory.  A
+# literal "USER" path parses fine but makes every exec/session fail with
+# "[Errno 2] No such file or directory".
 
 [server]
 # Bind address. On the host that Terok/Podman reaches via
@@ -68,8 +72,14 @@ remote_port = 2222
 user = "agent"
 # Mandatory for production: pin the development-container host key.  Because a
 # tunnel maps an ephemeral local port to the container, a known_hosts file
-# cannot reliably match; pin the fingerprint instead.  Obtain with:
-#   ssh-keyscan -p 2222 127.0.0.1 | ssh-keygen -lf -
+# cannot reliably match; pin the fingerprint instead.  The pinned key is the
+# sshd the gateway dials (remote_port, usually 2222) -- the CONTAINER's sshd,
+# not the host's own sshd on port 22, and not a random Slurm compute-node key.
+# Obtain it on the host via an alias that reaches the container:
+#   ssh <alias> 'cat /etc/ssh/ssh_host_ed25519_key.pub' | ssh-keygen -lf - | awk '{print $2}'
+#   ssh <alias> 'ssh-keyscan -t ed25519 -p 2222 127.0.0.1 2>/dev/null' | ssh-keygen -lf - | awk '{print $2}'
+# An unqualified hostname in ~/.ssh/known_hosts means port 22, so its
+# fingerprint is usually the wrong key; look for a "[host]:2222" entry.
 # If the container offers several host-key algorithms, restrict negotiation to
 # the one you pinned so the fingerprint always matches.
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"

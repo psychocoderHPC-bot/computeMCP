@@ -1060,14 +1060,16 @@ class Gateway:
                 print(self.public_status(args[0]))
             else:
                 self._print_status_table()
-        elif cmd == "connect":
-            print(await self.connect_target(args[0]))
-        elif cmd == "refresh":
-            print(await self.refresh_target(args[0]))
-        elif cmd == "reconnect":
-            print(await self.refresh_target(args[0]))
-        elif cmd == "stop":
-            print(await self.stop_target(args[0]))
+        elif cmd in ("connect", "refresh", "reconnect", "stop"):
+            if not args:
+                print(f"usage: {cmd} <target>")
+                return True
+            if cmd == "connect":
+                print(await self.connect_target(args[0]))
+            elif cmd == "stop":
+                print(await self.stop_target(args[0]))
+            else:  # refresh / reconnect both re-run route failover
+                print(await self.refresh_target(args[0]))
         elif cmd == "connect-all":
             for name in self.config.targets:
                 with contextlib.suppress(Exception):
@@ -1082,6 +1084,9 @@ class Gateway:
         elif cmd == "clients":
             self._print_clients_table()
         elif cmd == "client":
+            if not args:
+                print("usage: client <name>")
+                return True
             self._print_client(args[0])
         elif cmd in ("client-refresh", "client-connect", "client-stop"):
             await self._client_target_action(cmd, args)
