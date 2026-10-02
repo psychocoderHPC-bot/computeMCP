@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: René Widera
+#
+# SPDX-License-Identifier: ISC
+
+[Unit]
+Description=Terok Compute Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/terok-compute-gateway --config %h/.config/terok-compute-gateway/config.toml --no-console
+Restart=on-failure
+RestartSec=3
+# The service must never run as root.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

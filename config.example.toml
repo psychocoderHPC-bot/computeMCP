@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: René Widera
+#
+# SPDX-License-Identifier: ISC
+
+# Terok Compute Gateway configuration.
+#
+# Copy to ~/.config/terok-compute-gateway/config.toml and edit.
+# The gateway TOML is the single source of truth for targets.  Values here are
+# never accepted from MCP clients.
+
+[server]
+# Bind address. On the host that Terok/Podman reaches via
+# host.containers.internal this is typically the host-side gateway address
+# (e.g. 10.0.2.2 or 0.0.0.0 restricted by the Terok shield). Keep it loopback
+# unless a container must reach it.
+listen = "127.0.0.1"
+port = 2222
+request_timeout = 30.0
+exec_timeout = 900.0
+max_body_bytes = 268435456
+
+[ssh]
+connect_timeout = 10
+server_alive_interval = 30
+server_alive_count_max = 3
+internal_port_min = 31000
+internal_port_max = 31999
+# Optional dedicated SSH config used by the tunnel subprocess.  Leave unset to
+# use the gateway user's normal ~/.ssh/config.  Keeping a separate file lets the
+# gateway own only the aliases it needs.
+# config = "/home/USER/.config/terok-compute-gateway/ssh_config"
+
+[sessions]
+idle_timeout = 3600.0
+max_per_client = 16
+output_buffer_bytes = 4194304
+
+[auth]
+# Recommended: generate tokens and store only their hashes here.
+#   terok-compute-gateway --config <this> --generate-tokens tokens.toml
+# Then uncomment the line below (and remove the inline `token` entries in
+# [clients.*]).
+# token_file = "/home/USER/.config/terok-compute-gateway/tokens.toml"
+
+# ---------------------------------------------------------------------------
+# Clients. Each Terok project gets a dedicated high-entropy token.  Prefer
+# `--generate-tokens` + token_file.  Inline `token` (hashed on load) or
+# `token_hash` is accepted for bootstrapping.  Never reuse an SSH key or a
+# GitHub token here.
+# ---------------------------------------------------------------------------
+[clients.alpaka]
+token = "REPLACE_WITH_PROJECT_TOKEN"
+targets = ["hal", "fwk394"]
+
+[clients.admin]
+token = "REPLACE_WITH_ADMIN_TOKEN"
+targets = ["*"]
+
+# ---------------------------------------------------------------------------
+# Targets.  `ssh_targets` are aliases from the local user's SSH config, in
+# priority order.  The gateway starts `ssh -N -L` through the first alias that
+# works.  Transport defaults to "tunnel" when ssh_targets is present, and
+# "direct" otherwise.
+# ---------------------------------------------------------------------------
+[targets.hal]
+ssh_targets = ["hal", "ex_hal"]
+remote_host = "127.0.0.1"
+remote_port = 2222
+user = "agent"
+# Mandatory for production: pin the development-container host key.  Because a
+# tunnel maps an ephemeral local port to the container, a known_hosts file
+# cannot reliably match; pin the fingerprint instead.  Obtain with:
+#   ssh-keyscan -p 2222 127.0.0.1 | ssh-keygen -lf -
+# If the container offers several host-key algorithms, restrict negotiation to
+# the one you pinned so the fingerprint always matches.
+host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+host_key_algorithms = ["ssh-ed25519"]
+client_key = "/home/USER/.ssh/terok_compute_container"
+# "shared" (default) multiplexes all exec/sessions over one SSH connection.
+# "dedicated" opens a fresh connection per exec/session, bypassing the remote
+# sshd's per-connection MaxSessions limit (commonly 10) at the cost of more
+# handshakes. Use "dedicated" for many simultaneous long-running sessions.
+connect_mode = "shared"
+auto_connect = true
+connect_backoff_initial = 1.0
+connect_backoff_max = 60.0
+
+# A target reachable without a tunnel (e.g. gateway co-located with the
+# container, or the dev-hal test setup in this repository).
+[targets.hal-direct]
+transport = "direct"
+remote_host = "host.containers.internal"
+remote_port = 2222
+user = "agent"
+known_hosts = "/home/USER/.ssh/known_hosts"
+client_key = "/home/USER/.ssh/terok_hal_task"
+
+[targets.fwk394]
+ssh_targets = ["fwk394", "ex_fwk394"]
+remote_host = "127.0.0.1"
+remote_port = 2222
+user = "agent"
+host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+client_key = "/home/USER/.ssh/terok_compute_container"
+
+# A target with many simultaneous long-running sessions can opt out of the
+# remote sshd's per-connection MaxSessions limit.
+# [targets.gpu03]
+# ssh_targets = ["gpu03"]
+# remote_host = "127.0.0.1"
+# remote_port = 2222
+# user = "agent"
+# connect_mode = "dedicated"
+# host_key_sha256 = "SHA256:..."
+# client_key = "/home/USER/.ssh/terok_compute_container"

@@ -1,0 +1,10 @@
+version = 1
+SPDX-PackageName = "computeMCP"
+SPDX-PackageSupplier = "René Widera <r.widera@hzdr.de>"
+SPDX-PackageDownloadLocation = "https://github.com/psychocoderHPC-bot/computeMCP"
+
+[[annotations]]
+path = ["README.md", "LICENSE", ".gitignore"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "René Widera"
+SPDX-License-Identifier = "ISC"

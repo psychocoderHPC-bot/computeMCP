@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: René Widera
+#
+# SPDX-License-Identifier: ISC
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terok-compute-gateway"
+version = "0.1.0"
+description = "Secure gateway and MCP bridge giving Terok agents access to remote compute containers"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncssh>=2.20",
+    "aiohttp>=3.10",
+    "mcp>=2,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+terok-compute-gateway = "terok_compute.gateway:main"
+terok-compute-mcp = "terok_compute.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
