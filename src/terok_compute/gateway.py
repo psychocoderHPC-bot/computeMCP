@@ -27,6 +27,8 @@ from .config import (
     ConfigError,
     GatewayConfig,
     TargetConfig,
+    default_config_path,
+    default_token_path,
     load_config,
 )
 from .files import sftp_client
@@ -1255,7 +1257,13 @@ async def _error_middleware(request: web.Request, handler):
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="terok-compute-gateway")
-    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_config_path(),
+        help="gateway config.toml (default: "
+        "~/.config/terok-compute-gateway/config.toml)",
+    )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--listen", help="override server.listen")
     parser.add_argument("--port", type=int, help="override server.port")
@@ -1276,9 +1284,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--generate-tokens",
+        nargs="?",
+        const=str(default_token_path()),
         metavar="OUT",
         help="generate a fresh high-entropy token for every configured client, "
-        "write token hashes to OUT, print the plaintext tokens once, and exit",
+        "write token hashes to OUT (default: "
+        "~/.config/terok-compute-gateway/tokens.toml), print the plaintext "
+        "tokens once, and exit",
     )
     parser.add_argument("--log-level", default="INFO")
     return parser

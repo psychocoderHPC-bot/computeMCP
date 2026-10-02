@@ -28,7 +28,12 @@ import sys
 
 import aiohttp
 
-from .config import ConfigError, GatewayConfig, load_config
+from .config import (
+    ConfigError,
+    GatewayConfig,
+    default_config_path,
+    load_config,
+)
 
 
 def _resolve_gateway(config: GatewayConfig, override: str | None) -> str:
@@ -76,7 +81,12 @@ def _resolve_token(config_path: str, token_file: str | None,
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="terok-compute-gatewayctl")
-    parser.add_argument("--config", required=True, help="gateway config.toml")
+    parser.add_argument(
+        "--config",
+        default=str(default_config_path()),
+        help="gateway config.toml (default: "
+        "~/.config/terok-compute-gateway/config.toml)",
+    )
     parser.add_argument("--token-file", help="override [auth] token_file")
     parser.add_argument("--gateway", help="gateway base URL (default from config/env)")
     parser.add_argument("--token", help="admin/operator bearer token")

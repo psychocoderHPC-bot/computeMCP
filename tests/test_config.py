@@ -204,3 +204,66 @@ def test_missing_token_file_is_rejected(tmp_path):
     raw["clients"] = {"alpaka": {"targets": ["hal"]}}
     with pytest.raises(FileNotFoundError):
         parse_config(raw, token_file=str(tmp_path / "nope.toml"))
+
+
+def test_default_paths_use_xdg_config_home(tmp_path, monkeypatch):
+    from terok_compute.config import default_config_path, default_token_path
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert default_config_path() == tmp_path / "terok-compute-gateway" / "config.toml"
+    assert default_token_path() == tmp_path / "terok-compute-gateway" / "tokens.toml"
+
+
+def test_load_config_defaults_to_xdg_config_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfgdir = tmp_path / "terok-compute-gateway"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "config.toml").write_text(
+        textwrap.dedent(
+            """
+            [clients.ci]
+            token = "abc"
+            targets = ["hal"]
+
+            [targets.hal]
+            ssh_targets = ["hal"]
+            user = "agent"
+            host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+            """
+        )
+    )
+    cfg = load_config()  # no path -> conventional location
+    assert cfg.server.port == 2222
+    assert "hal" in cfg.targets
+
+
+def test_load_config_picks_up_sibling_default_token_file(tmp_path, monkeypatch):
+    from terok_compute.auth import hash_token
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cfgdir = tmp_path / "terok-compute-gateway"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "config.toml").write_text(
+        textwrap.dedent(
+            """
+            [clients.ci]
+            targets = ["hal"]
+
+            [targets.hal]
+            ssh_targets = ["hal"]
+            user = "agent"
+            host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+            """
+        )
+    )
+    (cfgdir / "tokens.toml").write_text(f'[tokens]\nci = "{hash_token("sekret")}"\n')
+    cfg = load_config()
+    assert cfg.clients["ci"].token_sha256 == hash_token("sekret")
+    assert cfg.token_file == str(cfgdir / "tokens.toml")
+
+
+def test_explicit_token_file_still_required_when_named(tmp_path):
+    raw = base_raw()
+    raw["clients"] = {"alpaka": {"targets": ["hal"]}}
+    with pytest.raises(FileNotFoundError):
+        parse_config(raw, token_file=str(tmp_path / "explicit-missing.toml"))

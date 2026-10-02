@@ -270,13 +270,23 @@ client_key = "/home/USER/.ssh/terok_compute_container"
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 ```
 
-After editing, generate token hashes, then start the gateway:
+After editing, generate token hashes, then start the gateway. When the files
+live in the conventional location, `--config` and `--generate-tokens` can be
+omitted:
 
 ```bash
-terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml \
-    --generate-tokens ~/.config/terok-compute-gateway/tokens.toml
-terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml
+terok-compute-gateway --generate-tokens   # -> ~/.config/terok-compute-gateway/tokens.toml
+terok-compute-gateway                     # -> ~/.config/terok-compute-gateway/config.toml
 ```
+
+**Path resolution.** `--config` defaults to
+`$XDG_CONFIG_HOME/terok-compute-gateway/config.toml` (or
+`~/.config/terok-compute-gateway/config.toml`); an explicit `--config` always
+wins. `--token-file` is resolved in this order: the flag, then
+`[auth] token_file`, then a `tokens.toml` sitting next to the config **if it
+exists**. A missing *explicit* token file is an error; a missing *conventional*
+one is not (inline client tokens may still be in use). Create the config
+directory once with `mkdir -p ~/.config/terok-compute-gateway`.
 
 ### Generate project tokens
 
@@ -285,13 +295,16 @@ issued once; only its `sha256` hash is stored on the gateway. The plaintext is
 printed once for you to inject into that project's Terok environment.
 
 ```bash
-# writes hashes to tokens.toml (chmod 600) and prints the plaintext tokens
-terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml \
-    --generate-tokens ~/.config/terok-compute-gateway/tokens.toml
+# writes hashes to the default tokens.toml (chmod 600) and prints the tokens
+terok-compute-gateway --generate-tokens
+
+# or point somewhere else explicitly:
+terok-compute-gateway --config /path/config.toml --generate-tokens /path/tokens.toml
 ```
 
 Point the gateway at that file with `[auth] token_file = "..."` (or
-`--token-file`). Then, in each Terok container set the matching plaintext token:
+`--token-file`). If neither is set, a `tokens.toml` next to `config.toml` is
+used automatically. Then, in each Terok container set the matching plaintext token:
 
 ```
 TEROK_COMPUTE_GATEWAY=http://host.containers.internal:2222
@@ -361,11 +374,14 @@ cp skills/terok-compute/SKILL.md ~/.config/opencode/skills/terok-compute/SKILL.m
 ## Run the gateway
 
 ```bash
-# interactive (operator console)
-terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml
+# interactive (operator console); uses the default config location
+terok-compute-gateway
 
 # headless (systemd)
-terok-compute-gateway --config ~/.config/terok-compute-gateway/config.toml --no-console
+terok-compute-gateway --no-console
+
+# or point at an explicit file
+terok-compute-gateway --config /path/to/config.toml
 ```
 
 Console commands: `targets`, `status [target]`, `connect`, `refresh`,

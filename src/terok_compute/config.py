@@ -10,6 +10,7 @@ used as an SSH destination; only values loaded here are legal.
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -19,9 +20,29 @@ TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 VALID_STATES = ("disconnected", "connecting", "connected", "failed")
 
+# Default location used when the operator does not point at a file explicitly.
+# ``$XDG_CONFIG_HOME`` is honored, falling back to ``~/.config``.
+DEFAULT_CONFIG_DIR = "terok-compute-gateway"
+DEFAULT_CONFIG_NAME = "config.toml"
+DEFAULT_TOKEN_NAME = "tokens.toml"
+
 
 class ConfigError(ValueError):
     """Raised when a configuration file is missing, malformed or unsafe."""
+
+
+def _xdg_config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+def default_config_path() -> Path:
+    """Return the default ``config.toml`` path (used when --config is omitted)."""
+    return _xdg_config_home() / DEFAULT_CONFIG_DIR / DEFAULT_CONFIG_NAME
+
+
+def default_token_path() -> Path:
+    """Return the default ``tokens.toml`` path (used when --token-file is omitted)."""
+    return _xdg_config_home() / DEFAULT_CONFIG_DIR / DEFAULT_TOKEN_NAME
 
 
 def validate_target_name(name: str) -> str:
@@ -345,10 +366,28 @@ def parse_config(
         targets[name] = _load_target(name, value, ssh)
 
     auth_raw = _require_table(raw, "auth")
+    # Resolution order: explicit --token-file, then [auth] token_file, then the
+    # conventional tokens.toml next to the config when it exists.  A missing
+    # default is not an error -- inline client tokens may still be in use.
     token_path = token_file or auth_raw.get("token_file")
+    explicit_token = token_path is not None
+    if token_path is None:
+        candidate = (
+            Path(config_path).parent / DEFAULT_TOKEN_NAME
+            if config_path
+            else default_token_path()
+        )
+        if candidate.exists():
+            token_path = str(candidate)
     external_hashes: dict[str, str] = {}
     if token_path:
-        external_hashes = _token_hashes_from_file_table(load_tokens(token_path))
+        try:
+            external_hashes = _token_hashes_from_file_table(load_tokens(token_path))
+        except FileNotFoundError:
+            # Only an explicitly named token file must exist.
+            if explicit_token:
+                raise
+            token_path = None
     clients = _load_clients(raw, targets, external_hashes)
 
     if not clients:
@@ -369,9 +408,10 @@ def parse_config(
 
 
 def load_config(
-    path: str | Path, token_file: str | Path | None = None
+    path: str | Path | None = None, token_file: str | Path | None = None
 ) -> GatewayConfig:
-    path = Path(path)
+    # An omitted --config falls back to the conventional location.
+    path = Path(path) if path is not None else default_config_path()
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)

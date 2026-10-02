@@ -40,9 +40,11 @@ output_buffer_bytes = 4194304
 
 [auth]
 # Recommended: generate tokens and store only their hashes here.
-#   terok-compute-gateway --config <this> --generate-tokens tokens.toml
+#   terok-compute-gateway --generate-tokens
 # Then uncomment the line below AND delete every inline `token = ...` in
-# [clients.*].  IMPORTANT: an inline `token` takes precedence over `token_file`.
+# [clients.*].  If you do not set token_file, a tokens.toml next to this file is
+# picked up automatically.  IMPORTANT: an inline `token` takes precedence over
+# token_file.
 # If you enable token_file but leave the example's inline
 # `token = "REPLACE_WITH_..."`, the gateway authenticates against the
 # placeholder hash and every client request fails with "invalid token".
