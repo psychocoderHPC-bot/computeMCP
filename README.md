@@ -167,6 +167,81 @@ Notes and invariants:
 - For the next step, the sshd the gateway pins is this container's — read it from
   inside (`/etc/ssh/ssh_host_ed25519_key.pub`) or scan the loopback port.
 
+### AMD / HIP (ROCm) container variant
+
+The gateway is GPU-agnostic (it only tunnels SSH), so an AMD target needs no
+gateway change. Only the **dev container** recipe differs: replace the NVIDIA
+`--device /dev/dri:/dev/dri --gpus all` with the ROCm device- and group-access
+flags. `--gpus` (NVIDIA runtime) does **not** expose an AMD GPU; ROCm needs the
+KFD and DRM character devices plus the `video`/`render` groups.
+
+```bash
+docker run -d \
+  --name "$CONTAINER_NAME" \
+  --restart unless-stopped \
+  --device /dev/kfd --device /dev/dri \
+  --security-opt seccomp=unconfined \
+  --group-add video --group-add render \
+  -p 127.0.0.1:2222:22 \
+  --mount "type=bind,src=$HOST_HOME,dst=/home/agent" \
+  -e "SSH_PUBLIC_KEY=$SSH_PUBLIC_KEY" \
+  -e "AGENT_UID=$AGENT_UID" \
+  -e "AGENT_GID=$AGENT_GID" \
+  ubuntu:24.04 \
+  bash -euc '
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
+    groupadd --gid "$AGENT_GID" agent
+    useradd --uid "$AGENT_UID" --gid "$AGENT_GID" \
+      --home-dir /home/agent --no-create-home --shell /bin/bash agent
+    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
+    chmod 440 /etc/sudoers.d/agent
+    install -d -m 700 -o agent -g agent /home/agent/.ssh
+    printf "%s\n" "$SSH_PUBLIC_KEY" > /home/agent/.ssh/authorized_keys
+    chown agent:agent /home/agent/.ssh/authorized_keys
+    chmod 600 /home/agent/.ssh/authorized_keys
+    printf "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nPubkeyAuthentication yes\n" \
+      > /etc/ssh/sshd_config.d/00-terok.conf
+    mkdir -p /run/sshd
+    ssh-keygen -A
+    /usr/sbin/sshd -t
+    exec /usr/sbin/sshd -D -e
+  '
+```
+
+The same guards, host-key generation and persistence notes as the NVIDIA recipe
+apply. Additional AMD-specific points:
+
+- **`--security-opt seccomp=unconfined`** is effectively required: the default
+  Docker seccomp profile blocks the `ioctls` ROCm needs (`kfd` / `amdgpu`),
+  causing `HSA_STATUS_ERROR` or "no GPU".
+
+- **`/dev/kfd` is the ROCm compute device**; `/dev/dri` (`renderD*`, `card*`) is
+  the DRM/render device. Both are needed; `--gpus all` alone is not enough on
+  AMD.
+
+- **Group access:** the container process must be in the host's `video` and
+  `render` groups to open those devices. `--group-add video --group-add render`
+  resolves the names against the **container's** `/etc/group`; if the host GIDs
+  differ (common on non-Ubuntu hosts, and `render` may be absent in the image),
+  add the numeric host GIDs instead:
+
+  ```bash
+  --group-add "$(getent group video  | cut -d: -f3)" \
+  --group-add "$(getent group render | cut -d: -f3)"
+  ```
+
+- **Driver policy (AMD):** the `amdgpu` / ROCm kernel driver lives on the **host**
+  and MUST NOT be installed inside the container. The base `ubuntu:24.04` image
+  ships **no ROCm user space** — the agent installs the matching ROCm userspace
+  toolchain later, exactly as it installs CUDA toolkits for an NVIDIA target.
+  Once installed, verify with `docker exec terok-dev rocminfo` (and
+  `rocm-smi`), analogously to `nvidia-smi`.
+
+- **Creation-time only:** as with the NVIDIA flags, `--device`, `--group-add`
+  and `--security-opt` are frozen in `HostConfig`; they cannot be added by
+  `stop`/`start`. Use the snapshot/rename/recreate procedure above.
+
 ### Obtain the container host-key fingerprint
 
 For a tunnelled target, set `host_key_sha256` to the fingerprint of the sshd the
