@@ -191,6 +191,18 @@ Register a single MCP in OpenCode:
 The MCP does not need SSH credentials and never learns `hal`, `ex_hal`,
 ProxyJump aliases or internal forward ports.
 
+### Agent skill
+
+A ready-to-use skill that teaches an AI agent how to drive the `compute` MCP
+(discover systems, run commands, parallel sessions, file transfer) ships in
+[`skills/terok-compute/SKILL.md`](skills/terok-compute/SKILL.md). Install it
+where the agent loads skills, for example:
+
+```bash
+mkdir -p ~/.config/opencode/skills/terok-compute
+cp skills/terok-compute/SKILL.md ~/.config/opencode/skills/terok-compute/SKILL.md
+```
+
 ## Run the gateway
 
 ```bash
