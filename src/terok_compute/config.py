@@ -136,6 +136,11 @@ class ServerConfig:
     request_timeout: float = 30.0
     exec_timeout: float = 900.0
     max_body_bytes: int = 256 * 1024 * 1024
+    # Out-of-band client enrollment (see enrollment.py).  Approval is always an
+    # explicit operator action; these only bound the unauthenticated surface.
+    allow_enrollment: bool = True
+    enroll_ttl: float = 600.0
+    enroll_max_pending: int = 32
 
 
 @dataclass(frozen=True)
@@ -338,6 +343,11 @@ def parse_config(
         request_timeout=_float(server_raw.get("request_timeout"), "request_timeout", 30.0),
         exec_timeout=_float(server_raw.get("exec_timeout"), "exec_timeout", 900.0),
         max_body_bytes=_int(server_raw.get("max_body_bytes"), "max_body_bytes", 256 * 1024 * 1024),
+        allow_enrollment=bool(server_raw.get("allow_enrollment", True)),
+        enroll_ttl=_float(server_raw.get("enroll_ttl"), "server.enroll_ttl", 600.0),
+        enroll_max_pending=_int(
+            server_raw.get("enroll_max_pending"), "server.enroll_max_pending", 32
+        ),
     )
 
     ssh_raw = _require_table(raw, "ssh")
@@ -445,3 +455,118 @@ def load_tokens(path: str | Path) -> dict[str, str]:
     if not isinstance(table, dict):
         raise ConfigError("token file must contain a [tokens] table")
     return {str(k): str(v) for k, v in table.items()}
+
+
+def _toml_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _atomic_write(path: Path, text: str, mode: int | None = None) -> None:
+    """Write ``text`` to ``path`` via a temp file + rename (atomic on POSIX)."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(text)
+    if mode is not None:
+        try:
+            tmp.chmod(mode)
+        except OSError:
+            pass
+    os.replace(tmp, path)
+
+
+def append_client(
+    config_path: str | Path,
+    client_id: str,
+    targets: tuple[str, ...],
+    label: str | None = None,
+) -> None:
+    """Append a ``[clients.<id>]`` block to the config, then re-validate it.
+
+    The block is only ever *appended*; existing content (including operator
+    comments) is preserved.  The whole file is re-parsed afterwards, and the
+    caller should only rely on it once that validation passes.  A duplicate
+    client id is refused.
+    """
+    validate_target_name(client_id)
+    path = Path(config_path)
+    with path.open("rb") as handle:
+        raw = tomllib.load(handle)
+    if client_id in raw.get("clients", {}):
+        raise ConfigError(f"client {client_id!r} already exists in {path}")
+
+    known = set(raw.get("targets", {}))
+    for target in targets:
+        if target != "*" and target not in known:
+            raise ConfigError(
+                f"unknown target {target!r} for client {client_id!r}; "
+                f"known targets: {', '.join(sorted(known)) or '(none)'}"
+            )
+
+    lines = [
+        "",
+        f"[clients.{client_id}]",
+        f"targets = [{', '.join(_toml_quote(t) for t in targets)}]",
+    ]
+    if label:
+        lines.append(f"label = {_toml_quote(label)}")
+    block = "\n".join(lines) + "\n"
+
+    existing = path.read_text()
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    _atomic_write(path, existing + block)
+
+    # Validate what we just wrote; leave the file in place only if it is safe.
+    try:
+        load_config(path, token_file=None)
+    except ConfigError:
+        # Restore the previous content so a bad append cannot brick reloads.
+        _atomic_write(path, existing)
+        raise
+
+
+def append_token_hash(
+    token_path: str | Path, client_id: str, token: str, *, create: bool = True
+) -> None:
+    """Append ``client_id = sha256:<hash>`` under ``[tokens]`` atomically.
+
+    If the file does not exist it is created (chmod 600).  An existing entry for
+    the same client id is replaced in place so rotation is idempotent.
+    """
+    from .auth import hash_token
+
+    validate_target_name(client_id)
+    path = Path(token_path)
+    entry = f"{_toml_quote(client_id)} = {_toml_quote(hash_token(token))}"
+
+    if not path.exists():
+        if not create:
+            raise ConfigError(f"token file not found: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(path, f"[tokens]\n{entry}\n", mode=0o600)
+        return
+
+    lines = path.read_text().splitlines()
+    out: list[str] = []
+    replaced = False
+    header_seen = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[tokens]"):
+            header_seen = True
+            out.append(line)
+            continue
+        if stripped.startswith(f"{_toml_quote(client_id)} =") or stripped.startswith(
+            f"{client_id} ="
+        ):
+            out.append(entry)
+            replaced = True
+            continue
+        out.append(line)
+    if not header_seen:
+        out.append("")
+        out.append("[tokens]")
+    if not replaced:
+        out.append(entry)
+    _atomic_write(path, "\n".join(out).rstrip("\n") + "\n", mode=0o600)

@@ -21,6 +21,12 @@ port = 2222
 request_timeout = 30.0
 exec_timeout = 900.0
 max_body_bytes = 268435456
+# Interactive enrollment (terok-handshake).  /v1/enroll is unauthenticated but
+# grants nothing until an operator approves on the console; these bound it.
+# Set allow_enrollment = false to remove the endpoint entirely.
+allow_enrollment = true
+enroll_ttl = 600.0
+enroll_max_pending = 32
 
 [ssh]
 connect_timeout = 10

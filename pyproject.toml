@@ -23,6 +23,7 @@ test = ["pytest>=8", "pytest-asyncio>=0.24"]
 terok-compute-gateway = "terok_compute.gateway:main"
 terok-compute-mcp = "terok_compute.mcp_server:main"
 terok-compute-gatewayctl = "terok_compute.control:main"
+terok-handshake = "terok_compute.handshake:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

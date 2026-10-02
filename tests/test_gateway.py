@@ -1099,3 +1099,188 @@ async def test_upload_requires_target_acl(monkeypatch):
         assert resp.status == 403
     finally:
         await client.close()
+
+
+async def _enroll_flow(tmp_path, monkeypatch):
+    """Build a gateway backed by real files so enrollment can persist."""
+    from terok_compute.config import load_config
+    from terok_compute.gateway import Gateway
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        """
+        [clients.ci]
+        token = "ci-secret"
+        targets = ["hal"]
+
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    gw = Gateway(load_config(cfg))
+    return gw, cfg
+
+
+async def test_enroll_request_approve_delivers_token(tmp_path, monkeypatch):
+    gw, cfg = await _enroll_flow(tmp_path, monkeypatch)
+    client = await make_client(gw)
+    try:
+        # Unauthenticated request to enroll.
+        resp = await client.post(
+            "/v1/enroll",
+            json={"client_id": "picongpu-bot-dev2", "targets": ["hal"], "label": "PIC"},
+        )
+        assert resp.status == 200, await resp.text()
+        created = await resp.json()
+        rid, secret = created["request_id"], created["poll_secret"]
+
+        # Pending until approved.
+        resp = await client.get(f"/v1/enroll/{rid}", headers={"X-Enroll-Secret": secret})
+        assert (await resp.json())["status"] == "pending"
+
+        # Admin can see it and approve it.
+        resp = await client.get("/v1/enroll-requests", headers=auth("admin-token"))
+        assert [r["client_id"] for r in (await resp.json())["pending"]] == [
+            "picongpu-bot-dev2"
+        ]
+        resp = await client.post(
+            f"/v1/enroll-requests/{rid}/approve", headers=auth("admin-token")
+        )
+        assert resp.status == 200, await resp.text()
+
+        # The requester now receives the token exactly once.
+        resp = await client.get(f"/v1/enroll/{rid}", headers={"X-Enroll-Secret": secret})
+        body = await resp.json()
+        assert body["status"] == "approved" and body["token"]
+        token = body["token"]
+
+        # And the delivered token authenticates against the live gateway.
+        resp = await client.get("/v1/targets", headers=auth(token))
+        assert resp.status == 200
+        names = [t["name"] for t in (await resp.json())["targets"]]
+        assert names == ["hal"]
+
+        # Second poll: token already consumed.
+        resp = await client.get(f"/v1/enroll/{rid}", headers={"X-Enroll-Secret": secret})
+        assert (await resp.json())["status"] == "consumed"
+
+        # Config file gained the client, comment-free but parseable.
+        assert "[clients.picongpu-bot-dev2]" in cfg.read_text()
+    finally:
+        await client.close()
+
+
+async def test_enroll_poll_requires_secret(tmp_path, monkeypatch):
+    gw, _ = await _enroll_flow(tmp_path, monkeypatch)
+    client = await make_client(gw)
+    try:
+        resp = await client.post("/v1/enroll", json={"client_id": "x", "targets": []})
+        rid = (await resp.json())["request_id"]
+        resp = await client.get(f"/v1/enroll/{rid}", headers={"X-Enroll-Secret": "nope"})
+        assert resp.status == 404
+    finally:
+        await client.close()
+
+
+async def test_enroll_rejects_existing_client_and_unknown_target(tmp_path, monkeypatch):
+    gw, _ = await _enroll_flow(tmp_path, monkeypatch)
+    client = await make_client(gw)
+    try:
+        resp = await client.post("/v1/enroll", json={"client_id": "ci", "targets": []})
+        assert resp.status == 409
+        resp = await client.post(
+            "/v1/enroll", json={"client_id": "newci", "targets": ["nope"]}
+        )
+        assert resp.status == 400
+    finally:
+        await client.close()
+
+
+async def test_enroll_disabled_returns_403(tmp_path):
+    from terok_compute.config import load_config
+    from terok_compute.gateway import Gateway
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        """
+        [server]
+        allow_enrollment = false
+
+        [clients.ci]
+        token = "ci-secret"
+        targets = ["hal"]
+
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    gw = Gateway(load_config(cfg))
+    client = await make_client(gw)
+    try:
+        resp = await client.post("/v1/enroll", json={"client_id": "x", "targets": []})
+        assert resp.status == 403
+    finally:
+        await client.close()
+
+
+async def test_enroll_deny_is_reported(tmp_path, monkeypatch):
+    gw, _ = await _enroll_flow(tmp_path, monkeypatch)
+    client = await make_client(gw)
+    try:
+        resp = await client.post("/v1/enroll", json={"client_id": "x", "targets": []})
+        created = await resp.json()
+        rid, secret = created["request_id"], created["poll_secret"]
+        await client.post(f"/v1/enroll-requests/{rid}/deny", headers=auth("admin-token"))
+        resp = await client.get(f"/v1/enroll/{rid}", headers={"X-Enroll-Secret": secret})
+        assert (await resp.json())["status"] == "denied"
+    finally:
+        await client.close()
+
+
+async def test_approve_rolls_back_token_when_config_append_fails(tmp_path, monkeypatch):
+    """A failed config append must not leave an orphan token hash behind."""
+    from terok_compute.config import load_config, load_tokens
+    from terok_compute.gateway import Gateway
+    import terok_compute.gateway as gwmod
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        """
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    gw = Gateway(load_config(cfg))
+    pending, _ = gw.enrollments.create("newci", ("hal",), None, None)
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated append failure")
+
+    # Fail only the config append, after the token hash was already written.
+    monkeypatch.setattr(gwmod, "append_client", boom)
+    with pytest.raises(RuntimeError):
+        await gw.approve_enrollment(pending.request_id)
+
+    tokens = tmp_path / "tokens.toml"
+    assert tokens.exists()
+    assert "newci" not in load_tokens(tokens)

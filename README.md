@@ -31,9 +31,11 @@ src/terok_compute/
   sessions.py     persistent PTY session manager (bounded buffers, quotas)
   files.py        SFTP file operations
   gateway.py      state machine, HTTP API, interactive console
+  enrollment.py   unauthenticated request queue + operator approval
+  handshake.py    terok-handshake: request access from inside a container
   mcp_server.py   MCP server (stdio) exposing compute_* tools
   control.py      terok-compute-gatewayctl operator CLI
-tests/            unit tests (69)
+tests/            unit tests (118)
 config.example.toml
 systemd/terok-compute-gateway.service
 ```
@@ -313,6 +315,56 @@ TEROK_COMPUTE_TOKEN=<that project's generated token>
 
 The token is the only credential the container holds; it is never the host SSH
 key and never committed to a repository.
+
+### Interactive enrollment with `terok-handshake`
+
+Instead of pre-generating a token and copying it around, a container can ask for
+one. Run `terok-handshake` **inside the Terok container**; it queues a request,
+waits while you approve it on the gateway console, receives the token, and wires
+it into the container:
+
+```bash
+terok-handshake picongpu-bot-dev2 --port 2223 --system hal,fwk394
+# --system is a comma-separated allow-list; omit it for an empty ACL
+# (no targets) or pass --system '*' for all targets.
+```
+
+Flow:
+
+```
+container                                     gateway (host)
+terok-handshake <client> --port 2223          console:
+   │  POST /v1/enroll  {client_id,targets}       gateway> enrollments
+   ├──────────────────────────────────────────►  REQUEST ... CLIENT ... TARGETS
+   │  (request queued, pending operator)         gateway> approve <request-id>
+   │  GET /v1/enroll/<id>  (poll)              → mint token, append
+   │◄──────── {status: approved, token} ──────    [clients.<id>] + tokens.toml,
+   └ writes TEROK_COMPUTE_* to ~/.bashrc          reload
+     and prints the MCP env snippet
+```
+
+The `/v1/enroll` request is **unauthenticated but grants nothing** — it only
+places a bounded, expiring entry in a queue. Nothing is created until an
+operator approves it (console `approve <id>`, or
+`terok-compute-gatewayctl approve <id>` with an admin token). On approval the
+gateway appends `[clients.<id>]` to `config.toml`, writes the token hash to
+`tokens.toml`, reloads, and hands the plaintext token to the requester exactly
+once; a poll secret proves ownership of the request.
+
+Container-side writing:
+
+- Default: an idempotent, marker-delimited block in `~/.bashrc` (re-running
+  replaces it).
+- `--env-file ~/.config/terok-compute/env`: write the token to that file (0600)
+  and only add a `source` line to `~/.bashrc`, keeping the secret out of the
+  shell history file.
+- `--no-write`: don't touch any file; just print the MCP `environment` snippet.
+- The running opencode will **not** see new shell variables (a long-lived
+  tmux/session manager keeps its old environment); paste the printed
+  `environment` block into the MCP entry, or restart from a fresh shell.
+
+Turn it off with `[server] allow_enrollment = false`. `enroll_ttl` (default
+600 s) and `enroll_max_pending` (default 32) bound the unauthenticated surface.
 
 ## Install the MCP inside a Terok container
 
@@ -675,6 +727,11 @@ GET    /v1/clients/{name}/sessions                   # admin
 DELETE /v1/clients/{name}/sessions                   # admin: close its sessions
 GET    /v1/files/stat|list|read ; PUT /v1/files/write|upload
 POST   /v1/files/mkdir|remove|rename|chmod
+POST   /v1/enroll                            # UNAUTHENTICATED: queue a request
+GET    /v1/enroll/{request}                  # poll (X-Enroll-Secret header)
+GET    /v1/enroll-requests                   # admin: list pending
+POST   /v1/enroll-requests/{request}/approve # admin
+POST   /v1/enroll-requests/{request}/deny    # admin
 ```
 
 `GET /v1/files/read?encoding=stream` streams raw bytes; `PUT /v1/files/upload`
@@ -698,6 +755,10 @@ short `sha256:` fingerprint.
   `404`.
 - Tokens are compared in constant time and stored as `sha256:` hashes.
 - The service runs as a normal user, never root.
+- Enrollment grants nothing on its own: `/v1/enroll` is unauthenticated but
+  only queues a bounded, expiring request; access exists only after an explicit
+  operator approval. The delivered token is readable exactly once, gated by a
+  poll secret, and a request cannot name an unknown target.
 
 ## Tests
 
@@ -706,11 +767,13 @@ pip install -e '.[test]'
 pytest -q
 ```
 
-The suite (42 tests) covers config validation/reload, auth/ACL, tunnel
-allocation and route failover (against a fake `ssh`), `connect_mode`
-validation, and the HTTP API (auth, discovery, exec, dedicated-connection
-open/close, session isolation, streaming upload, reload, malformed-config
-safety).
+The suite covers config validation/reload (including the default path
+resolution and atomic client/token append), auth/ACL, tunnel allocation and
+route failover (against a fake `ssh`), `connect_mode` validation, the HTTP API
+(auth, discovery, exec, dedicated-connection open/close, session isolation,
+streaming upload, reload, malformed-config safety), and the enrollment flow
+(unauthenticated request, admin approval, one-shot token delivery, `.bashrc`
+update, and end-to-end `terok-handshake` against a live gateway).
 
 End-to-end against the `dev-hal` development container used
 `transport = "direct"` for exec/PTY/SFTP/MCP plus a real `ssh -N -L` tunnel

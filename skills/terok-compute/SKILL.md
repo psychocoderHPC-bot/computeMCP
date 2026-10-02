@@ -46,6 +46,21 @@ If `compute_targets` does not return a system you expect, or a target shows
 `state != "connected"` with an error, report the gateway status. **Do not try
 to bypass the gateway** (no direct `ssh`, no host access).
 
+If the `compute` MCP is not configured at all (no tools available, or
+`TEROK_COMPUTE_GATEWAY`/`TEROK_COMPUTE_TOKEN` unset), you can request access
+with the `terok-handshake` tool **inside this container**:
+
+```
+terok-handshake <project-id> --port <gateway-port> [--system hal,fwk394]
+```
+
+It queues a request; a human must approve it on the gateway console
+(`approve <request-id>`). Tell the human the request id and that it is waiting.
+On approval the token is written to `~/.bashrc`, but the running agent will not
+see it until restarted (tmux keeps its old environment) — the command prints an
+`environment` block to paste into the MCP config. Never attempt to bypass the
+gateway while waiting.
+
 ## 2. Run a command
 
 For short, non-interactive commands use `compute_exec`. It returns

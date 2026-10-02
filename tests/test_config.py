@@ -9,6 +9,7 @@ import pytest
 from terok_compute.config import (
     ConfigError,
     load_config,
+    load_tokens,
     parse_config,
 )
 
@@ -267,3 +268,84 @@ def test_explicit_token_file_still_required_when_named(tmp_path):
     raw["clients"] = {"alpaka": {"targets": ["hal"]}}
     with pytest.raises(FileNotFoundError):
         parse_config(raw, token_file=str(tmp_path / "explicit-missing.toml"))
+
+
+def _write_base_config(path: Path, extra: str = "") -> None:
+    path.write_text(
+        textwrap.dedent(
+            """
+            # operator comment, must be preserved
+            [clients.ci]
+            token = "ci-secret"
+            targets = ["hal"]
+
+            [targets.hal]
+            ssh_targets = ["hal"]
+            user = "agent"
+            host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+            """
+        )
+        + extra
+    )
+
+
+def test_append_client_preserves_existing_and_loads(tmp_path):
+    from terok_compute.config import append_client, append_token_hash
+
+    cfg = tmp_path / "config.toml"
+    tok = tmp_path / "tokens.toml"
+    _write_base_config(cfg)
+    append_token_hash(tok, "newci", "plain", create=True)
+    append_client(cfg, "newci", ("hal",), "New CI")
+    text = cfg.read_text()
+    assert "# operator comment, must be preserved" in text
+    assert "[clients.newci]" in text
+    loaded = load_config(cfg, token_file=str(tok))
+    assert set(loaded.clients) == {"ci", "newci"}
+    assert loaded.clients["newci"].may_access("hal")
+    assert not loaded.clients["newci"].allow_all
+
+
+def test_append_client_unknown_target_is_rejected(tmp_path):
+    from terok_compute.config import append_client, append_token_hash
+
+    cfg = tmp_path / "config.toml"
+    tok = tmp_path / "tokens.toml"
+    _write_base_config(cfg)
+    append_token_hash(tok, "newci", "plain")
+    with pytest.raises(ConfigError):
+        append_client(cfg, "newci", ("nope",))
+    # File is left untouched on rejection.
+    assert "[clients.newci]" not in cfg.read_text()
+
+
+def test_append_client_duplicate_rejected(tmp_path):
+    from terok_compute.config import append_client
+
+    cfg = tmp_path / "config.toml"
+    _write_base_config(cfg)
+    with pytest.raises(ConfigError):
+        append_client(cfg, "ci", ("hal",))
+
+
+def test_append_client_empty_acl(tmp_path):
+    from terok_compute.config import append_client, append_token_hash
+
+    cfg = tmp_path / "config.toml"
+    tok = tmp_path / "tokens.toml"
+    _write_base_config(cfg)
+    append_token_hash(tok, "newci", "plain")
+    append_client(cfg, "newci", ())
+    loaded = load_config(cfg, token_file=str(tok))
+    assert loaded.clients["newci"].targets == ()
+    assert not loaded.clients["newci"].allow_all
+
+
+def test_append_token_hash_replaces_existing(tmp_path):
+    from terok_compute.auth import hash_token
+    from terok_compute.config import append_token_hash
+
+    tok = tmp_path / "tokens.toml"
+    append_token_hash(tok, "ci", "first")
+    append_token_hash(tok, "ci", "second")
+    assert load_tokens(tok)["ci"] == hash_token("second")

@@ -27,9 +27,20 @@ from .config import (
     ConfigError,
     GatewayConfig,
     TargetConfig,
+    append_client,
+    append_token_hash,
     default_config_path,
     default_token_path,
     load_config,
+    validate_target_name,
+)
+from .enrollment import (
+    APPROVED,
+    PENDING,
+    EnrollmentError,
+    EnrollmentManager,
+    EnrollmentQueueFull,
+    PendingEnrollment,
 )
 from .files import sftp_client
 from .files import chmod as files_chmod
@@ -126,6 +137,11 @@ class Gateway:
         # Interactive-authentication plumbing for the console.
         self._interactive = False
         self._prompt_lock = asyncio.Lock()
+        # Out-of-band enrollment queue (bounded + expiring).
+        self.enrollments = EnrollmentManager(
+            ttl=config.server.enroll_ttl,
+            max_pending=config.server.enroll_max_pending,
+        )
 
     # -- helpers -----------------------------------------------------------
     def _apply_transport_override(self) -> None:
@@ -810,6 +826,192 @@ class Gateway:
         report = await self.reload()
         return web.json_response({"reloaded": True, "report": report})
 
+    # -- enrollment --------------------------------------------------------
+    def _enrollment_enabled(self) -> None:
+        if not self.config.server.allow_enrollment:
+            raise web.HTTPForbidden(text="enrollment is disabled")
+
+    def _check_enroll_targets(self, targets: tuple[str, ...]) -> None:
+        known = set(self.config.targets)
+        for target in targets:
+            if target != "*" and target not in known:
+                raise web.HTTPBadRequest(
+                    text=f"unknown target {target!r}; known: "
+                    f"{', '.join(sorted(known)) or '(none)'}"
+                )
+
+    async def h_enroll_create(self, request: web.Request) -> web.Response:
+        """Unauthenticated: queue an enrollment request for operator approval."""
+        self._enrollment_enabled()
+        try:
+            body = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            raise web.HTTPBadRequest(text="body must be JSON") from exc
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="body must be a JSON object")
+        client_id = body.get("client_id")
+        if not isinstance(client_id, str) or not client_id:
+            raise web.HTTPBadRequest(text="'client_id' is required")
+        try:
+            validate_target_name(client_id)
+        except ConfigError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+        if client_id in self.config.clients:
+            raise web.HTTPConflict(text=f"client {client_id!r} already exists")
+        raw_targets = body.get("targets", [])
+        if not isinstance(raw_targets, list) or not all(
+            isinstance(t, str) for t in raw_targets
+        ):
+            raise web.HTTPBadRequest(text="'targets' must be a list of strings")
+        targets = tuple(dict.fromkeys(raw_targets))  # de-dup, keep order
+        self._check_enroll_targets(targets)
+        label = body.get("label")
+        if label is not None and not isinstance(label, str):
+            raise web.HTTPBadRequest(text="'label' must be a string")
+
+        source = request.remote
+        try:
+            pending, secret = self.enrollments.create(client_id, targets, label, source)
+        except EnrollmentQueueFull as exc:
+            raise web.HTTPTooManyRequests(text=str(exc)) from exc
+        except EnrollmentError as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+
+        log.info(
+            "enrollment request %s from %s for client %r (targets: %s) - "
+            "awaiting operator approval",
+            pending.request_id,
+            source,
+            client_id,
+            ", ".join(targets) or "(none)",
+        )
+        return web.json_response(
+            {
+                "request_id": pending.request_id,
+                "poll_secret": secret,
+                "expires_at": pending.expires_at,
+                "status": pending.status,
+            }
+        )
+
+    async def h_enroll_poll(self, request: web.Request) -> web.Response:
+        """Poll a request with its poll secret; deliver the token once approved."""
+        self._enrollment_enabled()
+        request_id = request.match_info["request"]
+        secret = request.headers.get("X-Enroll-Secret", "")
+        try:
+            pending = self.enrollments.get(request_id, secret)
+        except EnrollmentError as exc:
+            raise web.HTTPNotFound(text=str(exc)) from exc
+        if pending.status == PENDING:
+            return web.json_response({"status": PENDING})
+        if pending.status == APPROVED:
+            token = self.enrollments.consume(pending)
+            return web.json_response(
+                {"status": APPROVED, "client_id": pending.client_id, "token": token}
+            )
+        # DENIED / CONSUMED / EXPIRED are all terminal for the requester.
+        return web.json_response({"status": pending.status})
+
+    async def approve_enrollment(self, request_id: str) -> PendingEnrollment:
+        """Operator action: mint a token, append the client, reload, approve."""
+        path = self.config.config_path
+        if not path:
+            raise ConfigError("no config path recorded; cannot enroll")
+        pending = self.enrollments.get_by_id(request_id)
+        if pending.status != PENDING:
+            raise EnrollmentError(f"request is {pending.status}, not pending")
+        if pending.client_id in self.config.clients:
+            self.enrollments.deny(request_id)
+            raise ConfigError(f"client {pending.client_id!r} already exists")
+
+        # Mint the token with the same generator the CLI uses, so the hash is
+        # consistent; the plaintext is written nowhere but returned later.
+        from .auth import new_token
+
+        token = new_token()
+        token_path = self.config.token_file or str(Path(path).parent / "tokens.toml")
+        # Write the hash first: append_client re-validates the whole config, and
+        # a client with neither an inline token nor a token-file entry would be
+        # rejected.  If the config append then fails, drop the orphan hash.
+        append_token_hash(token_path, pending.client_id, token)
+        try:
+            append_client(path, pending.client_id, pending.targets, pending.label)
+        except Exception:
+            self._rollback_token(token_path, pending.client_id)
+            raise
+
+        await self.reload()
+        self.enrollments.approve(request_id)
+        pending.token = token
+        log.info(
+            "approved enrollment %s: client %r -> targets %s",
+            request_id,
+            pending.client_id,
+            ", ".join(pending.targets) or "(none)",
+        )
+        return pending
+
+    @staticmethod
+    def _rollback_token(token_path: str, client_id: str) -> None:
+        """Best-effort removal of an orphan token entry after a failed append."""
+        try:
+            from .config import _atomic_write, _toml_quote
+
+            path = Path(token_path)
+            lines = path.read_text().splitlines()
+            out = [
+                line
+                for line in lines
+                if not line.strip().startswith(f"{_toml_quote(client_id)} =")
+                and not line.strip().startswith(f"{client_id} =")
+            ]
+            _atomic_write(path, "\n".join(out).rstrip("\n") + "\n", mode=0o600)
+        except Exception:  # noqa: BLE001
+            log.exception("rollback of token for %r failed", client_id)
+
+    async def h_enroll_list(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        client.require_admin()
+        pending = [
+            {
+                "request_id": r.request_id,
+                "client_id": r.client_id,
+                "targets": list(r.targets),
+                "label": r.label,
+                "source": r.source,
+                "status": r.status,
+                "created_at": r.created_at,
+                "expires_at": r.expires_at,
+            }
+            for r in self.enrollments.list_pending()
+        ]
+        return web.json_response({"pending": pending})
+
+    async def h_enroll_approve(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        client.require_admin()
+        pending = await self.approve_enrollment(request.match_info["request"])
+        return web.json_response(
+            {
+                "request_id": pending.request_id,
+                "client_id": pending.client_id,
+                "targets": list(pending.targets),
+                "status": pending.status,
+            }
+        )
+
+    async def h_enroll_deny(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        client.require_admin()
+        try:
+            pending = self.enrollments.deny(request.match_info["request"])
+        except EnrollmentError as exc:
+            raise web.HTTPNotFound(text=str(exc)) from exc
+        return web.json_response(
+            {"request_id": pending.request_id, "status": pending.status}
+        )
+
     # files
     @contextlib.asynccontextmanager
     async def _sftp_session(self, client: Client, request: web.Request):
@@ -995,6 +1197,11 @@ class Gateway:
         router.add_get("/v1/clients/{client}", self.h_get_client)
         router.add_get("/v1/clients/{client}/sessions", self.h_client_sessions)
         router.add_delete("/v1/clients/{client}/sessions", self.h_client_sessions_close)
+        router.add_post("/v1/enroll", self.h_enroll_create)
+        router.add_get("/v1/enroll/{request}", self.h_enroll_poll)
+        router.add_get("/v1/enroll-requests", self.h_enroll_list)
+        router.add_post("/v1/enroll-requests/{request}/approve", self.h_enroll_approve)
+        router.add_post("/v1/enroll-requests/{request}/deny", self.h_enroll_deny)
         router.add_get("/v1/files/stat", self.h_file_stat)
         router.add_get("/v1/files/list", self.h_file_list)
         router.add_get("/v1/files/read", self.h_file_read)
@@ -1017,10 +1224,16 @@ class Gateway:
     # -- interactive console ----------------------------------------------
     async def run_console(self) -> None:
         self._interactive = True
-        print(
+        banner = (
             "terok-compute-gateway console. Type 'help' for commands.\n"
             "Targets with interactive_auth will prompt for password/OTP here."
         )
+        if self.config.server.allow_enrollment:
+            banner += (
+                "\nEnrollment is enabled: approve a request with 'approve <id>' "
+                "(list with 'enrollments')."
+            )
+        print(banner)
         try:
             while True:
                 try:
@@ -1052,7 +1265,8 @@ class Gateway:
                 "reconnect <t> | stop <t> | connect-all | stop-all | reload |\n"
                 "clients | client <name> | client-refresh <name> | "
                 "client-connect <name> | client-stop <name> | client-kill <name> |\n"
-                "sessions [target] | close-session <id> | quit"
+                "sessions [target] | close-session <id> |\n"
+                "enrollments | approve <id> | deny <id> | quit"
             )
         elif cmd == "targets":
             for name in self.config.targets:
@@ -1092,6 +1306,13 @@ class Gateway:
             self._print_client(args[0])
         elif cmd in ("client-refresh", "client-connect", "client-stop"):
             await self._client_target_action(cmd, args)
+        elif cmd == "enrollments":
+            self._print_enrollments()
+        elif cmd in ("approve", "deny"):
+            if not args:
+                print(f"usage: {cmd} <request-id>")
+                return True
+            await self._console_enrollment(cmd, args[0])
         elif cmd == "client-kill":
             if not args:
                 print("usage: client-kill <client>")
@@ -1146,6 +1367,33 @@ class Gateway:
                 f"  {s['session_id']}  target={s['target']}  idle={s['idle']}  "
                 f"{s['connection']}"
             )
+
+    def _print_enrollments(self) -> None:
+        pending = self.enrollments.list_pending()
+        if not pending:
+            print("no pending enrollment requests")
+            return
+        print(f"{'REQUEST':<14}{'STATUS':<10}{'CLIENT':<22}{'TARGETS':<28}SOURCE")
+        for r in pending:
+            print(
+                f"{r.request_id:<14}{r.status:<10}{r.client_id:<22}"
+                f"{','.join(r.targets) or '-':<28}{r.source or '-'}"
+            )
+
+    async def _console_enrollment(self, action: str, request_id: str) -> None:
+        try:
+            if action == "approve":
+                pending = await self.approve_enrollment(request_id)
+                print(
+                    f"approved {pending.request_id}: client {pending.client_id!r} "
+                    f"targets {', '.join(pending.targets) or '(none)'}; the "
+                    "requester will receive its token on the next poll"
+                )
+            else:
+                pending = self.enrollments.deny(request_id)
+                print(f"denied {pending.request_id}")
+        except (ConfigError, EnrollmentError) as exc:
+            print(f"error: {exc}")
 
     async def _client_target_action(self, cmd: str, args: list[str]) -> None:
         if not args:
@@ -1345,6 +1593,11 @@ def generate_tokens(config_path: str, out_path: str, token_file: str | None) -> 
     print(
         "\nSet [auth] token_file (or pass --token-file), then set in each Terok "
         "container:\n  TEROK_COMPUTE_GATEWAY=<gateway url>\n  TEROK_COMPUTE_TOKEN=<its token>"
+    )
+    print(
+        "\nAlternatively, a container can request its own token interactively with\n"
+        "  terok-handshake <client-id> --port <gateway port> [--system hal,fwk394]\n"
+        "and you approve it on the gateway console ('approve <id>')."
     )
     return 0
 

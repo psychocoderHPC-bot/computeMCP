@@ -101,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("clients", help="list clients, ACLs and live sessions")
     sub.add_parser("sessions", help="list live sessions (all clients)")
     sub.add_parser("reload", help="reload the gateway configuration")
+    sub.add_parser("enrollments", help="list pending enrollment requests (admin)")
+
+    p = sub.add_parser("approve", help="approve an enrollment request (admin)")
+    p.add_argument("request_id")
+    p = sub.add_parser("deny", help="deny an enrollment request (admin)")
+    p.add_argument("request_id")
 
     p = sub.add_parser("client", help="show one client")
     p.add_argument("name")
@@ -179,6 +185,23 @@ async def _run(args: argparse.Namespace) -> int:
         elif cmd == "reload":
             body = await control.request("POST", "/v1/reload")
             _emit(args, body, lambda b: f"reloaded: {b['report']}")
+        elif cmd == "enrollments":
+            body = await control.request("GET", "/v1/enroll-requests")
+            _emit(args, body, _render_enrollments)
+        elif cmd == "approve":
+            body = await control.request(
+                "POST", f"/v1/enroll-requests/{args.request_id}/approve"
+            )
+            _emit(
+                args,
+                body,
+                lambda b: f"approved {b['request_id']}: client {b['client_id']}",
+            )
+        elif cmd == "deny":
+            body = await control.request(
+                "POST", f"/v1/enroll-requests/{args.request_id}/deny"
+            )
+            _emit(args, body, lambda b: f"denied {b['request_id']}")
         elif cmd == "target-connect":
             body = await control.request("POST", f"/v1/targets/{args.target}/connect")
             _emit(args, body, lambda b: f"{b['name']} -> {b['state']} ({b['active_route']})")
@@ -236,6 +259,19 @@ def _emit_status(args, body: dict) -> None:
             f"{t.get('local_port') or '-':<8}{t.get('sharing', 'unknown'):<11}"
             f"{t.get('clients', 0)}"
         )
+
+
+def _render_enrollments(body: dict) -> str:
+    pending = body["pending"]
+    if not pending:
+        return "no pending enrollment requests"
+    lines = [f"{'REQUEST':<14}{'CLIENT':<22}{'TARGETS':<28}SOURCE"]
+    for r in pending:
+        lines.append(
+            f"{r['request_id']:<14}{r['client_id']:<22}"
+            f"{','.join(r['targets']) or '-':<28}{r.get('source') or '-'}"
+        )
+    return "\n".join(lines)
 
 
 def _emit_clients(args, body: dict) -> None:
