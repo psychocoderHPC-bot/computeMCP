@@ -80,6 +80,13 @@ client_key = "/home/USER/.ssh/terok_compute_container"
 # sshd's per-connection MaxSessions limit (commonly 10) at the cost of more
 # handshakes. Use "dedicated" for many simultaneous long-running sessions.
 connect_mode = "shared"
+# Is the underlying system dedicated to this task or shared with others?
+#   "exclusive" - dedicated (e.g. a whole Slurm node/container); benchmarks
+#                 are meaningful
+#   "shared"    - other users/jobs may run concurrently; benchmarks are noisy
+#   "unknown"   - not declared (default)
+# Exposed to agents via compute_targets()/compute_status().
+sharing = "unknown"
 # Set true if the development container requires interactive authentication
 # (password / keyboard-interactive, e.g. a second factor). The gateway then
 # prompts on the operator console during `connect`/`refresh`/`exec`; when the

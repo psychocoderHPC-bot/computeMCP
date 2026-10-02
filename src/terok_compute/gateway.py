@@ -492,7 +492,11 @@ class Gateway:
 
     # -- status ------------------------------------------------------------
     def public_status(self, name: str) -> dict:
-        return self.runtimes[name].public(self.sessions.count_for_target(name))
+        status = self.runtimes[name].public(self.sessions.count_for_target(name))
+        target = self.config.targets.get(name)
+        if target is not None:
+            status["sharing"] = target.sharing
+        return status
 
     def list_targets(self, client: Client) -> list[dict]:
         return [
@@ -1145,7 +1149,10 @@ class Gateway:
                 print(f"{name}: {target} -> error: {exc}")
 
     def _print_status_table(self) -> None:
-        print(f"{'TARGET':<16}{'STATE':<14}{'ROUTE':<14}{'LOCAL':<8}{'CLIENTS':<8}UPTIME")
+        print(
+            f"{'TARGET':<16}{'STATE':<14}{'ROUTE':<14}{'LOCAL':<8}"
+            f"{'SHARING':<11}{'CLIENTS':<8}UPTIME"
+        )
         now = datetime.now(timezone.utc)
         for name in self.config.targets:
             runtime = self.runtimes[name]
@@ -1157,6 +1164,7 @@ class Gateway:
                 f"{name:<16}{runtime.state:<14}"
                 f"{runtime.active_route or '-':<14}"
                 f"{runtime.local_port if runtime.local_port else '-':<8}"
+                f"{self.config.targets[name].sharing:<11}"
                 f"{self.sessions.count_for_target(name):<8}{uptime}"
             )
 

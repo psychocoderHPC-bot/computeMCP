@@ -353,6 +353,19 @@ targets = ["hal", "fwk394"]
   {'name': 'hal', 'state': 'connected', ...}
   ```
 
+- `sharing` documents whether a system is dedicated or shared, so agents can
+  judge benchmark reliability. `compute_targets()`/`compute_status()` return it:
+  - `"exclusive"` — dedicated to this task (e.g. a whole Slurm allocation);
+    benchmarks are meaningful.
+  - `"shared"` — other users/jobs may run concurrently; timings can be noisy.
+  - `"unknown"` — not declared (default).
+
+  ```toml
+  [targets.rosi5]
+  ssh_targets = ["rosi5"]
+  sharing = "exclusive"     # Slurm allocation is ours
+  ```
+
 - HPC / Slurm targets: a fixed login node can be reached with `proxy_jump`,
   while the dynamic compute node is discovered at connect time by a trusted
   `provision_command` (see the next subsection).

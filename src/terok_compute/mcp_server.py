@@ -163,13 +163,23 @@ def build_server(client: GatewayClient) -> MCPServer:
         """List remote compute targets available to this Terok task.
 
         Call this before any other compute tool and only use the returned
-        target names.
+        target names. Each target reports `state` and `sharing`; `sharing` is
+        one of:
+          - "exclusive": the system is dedicated to this task (e.g. a Slurm
+            allocation), so benchmarks are meaningful;
+          - "shared": other users/jobs may run concurrently, so benchmark
+            results can be noisy;
+          - "unknown": the operator did not declare it.
         """
         return await client.request("GET", "/v1/targets")
 
     @mcp.tool()
     async def compute_status(target: str) -> dict:
-        """Get state, active route and client count for a compute target."""
+        """Get state, active route, client count and `sharing` for a target.
+
+        Check `sharing` before trusting benchmark numbers: only an
+        "exclusive" system gives stable measurements.
+        """
         return await client.request("GET", f"/v1/targets/{target}")
 
     @mcp.tool()

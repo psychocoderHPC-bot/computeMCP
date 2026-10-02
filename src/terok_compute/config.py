@@ -69,6 +69,10 @@ class TargetConfig:
     host_key_sha256: str | None = None
     host_key_algorithms: tuple[str, ...] = ()
     connect_mode: str = "shared"
+    # Whether the underlying system is dedicated to this job or shared with
+    # other users/jobs.  Relevant for benchmark trust; "unknown" when the
+    # operator does not know.  Free-form but one of the three constants.
+    sharing: str = "unknown"
     interactive_auth: bool = False
     # Optional trusted provisioning command (argv, no shell).  Run before the
     # tunnel is opened to discover a dynamic endpoint (e.g. a Slurm job's
@@ -90,6 +94,10 @@ class TargetConfig:
         if self.connect_mode not in ("shared", "dedicated"):
             raise ConfigError(
                 f"target {self.name!r} connect_mode must be 'shared' or 'dedicated'"
+            )
+        if self.sharing not in ("exclusive", "shared", "unknown"):
+            raise ConfigError(
+                f"target {self.name!r} sharing must be 'exclusive', 'shared' or 'unknown'"
             )
         if self.host_key_sha256 is not None:
             fp = self.host_key_sha256.strip()
@@ -204,6 +212,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         host_key_sha256=value.get("host_key_sha256"),
         host_key_algorithms=tuple(value.get("host_key_algorithms", ())),
         connect_mode=value.get("connect_mode", "shared"),
+        sharing=value.get("sharing", "unknown"),
         interactive_auth=bool(value.get("interactive_auth", False)),
         provision_command=tuple(value.get("provision_command", ())),
         provision_timeout=_float(

@@ -219,11 +219,12 @@ def _emit_status(args, body: dict) -> None:
     if args.json:
         print(json.dumps(body, indent=2))
         return
-    print(f"{'TARGET':<18}{'STATE':<14}{'ROUTE':<14}{'LOCAL':<8}CLIENTS")
+    print(f"{'TARGET':<18}{'STATE':<14}{'ROUTE':<14}{'LOCAL':<8}{'SHARING':<11}CLIENTS")
     for t in body["targets"]:
         print(
             f"{t['name']:<18}{t['state']:<14}{t.get('active_route') or '-':<14}"
-            f"{t.get('local_port') or '-':<8}{t.get('clients', 0)}"
+            f"{t.get('local_port') or '-':<8}{t.get('sharing', 'unknown'):<11}"
+            f"{t.get('clients', 0)}"
         )
 
 

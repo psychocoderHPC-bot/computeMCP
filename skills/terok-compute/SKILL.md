@@ -29,8 +29,18 @@ compute_targets()
 Then, optionally, inspect one:
 
 ```
-compute_status(target)      # state, active route, connected clients, last_error
+compute_status(target)      # state, active route, clients, sharing, last_error
 ```
+
+Each target also carries a **`sharing`** field, which matters for benchmarks:
+
+- `"exclusive"` — the system is dedicated to this task (e.g. a Slurm
+  allocation). Timings are meaningful.
+- `"shared"` — other users/jobs may run concurrently. Benchmark results can be
+  noisy; measure repeatedly and report the variance.
+- `"unknown"` — the operator did not declare it. Treat as potentially shared.
+
+Before running or reporting a benchmark, check `sharing` and say which it was.
 
 If `compute_targets` does not return a system you expect, or a target shows
 `state != "connected"` with an error, report the gateway status. **Do not try
@@ -115,8 +125,8 @@ compute_file_download(target="hal", remote_path="/work/results.dat", local_path=
 
 | Tool | Purpose |
 | --- | --- |
-| `compute_targets()` | List available systems (do this first) |
-| `compute_status(target)` | State/route/clients/errors for one system |
+| `compute_targets()` | List available systems + `sharing` (do this first) |
+| `compute_status(target)` | State/route/clients/`sharing`/errors for one system |
 | `compute_exec(target, command, cwd?, timeout?)` | Short non-interactive command |
 | `compute_session_create(target, cwd?, columns?, rows?)` | New PTY session |
 | `compute_session_write(session_id, data)` | Send input to a session |
@@ -170,3 +180,5 @@ compute_session_close(sid)
 - If a target is unavailable, report the `compute_status`/error — do not try to
   reach the host directly.
 - Close sessions you create.
+- Check `sharing` before trusting benchmark numbers; only `"exclusive"` systems
+  give stable measurements.

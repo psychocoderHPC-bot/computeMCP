@@ -678,6 +678,29 @@ async def test_interactive_target_preauth_prompts_on_connect(monkeypatch):
     assert called == [True]
 
 
+async def test_sharing_exposed_in_target_status_and_discovery(monkeypatch):
+    import dataclasses
+
+    gw = make_gateway()
+    hal = gw.config.targets["hal"]
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={**gw.config.targets, "hal": dataclasses.replace(hal, sharing="exclusive")},
+    )
+    client = await make_client(gw)
+    try:
+        resp = await client.get("/v1/targets/hal", headers=auth("alpaka-token"))
+        assert (await resp.json())["sharing"] == "exclusive"
+
+        resp = await client.get("/v1/targets", headers=auth("admin-token"))
+        body = await resp.json()
+        by_name = {t["name"]: t for t in body["targets"]}
+        assert by_name["hal"]["sharing"] == "exclusive"
+        assert by_name["gpu03"]["sharing"] == "unknown"
+    finally:
+        await client.close()
+
+
 async def test_clients_endpoint_admin_only_and_lists_acl(monkeypatch):
     gw = make_gateway()
     client = await make_client(gw)
