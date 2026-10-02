@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import getpass
 import logging
 import posixpath
 import signal
@@ -48,6 +49,19 @@ from .tunnel import Tunnel, TunnelError, TunnelManager, probe
 log = logging.getLogger("terok_compute.gateway")
 
 RECOVERY_POLL_SECONDS = 5.0
+
+
+class InteractiveAuthRequired(RuntimeError):
+    """A target needs interactive authentication but no console is available."""
+
+    def __init__(self, target: str) -> None:
+        super().__init__(
+            f"target {target!r} requires interactive authentication (e.g. 2FA), "
+            "but the gateway is not running an interactive console or is "
+            "answering a non-interactive request. Run the gateway in the "
+            "foreground console and retry."
+        )
+        self.target = target
 
 
 @dataclass
@@ -98,6 +112,9 @@ class Gateway:
         self._locks: dict[str, asyncio.Lock] = {}
         self._watch_task: asyncio.Task | None = None
         self._stopping = False
+        # Interactive-authentication plumbing for the console.
+        self._interactive = False
+        self._prompt_lock = asyncio.Lock()
 
     # -- helpers -----------------------------------------------------------
     def _apply_transport_override(self) -> None:
@@ -207,7 +224,31 @@ class Gateway:
             if runtime.state == "connected":
                 return runtime.public(self.sessions.count_for_target(name))
             await self._connect_locked(target, runtime)
+        await self._preauth_if_interactive(name)
         return self.runtimes[name].public(self.sessions.count_for_target(name))
+
+    async def _preauth_if_interactive(self, name: str) -> None:
+        """Force the container handshake now so the console can prompt for 2FA.
+
+        Establishing the tunnel does not authenticate to the container; doing it
+        here makes ``connect``/``refresh`` an accurate "is this target usable"
+        check and collects any second factor while the operator is present.
+        """
+        target = self.config.targets[name]
+        if not target.interactive_auth:
+            return
+        host, port = self._endpoint(self.runtimes[name])
+        prompter = self._make_prompter(name)
+        try:
+            if target.connect_mode == "dedicated":
+                conn = await self.backend.open_connection(target, host, port, prompter)
+                await self.backend.close_connection(conn)
+            else:
+                await self.backend.connection(target, host, port, prompter)
+        except SSHError:
+            if not self._interactive:
+                raise InteractiveAuthRequired(name) from None
+            raise
 
     async def refresh_target(self, name: str) -> dict:
         target = self._target(name)
@@ -217,6 +258,7 @@ class Gateway:
             await self.backend.disconnect(name)
             await self.sessions.close_for_target(name, reason="refresh")
             await self._connect_locked(target, runtime)
+        await self._preauth_if_interactive(name)
         return self.runtimes[name].public(self.sessions.count_for_target(name))
 
     async def stop_target(self, name: str) -> dict:
@@ -293,25 +335,89 @@ class Gateway:
         except asyncio.CancelledError:
             raise
 
+    # -- interactive authentication --------------------------------------
+    async def _prompt_line(self, prompt: str, echo: bool) -> str | None:
+        """Read a line from the console, off the event loop.
+
+        A hidden prompt (``echo=False``) is used for passwords/OTP so they are
+        not shown on screen.  An empty answer cancels the attempt.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            if echo:
+                answer = await loop.run_in_executor(None, input, prompt)
+            else:
+                answer = await loop.run_in_executor(None, getpass.getpass, prompt)
+        except (EOFError, KeyboardInterrupt):
+            return None
+        answer = (answer or "").strip()
+        return answer or None
+
+    async def _prompter(self, target_name: str, prompt: str, echo: bool):
+        """Collect an authentication secret from the operator console.
+
+        Returns ``None`` (so AsyncSSH tries another method) when the gateway is
+        not running an interactive console.  Serialized so two targets never
+        interleave prompts.
+        """
+        if not self._interactive:
+            log.warning(
+                "target %s requested interactive authentication while the "
+                "gateway is not interactive; authentication cannot proceed",
+                target_name,
+            )
+            return None
+        label = prompt if prompt.endswith(" ") else prompt + " "
+        async with self._prompt_lock:
+            return await self._prompt_line(f"[{target_name}] {label}", echo)
+
+    MAX_AUTH_PROMPTS = 3
+
+    def _make_prompter(self, target_name: str):
+        attempts = 0
+
+        async def prompter(prompt: str, echo: bool):
+            nonlocal attempts
+            attempts += 1
+            if attempts > self.MAX_AUTH_PROMPTS:
+                log.warning(
+                    "target %s: giving up after %d interactive auth attempt(s)",
+                    target_name,
+                    attempts - 1,
+                )
+                return None
+            return await self._prompter(target_name, prompt, echo)
+
+        return prompter
+
     # -- connection providers for exec/sessions --------------------------
-    async def _connection_provider(self, name: str):
+    async def _open_container_conn(self, name: str, force_dedicated: bool = False):
+        """Open the container SSH connection for a target.
+
+        Raises :class:`InteractiveAuthRequired` when the target needs 2FA but
+        the gateway is not interactive, instead of a generic SSH error.
+        """
         target = self._target(name)
         await self.ensure_connected(name)
         host, port = self._endpoint(self.runtimes[name])
-        if target.connect_mode == "dedicated":
-            # One fresh transport per operation: avoids the remote sshd's
-            # per-connection MaxSessions ceiling and isolates failures.
-            conn = await self.backend.open_connection(target, host, port)
+        prompter = self._make_prompter(name) if target.interactive_auth else None
+        dedicated = force_dedicated or target.connect_mode == "dedicated"
+        try:
+            if dedicated:
+                conn = await self.backend.open_connection(target, host, port, prompter)
+            else:
+                conn = await self.backend.connection(target, host, port, prompter)
             return target, conn
-        conn = await self.backend.connection(target, host, port)
-        return target, conn
+        except SSHError:
+            if target.interactive_auth and not self._interactive:
+                raise InteractiveAuthRequired(name) from None
+            raise
+
+    async def _connection_provider(self, name: str):
+        return await self._open_container_conn(name)
 
     async def _dedicated_connection_provider(self, name: str):
-        target = self._target(name)
-        await self.ensure_connected(name)
-        host, port = self._endpoint(self.runtimes[name])
-        conn = await self.backend.open_connection(target, host, port)
-        return target, conn
+        return await self._open_container_conn(name, force_dedicated=True)
 
     # -- status ------------------------------------------------------------
     def public_status(self, name: str) -> dict:
@@ -812,23 +918,30 @@ class Gateway:
 
     # -- interactive console ----------------------------------------------
     async def run_console(self) -> None:
-        print("terok-compute-gateway console. Type 'help' for commands.")
-        while True:
-            try:
-                line = await asyncio.get_running_loop().run_in_executor(
-                    None, input, "gateway> "
-                )
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                if not await self._console_command(line):
+        self._interactive = True
+        print(
+            "terok-compute-gateway console. Type 'help' for commands.\n"
+            "Targets with interactive_auth will prompt for password/OTP here."
+        )
+        try:
+            while True:
+                try:
+                    line = await asyncio.get_running_loop().run_in_executor(
+                        None, input, "gateway> "
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    print()
                     break
-            except Exception as exc:  # noqa: BLE001
-                print(f"error: {exc}")
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    if not await self._console_command(line):
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    print(f"error: {exc}")
+        finally:
+            self._interactive = False
 
     async def _console_command(self, line: str) -> bool:
         parts = line.split()
@@ -996,6 +1109,8 @@ async def _error_middleware(request: web.Request, handler):
     except ForbiddenTarget:
         # Do not leak whether an unauthorized target exists.
         raise web.HTTPForbidden(text="forbidden") from None
+    except InteractiveAuthRequired as exc:
+        raise web.HTTPServiceUnavailable(text=str(exc)) from exc
     except (HostKeyError, SSHError, TunnelError) as exc:
         raise web.HTTPBadGateway(text=str(exc)) from exc
     except SessionNotFound:

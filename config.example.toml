@@ -80,6 +80,11 @@ client_key = "/home/USER/.ssh/terok_compute_container"
 # sshd's per-connection MaxSessions limit (commonly 10) at the cost of more
 # handshakes. Use "dedicated" for many simultaneous long-running sessions.
 connect_mode = "shared"
+# Set true if the development container requires interactive authentication
+# (password / keyboard-interactive, e.g. a second factor). The gateway then
+# prompts on the operator console during `connect`/`refresh`/`exec`; when the
+# gateway runs headless it fails those operations with a clear error.
+interactive_auth = false
 auto_connect = true
 connect_backoff_initial = 1.0
 connect_backoff_max = 60.0

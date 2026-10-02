@@ -326,7 +326,7 @@ async def test_dedicated_exec_opens_and_closes_connection(monkeypatch):
         stdout = b"ok\n"
         stderr = b""
 
-    async def fake_open(target, host, port):
+    async def fake_open(target, host, port, prompter=None):
         opened.append(target.name)
         return object()
 
@@ -474,6 +474,106 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
         assert bytes(stored) == payload
     finally:
         await client.close()
+
+
+async def test_interactive_prompter_prompts_when_console_active(monkeypatch):
+    gw = make_gateway()
+    gw._interactive = True
+    prompts = []
+
+    async def fake_prompt_line(prompt, echo):
+        prompts.append((prompt, echo))
+        return "otp-123"
+
+    monkeypatch.setattr(gw, "_prompt_line", fake_prompt_line)
+    result = await gw._prompter("hal", "Password: ", False)
+    assert result == "otp-123"
+    assert prompts == [("[hal] Password: ", False)]
+
+
+async def test_prompter_caps_attempts(monkeypatch):
+    gw = make_gateway()
+    gw._interactive = True
+    prompts = []
+
+    async def fake_prompt_line(prompt, echo):
+        prompts.append(prompt)
+        return "bad"
+
+    monkeypatch.setattr(gw, "_prompt_line", fake_prompt_line)
+    prompter = gw._make_prompter("hal")
+    results = [await prompter("Password: ", False) for _ in range(5)]
+    assert results[:3] == ["bad", "bad", "bad"]
+    assert results[3:] == [None, None]
+    assert len(prompts) == 3
+
+
+async def test_interactive_prompter_returns_none_when_headless(monkeypatch):
+    gw = make_gateway()
+    gw._interactive = False
+
+    async def fail_line(prompt, echo):
+        raise AssertionError("must not prompt when headless")
+
+    monkeypatch.setattr(gw, "_prompt_line", fail_line)
+    assert await gw._prompter("hal", "Password: ", False) is None
+
+
+async def test_headless_interactive_target_raises_clear_error(monkeypatch):
+    from terok_compute.gateway import InteractiveAuthRequired
+    from terok_compute.ssh_backend import SSHError
+
+    gw = make_gateway()
+    gw._interactive = False
+    # mark the target as requiring interactive auth
+    target = gw.config.targets["hal"]
+    import dataclasses
+
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(target, interactive_auth=True),
+        },
+    )
+
+    async def boom(target, host, port, prompter=None):
+        raise SSHError("Permission denied")
+
+    async def no_connect(name):
+        return object()
+
+    monkeypatch.setattr(gw.backend, "connection", boom)
+    monkeypatch.setattr(gw, "ensure_connected", no_connect)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 9))
+
+    with pytest.raises(InteractiveAuthRequired):
+        await gw._open_container_conn("hal")
+
+
+async def test_interactive_target_preauth_prompts_on_connect(monkeypatch):
+    gw = make_gateway()
+    import dataclasses
+
+    target = gw.config.targets["hal"]
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(target, interactive_auth=True),
+        },
+    )
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].local_port = 9
+    called = []
+
+    async def fake_conn(target, host, port, prompter=None):
+        called.append(prompter is not None)
+        return object()
+
+    monkeypatch.setattr(gw.backend, "connection", fake_conn)
+    await gw._preauth_if_interactive("hal")
+    assert called == [True]
 
 
 async def test_clients_endpoint_admin_only_and_lists_acl(monkeypatch):

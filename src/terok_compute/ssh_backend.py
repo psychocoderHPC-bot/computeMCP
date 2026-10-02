@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass, field
+from typing import Awaitable, Protocol
 
 import asyncssh
 
@@ -46,22 +47,67 @@ class ManagedSession:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-class PinnedHostKeyClient(asyncssh.SSHClient):
-    """SSH client that only accepts a host key matching a SHA256 fingerprint.
+class _Prompter(Protocol):
+    """Interactive authentication callback used by the gateway console."""
 
-    AsyncSSH consults :meth:`validate_host_public_key` when a server key is not
-    already present in ``known_hosts``.  We pair this client with an empty
-    ``known_hosts`` provider so every key is checked against the pin instead of
-    being accepted blindly.
+    def __call__(self, prompt: str, echo: bool) -> Awaitable[str | None]:
+        ...
+
+
+class InteractiveSSHClient(asyncssh.SSHClient):
+    """SSH client with host-key pinning and interactive authentication.
+
+    AsyncSSH consults :meth:`validate_host_public_key` for the host key and the
+    ``password``/``kbdint`` hooks when the server requests them.  The hooks
+    delegate to an injected ``prompter`` so a second factor (password, OTP, or
+    an interactive challenge) can be collected by the operator console.  Without
+    a prompter, or when the target does not opt in, no secret is supplied and
+    key/agent authentication is used as usual.
     """
 
-    def __init__(self, pin: str) -> None:
-        self._pin = _b64_normalize(pin[len("SHA256:"):] if pin.startswith("SHA256:") else pin)
+    def __init__(
+        self,
+        pin: str | None = None,
+        prompter: _Prompter | None = None,
+    ) -> None:
+        self._pin = (
+            _b64_normalize(pin[len("SHA256:"):] if pin.startswith("SHA256:") else pin)
+            if pin
+            else None
+        )
+        self._prompter = prompter
 
     def validate_host_public_key(self, host, addr, port, key) -> bool:
+        if self._pin is None:
+            return False
         actual = key.get_fingerprint("sha256")
         actual = actual[len("SHA256:"):] if actual.startswith("SHA256:") else actual
         return _b64_normalize(actual) == self._pin
+
+    async def password_auth_requested(self) -> str | None:
+        if self._prompter is None:
+            return None
+        return await self._prompter("Password: ", False)
+
+    async def kbdint_auth_requested(self) -> str:
+        # Advertise keyboard-interactive so the server can issue a challenge
+        # (commonly used for OTP / second factor).
+        return ""
+
+    async def kbdint_challenge_received(self, name, instructions, lang, prompts):
+        if self._prompter is None:
+            return None
+        responses = []
+        for prompt, echo in prompts:
+            answer = await self._prompter(prompt.rstrip(), bool(echo))
+            if answer is None:
+                return None
+            responses.append(answer)
+        return responses
+
+
+# Backwards-compatible name used by earlier code paths / tests.
+PinnedHostKeyClient = InteractiveSSHClient
 
 
 def _empty_known_hosts(host: str, addr, port) -> tuple:
@@ -103,12 +149,13 @@ class SSHBackend:
         target: TargetConfig,
         host: str,
         port: int,
+        prompter: _Prompter | None = None,
     ) -> asyncssh.SSHClientConnection:
         async with self._lock(target.name):
             existing = self._connections.get(target.name)
             if existing is not None and not existing.is_closed():
                 return existing
-            conn = await self._dial(target, host, port)
+            conn = await self._dial(target, host, port, prompter)
             self._connections[target.name] = conn
             return conn
 
@@ -117,6 +164,7 @@ class SSHBackend:
         target: TargetConfig,
         host: str,
         port: int,
+        prompter: _Prompter | None = None,
     ) -> asyncssh.SSHClientConnection:
         """Open a fresh, uncached SSH connection owned by the caller.
 
@@ -124,7 +172,7 @@ class SSHBackend:
         its own transport and is not bounded by the remote sshd's
         ``MaxSessions`` limit on a single connection.  The caller must close it.
         """
-        return await self._dial(target, host, port)
+        return await self._dial(target, host, port, prompter)
 
     @staticmethod
     async def close_connection(conn: asyncssh.SSHClientConnection | None) -> None:
@@ -140,20 +188,22 @@ class SSHBackend:
         target: TargetConfig,
         host: str,
         port: int,
+        prompter: _Prompter | None = None,
     ) -> asyncssh.SSHClientConnection:
+        # Only pass the interactive prompter when the target opts in; otherwise
+        # authentication stays key/agent-only and no secret can be injected.
+        active_prompter = prompter if target.interactive_auth else None
+        pin = target.host_key_sha256 if target.host_key_sha256 else None
         if target.host_key_sha256:
-            # Pin the key: give AsyncSSH an empty known_hosts provider and let a
-            # custom client perform the fingerprint check.
             known_hosts = _empty_known_hosts
-            client_factory = lambda: PinnedHostKeyClient(target.host_key_sha256)
         elif target.known_hosts:
             known_hosts = target.known_hosts
-            client_factory = None
         else:
             raise HostKeyError(
                 f"target {target.name!r} has no host_key_sha256 or known_hosts; "
                 "refusing to connect without host-key verification"
             )
+        client_factory = lambda: InteractiveSSHClient(pin, active_prompter)
 
         client_keys = [target.client_key] if target.client_key else None
         server_host_key_algs = target.host_key_algorithms or ()
@@ -171,6 +221,11 @@ class SSHBackend:
                 keepalive_count_max=3,
             )
         except (asyncssh.Error, OSError) as exc:
+            if active_prompter is not None:
+                raise SSHError(
+                    f"SSH connection to target {target.name!r} failed during "
+                    f"authentication (interactive/2FA may be required): {exc}"
+                ) from exc
             raise SSHError(f"SSH connection to target {target.name!r} failed: {exc}") from exc
 
     async def run(

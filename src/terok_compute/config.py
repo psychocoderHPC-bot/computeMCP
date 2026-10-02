@@ -64,6 +64,7 @@ class TargetConfig:
     host_key_sha256: str | None = None
     host_key_algorithms: tuple[str, ...] = ()
     connect_mode: str = "shared"
+    interactive_auth: bool = False
     auto_connect: bool = False
     connect_backoff_initial: float = 1.0
     connect_backoff_max: float = 60.0
@@ -188,6 +189,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         host_key_sha256=value.get("host_key_sha256"),
         host_key_algorithms=tuple(value.get("host_key_algorithms", ())),
         connect_mode=value.get("connect_mode", "shared"),
+        interactive_auth=bool(value.get("interactive_auth", False)),
         auto_connect=bool(value.get("auto_connect", False)),
         connect_backoff_initial=_float(
             value.get("connect_backoff_initial"), "connect_backoff_initial", 1.0

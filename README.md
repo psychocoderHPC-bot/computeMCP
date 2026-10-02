@@ -234,6 +234,32 @@ targets = ["hal", "fwk394"]
   - `"dedicated"`: each exec/session opens its own SSH connection and closes it
     afterward, so the `MaxSessions` limit no longer bounds total parallel
     sessions. Costs one handshake per operation.
+- Interactive (second-factor) authentication: set `interactive_auth = true`
+  when the development container asks for a password or a keyboard-interactive
+  challenge (OTP/2FA) instead of accepting the key alone. The gateway prompts
+  on the operator console during `connect`, `refresh`, and the first `exec`/
+  session. Passwords are read without echo; up to 3 attempts are allowed. Run
+  the gateway in the foreground console for this to work. Headless (systemd)
+  operations on such a target fail with a clear `503` error rather than
+  hanging, because there is no one to prompt. Only the container hop is
+  prompted; the host `ssh -N -L` tunnel must stay key/agent-based.
+
+  ```toml
+  [targets.hal]
+  ssh_targets = ["hal", "ex_hal"]
+  user = "agent"
+  interactive_auth = true
+  host_key_sha256 = "SHA256:..."
+  ```
+
+  Console transcript:
+
+  ```
+  gateway> connect hal
+  [hal] Password:
+  {'name': 'hal', 'state': 'connected', ...}
+  ```
+
 - File transfer: small files use `compute_file_read`/`compute_file_write`
   (content in the response). For large or binary files use
   `compute_file_upload`/`compute_file_download`, which stream over SFTP and

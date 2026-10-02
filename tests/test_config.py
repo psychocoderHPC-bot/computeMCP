@@ -73,6 +73,11 @@ def test_invalid_connect_mode_rejected():
         parse_config(base_raw(connect_mode="everyone"))
 
 
+def test_interactive_auth_default_and_true():
+    assert parse_config(base_raw()).targets["hal"].interactive_auth is False
+    assert parse_config(base_raw(interactive_auth=True)).targets["hal"].interactive_auth is True
+
+
 def test_invalid_target_name_rejected():
     raw = base_raw()
     raw["targets"]["bad name!"] = raw["targets"].pop("hal")
