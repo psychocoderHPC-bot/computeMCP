@@ -8,6 +8,8 @@ import pytest
 
 from compute_mcp.config import (
     ConfigError,
+    TargetConfig,
+    TransportConfig,
     load_config,
     load_tokens,
     parse_config,
@@ -88,6 +90,48 @@ def test_sharing_default_and_values():
 def test_invalid_sharing_rejected():
     with pytest.raises(ConfigError):
         parse_config(base_raw(sharing="sometimes"))
+
+
+def test_node_info_default_is_empty():
+    assert parse_config(base_raw()).targets["hal"].node_info == ()
+
+
+def test_node_info_parsed():
+    cfg = parse_config(base_raw(node_info=["GPU nvidia", "x86 CPU"]))
+    assert cfg.targets["hal"].node_info == ("GPU nvidia", "x86 CPU")
+
+
+def test_node_info_bare_string_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(node_info="GPU"))
+
+
+def test_node_info_non_string_entry_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(node_info=["GPU", 3]))
+
+
+def _direct_target(**overrides):
+    kwargs = dict(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=2222),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    kwargs.update(overrides)
+    return TargetConfig(**kwargs)
+
+
+def test_node_info_direct_bare_string_rejected():
+    with pytest.raises(ConfigError):
+        _direct_target(node_info="GPU")
+
+
+def test_node_info_direct_list_normalized_to_tuple_and_hashable():
+    target = _direct_target(node_info=["GPU nvidia", "x86 CPU"])
+    assert target.node_info == ("GPU nvidia", "x86 CPU")
+    assert isinstance(target.node_info, tuple)
+    assert hash(target) is not None
 
 
 def test_proxy_jump_parsed_for_tunnel():

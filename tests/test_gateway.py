@@ -20,7 +20,7 @@ from compute_mcp.config import (
     TransportConfig,
     parse_config,
 )
-from compute_mcp.gateway import Gateway
+from compute_mcp.gateway import Gateway, TargetRuntime
 
 
 def make_gateway():
@@ -843,6 +843,40 @@ async def test_sharing_exposed_in_target_status_and_discovery(monkeypatch):
         by_name = {t["name"]: t for t in body["targets"]}
         assert by_name["hal"]["sharing"] == "exclusive"
         assert by_name["gpu03"]["sharing"] == "unknown"
+    finally:
+        await client.close()
+
+
+def test_public_status_node_info_empty_for_runtime_without_target():
+    gw = make_gateway()
+    gw.runtimes["orphan"] = TargetRuntime(name="orphan")
+    assert "orphan" not in gw.config.targets
+    assert gw.public_status("orphan")["node_info"] == []
+
+
+async def test_node_info_exposed_in_target_status_and_discovery(monkeypatch):
+    import dataclasses
+
+    gw = make_gateway()
+    hal = gw.config.targets["hal"]
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(hal, node_info=("GPU nvidia", "x86 CPU")),
+        },
+    )
+    client = await make_client(gw)
+    try:
+        resp = await client.get("/v1/targets/hal", headers=auth("alpaka-token"))
+        assert (await resp.json())["node_info"] == ["GPU nvidia", "x86 CPU"]
+
+        resp = await client.get("/v1/targets", headers=auth("admin-token"))
+        body = await resp.json()
+        by_name = {t["name"]: t for t in body["targets"]}
+        assert by_name["hal"]["node_info"] == ["GPU nvidia", "x86 CPU"]
+        assert by_name["gpu03"]["node_info"] == []
+        assert "node_info" in by_name["gpu03"]
     finally:
         await client.close()
 

@@ -99,6 +99,11 @@ class TargetConfig:
     # other users/jobs.  Relevant for benchmark trust; "unknown" when the
     # operator does not know.  Free-form but one of the three constants.
     sharing: str = "unknown"
+    # Free-form, operator-authored hints about the underlying system (e.g.
+    # ["GPU nvidia", "x86 CPU"]).  Unstructured: no fixed schema or meaning.
+    # Optional; an unset value is treated as an empty list.  Exposed to agents
+    # via computeMCP_targets()/computeMCP_status().
+    node_info: tuple[str, ...] = ()
     interactive_auth: bool = False
     # Optional trusted provisioning command (argv, no shell).  Run before the
     # tunnel is opened to discover a dynamic endpoint (e.g. a Slurm job's
@@ -147,6 +152,15 @@ class TargetConfig:
             raise ConfigError(
                 f"target {self.name!r} sharing must be 'exclusive', 'shared' or 'unknown'"
             )
+        if not isinstance(self.node_info, (tuple, list)):
+            raise ConfigError(
+                f"target {self.name!r} node_info must be a list of strings"
+            )
+        if not all(isinstance(entry, str) for entry in self.node_info):
+            raise ConfigError(
+                f"target {self.name!r} node_info must be a list of strings"
+            )
+        object.__setattr__(self, "node_info", tuple(self.node_info))
         if self.host_key_sha256 is not None:
             fp = self.host_key_sha256.strip()
             if not fp.startswith("SHA256:") or len(fp) < 12:
@@ -241,6 +255,9 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
     if not isinstance(value, dict):
         raise ConfigError(f"[targets.{name}] must be a table")
 
+    if "node_info" in value and not isinstance(value.get("node_info"), list):
+        raise ConfigError(f"target {name!r} node_info must be a list of strings")
+
     user = value.get("user", "agent")
     has_ssh_targets = "ssh_targets" in value
     ssh_targets = tuple(value.get("ssh_targets", ()))
@@ -271,6 +288,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         host_key_check=value.get("host_key_check", "on"),
         connect_mode=value.get("connect_mode", "shared"),
         sharing=value.get("sharing", "unknown"),
+        node_info=tuple(value.get("node_info", ())),
         interactive_auth=bool(value.get("interactive_auth", False)),
         provision_command=tuple(value.get("provision_command", ())),
         provision_timeout=_float(

@@ -803,6 +803,20 @@ targets = ["hal", "fwk394"]
   sharing = "exclusive"     # Slurm allocation is ours
   ```
 
+- `node_info` is an optional list of free-form, operator-provided, unstructured
+  hints about the underlying system (for example `"x86 CPU"` or `"AMD GPU"`).
+  There is no fixed schema or meaning; agents treat them as starting
+  hypotheses and verify the actual hardware. Unset or empty means no extra
+  information was provided, so the agent discovers the system itself or the
+  user guides it. `computeMCP_targets()`/`computeMCP_status()` return it.
+
+  ```toml
+  [targets.rosi5]
+  ssh_targets = ["rosi5"]
+  sharing = "exclusive"     # Slurm allocation is ours
+  node_info = ["x86 CPU", "AMD GPU"]
+  ```
+
 - HPC / Slurm targets: a fixed login node can be reached with `proxy_jump`,
   while the dynamic compute node is discovered at connect time by a trusted
   `provision_command` (see the next subsection).

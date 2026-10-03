@@ -51,7 +51,7 @@ computeMCP_targets()
 Then, optionally, inspect one:
 
 ```
-computeMCP_status(target)      # state, active route, clients, sharing, last_error
+computeMCP_status(target)      # state, active route, clients, sharing, node_info, last_error
 ```
 
 Each target also carries a **`sharing`** field, which matters for benchmarks:
@@ -63,6 +63,26 @@ Each target also carries a **`sharing`** field, which matters for benchmarks:
 - `"unknown"` — the operator did not declare it. Treat as potentially shared.
 
 Before running or reporting a benchmark, check `sharing` and say which it was.
+
+Each target also carries a **`node_info`** field: an optional list of free-form
+strings the operator wrote about the system, such as hardware, architecture, or
+accelerators. For example:
+
+```
+["GPU nvidia", "x86 CPU", "AMD GPU"]
+```
+
+There is no fixed schema and no limited vocabulary — the operator can put any
+human-readable text there. `computeMCP_targets()` and
+`computeMCP_status(target)` return it per target.
+
+An empty list means the operator provided no hints. You get no extra information
+and must determine the system yourself (for example, inspect `/proc/cpuinfo`,
+`nvidia-smi`, or `lscpu`) or ask the user.
+
+Treat the hints as a starting hypothesis, understand them with your own
+reasoning, and verify them against the actual system. They are guidance, never a
+hard constraint.
 
 If `computeMCP_targets` does not return a system you expect, or a target shows
 `state != "connected"` with an error, report the gateway status. If the MCP
@@ -194,8 +214,8 @@ with `skip_existing=True` to send only files still missing remotely, and use
 
 | Tool | Purpose |
 | --- | --- |
-| `computeMCP_targets()` | List available systems + `sharing` (do this first) |
-| `computeMCP_status(target)` | State/route/clients/`sharing`/errors for one system |
+| `computeMCP_targets()` | List available systems + `sharing`/`node_info` (do this first) |
+| `computeMCP_status(target)` | State/route/clients/`sharing`/`node_info`/errors for one system |
 | `computeMCP_exec(target, command, cwd?, timeout?, env?, stdin?)` | Short non-interactive command |
 | `computeMCP_session_create(target, cwd?, columns?, rows?)` | New PTY session |
 | `computeMCP_session_write(session_id, data)` | Send input to a session |
@@ -253,3 +273,5 @@ computeMCP_session_close(sid)
 - Close sessions you create.
 - Check `sharing` before trusting benchmark numbers; only `"exclusive"` systems
   give stable measurements.
+- Read `node_info` and treat it as a hypothesis, not ground truth; verify it
+  against the actual system.
