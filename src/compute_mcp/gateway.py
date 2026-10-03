@@ -546,6 +546,9 @@ class Gateway:
         target = self.config.targets.get(name)
         if target is not None:
             status["sharing"] = target.sharing
+            status["node_info"] = list(target.node_info)
+        else:
+            status["node_info"] = []
         return status
 
     def list_targets(self, client: Client) -> list[dict]:
@@ -1457,7 +1460,7 @@ class Gateway:
     def _print_status_table(self) -> None:
         print(
             f"{'TARGET':<16}{'STATE':<14}{'ROUTE':<14}{'LOCAL':<8}"
-            f"{'SHARING':<11}{'CLIENTS':<8}UPTIME"
+            f"{'SHARING':<11}{'NODE_INFO':<42}{'CLIENTS':<8}UPTIME"
         )
         now = datetime.now(timezone.utc)
         for name in self.config.targets:
@@ -1466,11 +1469,15 @@ class Gateway:
             if runtime.connected_since:
                 delta = now - runtime.connected_since
                 uptime = str(delta).split(".")[0]
+            node_info = "; ".join(self.config.targets[name].node_info or [])
+            if len(node_info) > 40:
+                node_info = node_info[:39] + "\u2026"
             print(
                 f"{name:<16}{runtime.state:<14}"
                 f"{runtime.active_route or '-':<14}"
                 f"{runtime.local_port if runtime.local_port else '-':<8}"
                 f"{self.config.targets[name].sharing:<11}"
+                f"{node_info or '-':<42}"
                 f"{self.sessions.count_for_target(name):<8}{uptime}"
             )
 

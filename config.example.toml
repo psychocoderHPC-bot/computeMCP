@@ -117,6 +117,11 @@ connect_mode = "shared"
 #   "unknown"   - not declared (default)
 # Exposed to agents via computeMCP_targets()/computeMCP_status().
 sharing = "unknown"
+# Optional list of free-form, unstructured, AI-readable hints about the system.
+# No fixed meaning or schema; agents treat them as starting hypotheses.  Unset
+# or empty means no extra info: the agent discovers the system itself or the
+# user guides it.  Exposed to agents via computeMCP_targets()/computeMCP_status().
+# node_info = ["GPU nvidia", "x86 CPU", "AMD GPU"]
 # Set true if the development container requires interactive authentication
 # (password / keyboard-interactive, e.g. a second factor). The gateway then
 # prompts on the operator console during `connect`/`refresh`/`exec`; when the
