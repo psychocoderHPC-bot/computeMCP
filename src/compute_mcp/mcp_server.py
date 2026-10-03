@@ -280,24 +280,24 @@ async def _download_tree(
 
 
 def _client_from_env() -> GatewayClient:
-    url = os.environ.get("TEROK_COMPUTE_GATEWAY")
-    token = os.environ.get("TEROK_COMPUTE_TOKEN")
+    url = os.environ.get("COMPUTEMCP_GATEWAY")
+    token = os.environ.get("COMPUTEMCP_TOKEN")
     if not url:
-        raise SystemExit("TEROK_COMPUTE_GATEWAY is not set")
+        raise SystemExit("COMPUTEMCP_GATEWAY is not set")
     if not token:
-        raise SystemExit("TEROK_COMPUTE_TOKEN is not set")
+        raise SystemExit("COMPUTEMCP_TOKEN is not set")
     return GatewayClient(url, token)
 
 
 def build_server(client: GatewayClient) -> MCPServer:
     mcp = MCPServer(
-        "terok-compute",
+        "computeMCP",
         instructions=(
             "Access to isolated remote development containers. "
-            "Call compute_targets FIRST to discover machines; use only target "
+            "Call computeMCP_targets FIRST to discover machines; use only target "
             "names it returns. All operations run inside the remote development "
-            "container, never on the gateway or compute host. Use compute_exec "
-            "for short commands and persistent compute_session_* tools for "
+            "container, never on the gateway or compute host. Use computeMCP_exec "
+            "for short commands and persistent computeMCP_session_* tools for "
             "builds, tests, debuggers or other long-running commands. Multiple "
             "sessions on the same target run concurrently, so use a second "
             "session to inspect a running build."
@@ -305,7 +305,7 @@ def build_server(client: GatewayClient) -> MCPServer:
     )
 
     @mcp.tool()
-    async def compute_targets() -> dict:
+    async def computeMCP_targets() -> dict:
         """List remote compute targets available to this Terok task.
 
         Call this before any other compute tool and only use the returned
@@ -320,7 +320,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         return await client.request("GET", "/v1/targets")
 
     @mcp.tool()
-    async def compute_status(target: str) -> dict:
+    async def computeMCP_status(target: str) -> dict:
         """Get state, active route, client count and `sharing` for a target.
 
         Check `sharing` before trusting benchmark numbers: only an
@@ -329,7 +329,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         return await client.request("GET", f"/v1/targets/{target}")
 
     @mcp.tool()
-    async def compute_exec(
+    async def computeMCP_exec(
         target: str,
         command: str,
         cwd: str | None = None,
@@ -363,7 +363,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_session_create(
+    async def computeMCP_session_create(
         target: str,
         cwd: str | None = None,
         columns: int = 160,
@@ -372,7 +372,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         """Create an independent persistent PTY session on a target.
 
         Use for builds, tests, debuggers and interactive programs. Returns a
-        session_id used by the other compute_session_* tools.
+        session_id used by the other computeMCP_session_* tools.
         """
         return await client.request(
             "POST",
@@ -381,14 +381,14 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_session_write(session_id: str, data: str) -> dict:
+    async def computeMCP_session_write(session_id: str, data: str) -> dict:
         """Send input (including a trailing newline) to a PTY session."""
         return await client.request(
             "POST", f"/v1/sessions/{session_id}/write", json={"data": data}
         )
 
     @mcp.tool()
-    async def compute_session_read(
+    async def computeMCP_session_read(
         session_id: str, max_bytes: int = 0, wait: float = 0.0
     ) -> dict:
         """Read and clear buffered output from a PTY session.
@@ -409,7 +409,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_session_resize(session_id: str, columns: int, rows: int) -> dict:
+    async def computeMCP_session_resize(session_id: str, columns: int, rows: int) -> dict:
         """Resize a PTY session's terminal."""
         return await client.request(
             "POST",
@@ -418,18 +418,18 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_session_close(session_id: str) -> dict:
+    async def computeMCP_session_close(session_id: str) -> dict:
         """Close a PTY session (terminates the remote process)."""
         return await client.request("DELETE", f"/v1/sessions/{session_id}")
 
     @mcp.tool()
-    async def compute_sessions(target: str | None = None) -> dict:
+    async def computeMCP_sessions(target: str | None = None) -> dict:
         """List sessions owned by this client, optionally filtered by target."""
         params = {"target": target} if target else None
         return await client.request("GET", "/v1/sessions", params=params)
 
     @mcp.tool()
-    async def compute_file_read(target: str, path: str) -> dict:
+    async def computeMCP_file_read(target: str, path: str) -> dict:
         """Read a file inside a remote development container (UTF-8, lossy).
 
         Paths are inside the container, never on the gateway host.
@@ -439,7 +439,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_file_read_base64(target: str, path: str) -> dict:
+    async def computeMCP_file_read_base64(target: str, path: str) -> dict:
         """Read a binary file inside a remote container as base64."""
         return await client.request(
             "GET",
@@ -448,7 +448,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_file_write(
+    async def computeMCP_file_write(
         target: str, path: str, content: str, encoding: str = "utf-8"
     ) -> dict:
         """Write text (or base64 when encoding='base64') to a file in a container."""
@@ -460,35 +460,35 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_file_list(target: str, path: str) -> dict:
+    async def computeMCP_file_list(target: str, path: str) -> dict:
         """List a directory inside a remote development container."""
         return await client.request(
             "GET", "/v1/files/list", params={"target": target, "path": path}
         )
 
     @mcp.tool()
-    async def compute_file_stat(target: str, path: str) -> dict:
+    async def computeMCP_file_stat(target: str, path: str) -> dict:
         """Stat a path inside a remote development container."""
         return await client.request(
             "GET", "/v1/files/stat", params={"target": target, "path": path}
         )
 
     @mcp.tool()
-    async def compute_file_mkdir(target: str, path: str) -> dict:
+    async def computeMCP_file_mkdir(target: str, path: str) -> dict:
         """Create a directory (and parents) inside a remote container."""
         return await client.request(
             "POST", "/v1/files/mkdir", params={"target": target}, json={"path": path}
         )
 
     @mcp.tool()
-    async def compute_file_remove(target: str, path: str) -> dict:
+    async def computeMCP_file_remove(target: str, path: str) -> dict:
         """Remove a file or directory inside a remote container."""
         return await client.request(
             "POST", "/v1/files/remove", params={"target": target}, json={"path": path}
         )
 
     @mcp.tool()
-    async def compute_file_rename(
+    async def computeMCP_file_rename(
         target: str, source: str, destination: str
     ) -> dict:
         """Rename/move a path inside a remote container."""
@@ -500,7 +500,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_file_upload(
+    async def computeMCP_file_upload(
         target: str,
         local_path: str,
         remote_path: str,
@@ -535,7 +535,7 @@ def build_server(client: GatewayClient) -> MCPServer:
             )
 
     @mcp.tool()
-    async def compute_file_upload_tree(
+    async def computeMCP_file_upload_tree(
         target: str,
         local_path: str,
         remote_path: str,
@@ -567,7 +567,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
-    async def compute_file_download(
+    async def computeMCP_file_download(
         target: str, remote_path: str, local_path: str, recursive: bool = False
     ) -> dict:
         """Download a file or directory from a remote development container into
@@ -584,7 +584,7 @@ def build_server(client: GatewayClient) -> MCPServer:
             return await client.download(target, remote_path, handle)
 
     @mcp.tool()
-    async def compute_file_chmod(target: str, path: str, mode: str) -> dict:
+    async def computeMCP_file_chmod(target: str, path: str, mode: str) -> dict:
         """Change permissions of a path inside a remote container.
 
         `mode` is octal, e.g. "644", "755" or "0755".

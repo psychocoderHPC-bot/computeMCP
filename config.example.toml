@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-# Terok Compute Gateway configuration.
+# computeMCP gateway configuration.
 #
-# Copy to ~/.config/terok-compute-gateway/config.toml and edit.
+# Copy to ~/.config/computeMCP-gateway/config.toml and edit.
 # The gateway TOML is the single source of truth for targets.  Values here are
 # never accepted from MCP clients.
 #
@@ -21,7 +21,7 @@ port = 2222
 request_timeout = 30.0
 exec_timeout = 900.0
 max_body_bytes = 268435456
-# Interactive enrollment (terok-handshake).  /v1/enroll is unauthenticated but
+# Interactive enrollment (computeMCP-handshake).  /v1/enroll is unauthenticated but
 # grants nothing until an operator approves on the console; these bound it.
 # Set allow_enrollment = false to remove the endpoint entirely.
 allow_enrollment = true
@@ -37,7 +37,7 @@ internal_port_max = 31999
 # Optional dedicated SSH config used by the tunnel subprocess.  Leave unset to
 # use the gateway user's normal ~/.ssh/config.  Keeping a separate file lets the
 # gateway own only the aliases it needs.
-# config = "/home/USER/.config/terok-compute-gateway/ssh_config"
+# config = "/home/USER/.config/computeMCP-gateway/ssh_config"
 
 [sessions]
 idle_timeout = 3600.0
@@ -46,7 +46,7 @@ output_buffer_bytes = 4194304
 
 [auth]
 # Recommended: generate tokens and store only their hashes here.
-#   terok-compute-gateway --generate-tokens
+#   computeMCP-gateway --generate-tokens
 # Then uncomment the line below AND delete every inline `token = ...` in
 # [clients.*].  If you do not set token_file, a tokens.toml next to this file is
 # picked up automatically.  IMPORTANT: an inline `token` takes precedence over
@@ -54,7 +54,7 @@ output_buffer_bytes = 4194304
 # If you enable token_file but leave the example's inline
 # `token = "REPLACE_WITH_..."`, the gateway authenticates against the
 # placeholder hash and every client request fails with "invalid token".
-# token_file = "/home/USER/.config/terok-compute-gateway/tokens.toml"
+# token_file = "/home/USER/.config/computeMCP-gateway/tokens.toml"
 
 # ---------------------------------------------------------------------------
 # Clients. Each Terok project gets a dedicated high-entropy token.  Prefer
@@ -96,7 +96,7 @@ user = "agent"
 # the one you pinned so the fingerprint always matches.
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 host_key_algorithms = ["ssh-ed25519"]
-client_key = "/home/USER/.ssh/terok_compute_container"
+client_key = "/home/USER/.ssh/computemcp_container"
 # "shared" (default) multiplexes all exec/sessions over one SSH connection.
 # "dedicated" opens a fresh connection per exec/session, bypassing the remote
 # sshd's per-connection MaxSessions limit (commonly 10) at the cost of more
@@ -107,7 +107,7 @@ connect_mode = "shared"
 #                 are meaningful
 #   "shared"    - other users/jobs may run concurrently; benchmarks are noisy
 #   "unknown"   - not declared (default)
-# Exposed to agents via compute_targets()/compute_status().
+# Exposed to agents via computeMCP_targets()/computeMCP_status().
 sharing = "unknown"
 # Set true if the development container requires interactive authentication
 # (password / keyboard-interactive, e.g. a second factor). The gateway then
@@ -125,7 +125,7 @@ connect_backoff_max = 60.0
 #
 # [targets.rosi5]
 # user = "agent"
-# client_key = "/home/USER/.ssh/terok_compute_container"
+# client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 # host_key_algorithms = ["ssh-ed25519"]
 # # Gateway reaches the login node via this SSH config alias.
@@ -135,7 +135,7 @@ connect_backoff_max = 60.0
 # # Trusted argv (no shell). It starts/attaches the Slurm job, sets up a
 # # forward from the login node to the compute container, and prints
 # # `host:port` (optionally prefixed with ENDPOINT) on stdout.
-# provision_command = ["/home/USER/.config/terok-compute-gateway/rosi5-provision.sh"]
+# provision_command = ["/home/USER/.config/computeMCP-gateway/rosi5-provision.sh"]
 # provision_timeout = 900.0
 
 # A target reachable without a tunnel (e.g. gateway co-located with the
@@ -154,7 +154,7 @@ remote_host = "127.0.0.1"
 remote_port = 2222
 user = "agent"
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
-client_key = "/home/USER/.ssh/terok_compute_container"
+client_key = "/home/USER/.ssh/computemcp_container"
 
 # A target with many simultaneous long-running sessions can opt out of the
 # remote sshd's per-connection MaxSessions limit.
@@ -165,4 +165,4 @@ client_key = "/home/USER/.ssh/terok_compute_container"
 # user = "agent"
 # connect_mode = "dedicated"
 # host_key_sha256 = "SHA256:..."
-# client_key = "/home/USER/.ssh/terok_compute_container"
+# client_key = "/home/USER/.ssh/computemcp_container"

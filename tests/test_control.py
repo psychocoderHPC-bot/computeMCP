@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-from terok_compute.config import parse_config
-from terok_compute.control import _resolve_gateway, build_parser
+from compute_mcp.config import parse_config
+from compute_mcp.control import _resolve_gateway, build_parser
 
 
 def make_config(**server):
@@ -27,7 +27,7 @@ def test_resolve_gateway_wildcard_binds_loopback():
 def test_resolve_gateway_override_and_env(monkeypatch):
     cfg = make_config()
     assert _resolve_gateway(cfg, "http://example:9/").rstrip("/") == "http://example:9"
-    monkeypatch.setenv("TEROK_COMPUTE_GATEWAY", "http://env:1")
+    monkeypatch.setenv("COMPUTEMCP_GATEWAY", "http://env:1")
     assert _resolve_gateway(cfg, None) == "http://env:1"
 
 

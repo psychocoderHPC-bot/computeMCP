@@ -22,7 +22,7 @@ import asyncssh
 from .config import SessionConfig, TargetConfig
 from .ssh_backend import ManagedSession, SSHBackend, SSHError
 
-log = logging.getLogger("terok_compute.sessions")
+log = logging.getLogger("compute_mcp.sessions")
 
 ConnectionProvider = Callable[[str], Awaitable[tuple[TargetConfig, asyncssh.SSHClientConnection]]]
 

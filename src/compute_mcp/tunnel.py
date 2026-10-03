@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 from .config import SSHConfig, TargetConfig, TransportConfig
 
-log = logging.getLogger("terok_compute.tunnel")
+log = logging.getLogger("compute_mcp.tunnel")
 
 
 class TunnelError(RuntimeError):

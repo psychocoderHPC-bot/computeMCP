@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: ISC
 import pytest
 
-from terok_compute.auth import (
+from compute_mcp.auth import (
     AuthError,
     Authenticator,
     ForbiddenTarget,
     hash_token,
     new_token,
 )
-from terok_compute.config import ClientConfig
+from compute_mcp.config import ClientConfig
 
 
 def make_auth():

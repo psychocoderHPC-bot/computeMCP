@@ -9,8 +9,8 @@ import time
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from terok_compute.auth import hash_token
-from terok_compute.config import (
+from compute_mcp.auth import hash_token
+from compute_mcp.config import (
     ClientConfig,
     GatewayConfig,
     ServerConfig,
@@ -20,7 +20,7 @@ from terok_compute.config import (
     TransportConfig,
     parse_config,
 )
-from terok_compute.gateway import Gateway
+from compute_mcp.gateway import Gateway
 
 
 def make_gateway():
@@ -328,7 +328,7 @@ async def test_file_chmod_endpoint(monkeypatch):
         return gw.config.targets[name], object()
 
     monkeypatch.setattr(gw, "_connection_provider", fake_provider)
-    monkeypatch.setattr("terok_compute.gateway.sftp_client", lambda conn: FakeSftpCtx(conn))
+    monkeypatch.setattr("compute_mcp.gateway.sftp_client", lambda conn: FakeSftpCtx(conn))
 
     client = await make_client(gw)
     try:
@@ -369,7 +369,7 @@ async def test_reload_add_remove_unchanged(tmp_path):
         host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
         """
     )
-    from terok_compute.config import load_config
+    from compute_mcp.config import load_config
 
     cfg = load_config(cfg_file)
     gw = Gateway(cfg)
@@ -412,7 +412,7 @@ async def test_reload_malformed_keeps_old_config(tmp_path):
         host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
         """
     )
-    from terok_compute.config import ConfigError, load_config
+    from compute_mcp.config import ConfigError, load_config
 
     cfg = load_config(cfg_file)
     gw = Gateway(cfg)
@@ -602,7 +602,7 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
 
     monkeypatch.setattr(gw, "_connection_provider", fake_provider)
     monkeypatch.setattr(
-        "terok_compute.gateway.sftp_client", lambda conn: FakeSftpCtx(conn)
+        "compute_mcp.gateway.sftp_client", lambda conn: FakeSftpCtx(conn)
     )
 
     client = await make_client(gw)
@@ -623,7 +623,7 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
 
 
 def test_parse_provision_endpoint():
-    from terok_compute.gateway import _parse_provision_endpoint
+    from compute_mcp.gateway import _parse_provision_endpoint
 
     assert _parse_provision_endpoint("cn123:2345\n") == ("cn123", 2345)
     assert _parse_provision_endpoint("ENDPOINT 10.0.0.5:2222\n") == ("10.0.0.5", 2222)
@@ -657,7 +657,7 @@ async def test_provision_runs_command_and_overrides_endpoint(tmp_path, monkeypat
 
 
 async def test_provision_failure_raises(tmp_path, monkeypatch):
-    from terok_compute.gateway import ProvisionError
+    from compute_mcp.gateway import ProvisionError
 
     gw = make_gateway()
     import dataclasses
@@ -768,8 +768,8 @@ async def test_interactive_prompter_returns_none_when_headless(monkeypatch):
 
 
 async def test_headless_interactive_target_raises_clear_error(monkeypatch):
-    from terok_compute.gateway import InteractiveAuthRequired
-    from terok_compute.ssh_backend import SSHError
+    from compute_mcp.gateway import InteractiveAuthRequired
+    from compute_mcp.ssh_backend import SSHError
 
     gw = make_gateway()
     gw._interactive = False
@@ -981,7 +981,7 @@ async def test_clients_kill_closes_sessions(monkeypatch):
 
 
 async def test_reload_endpoint_admin_only(tmp_path):
-    from terok_compute.config import load_config
+    from compute_mcp.config import load_config
 
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
@@ -1050,8 +1050,8 @@ async def test_console_target_commands_without_argument_print_usage():
 
 
 async def test_generate_tokens_writes_hashes_and_authenticates(tmp_path):
-    from terok_compute.auth import hash_token
-    from terok_compute.gateway import generate_tokens
+    from compute_mcp.auth import hash_token
+    from compute_mcp.gateway import generate_tokens
     import io
     import contextlib as _ctx
 
@@ -1103,8 +1103,8 @@ async def test_upload_requires_target_acl(monkeypatch):
 
 async def _enroll_flow(tmp_path, monkeypatch):
     """Build a gateway backed by real files so enrollment can persist."""
-    from terok_compute.config import load_config
-    from terok_compute.gateway import Gateway
+    from compute_mcp.config import load_config
+    from compute_mcp.gateway import Gateway
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(
@@ -1205,8 +1205,8 @@ async def test_enroll_rejects_existing_client_and_unknown_target(tmp_path, monke
 
 
 async def test_enroll_disabled_returns_403(tmp_path):
-    from terok_compute.config import load_config
-    from terok_compute.gateway import Gateway
+    from compute_mcp.config import load_config
+    from compute_mcp.gateway import Gateway
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(
@@ -1251,9 +1251,9 @@ async def test_enroll_deny_is_reported(tmp_path, monkeypatch):
 
 async def test_approve_rolls_back_token_when_config_append_fails(tmp_path, monkeypatch):
     """A failed config append must not leave an orphan token hash behind."""
-    from terok_compute.config import load_config, load_tokens
-    from terok_compute.gateway import Gateway
-    import terok_compute.gateway as gwmod
+    from compute_mcp.config import load_config, load_tokens
+    from compute_mcp.gateway import Gateway
+    import compute_mcp.gateway as gwmod
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(

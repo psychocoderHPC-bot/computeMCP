@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from terok_compute.enrollment import (
+from compute_mcp.enrollment import (
     APPROVED,
     DENIED,
     EnrollmentError,

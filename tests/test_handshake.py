@@ -4,7 +4,7 @@
 import json
 from pathlib import Path
 
-from terok_compute.handshake import (
+from compute_mcp.handshake import (
     BEGIN_MARK,
     END_MARK,
     _mcp_snippet,
@@ -41,22 +41,22 @@ def test_update_bashrc_source_file(tmp_path: Path):
     _update_bashrc(rc, source_file=env, url="http://gw:2223", token="tok")
     text = rc.read_text()
     assert f'. "{env}"' in text
-    assert "export TEROK_COMPUTE_TOKEN" not in text
+    assert "export COMPUTEMCP_TOKEN" not in text
 
 
 def test_mcp_snippet_is_valid_json_fragment():
     snippet = "{" + _mcp_snippet("http://gw:2223", "tok") + "}"
     parsed = json.loads(snippet)
-    assert parsed["compute"]["environment"]["TEROK_COMPUTE_TOKEN"] == "tok"
+    assert parsed["compute"]["environment"]["COMPUTEMCP_TOKEN"] == "tok"
 
 
 async def test_handshake_end_to_end(tmp_path):
     """Drive request -> approve -> poll -> .bashrc against a live gateway."""
     from aiohttp import web
 
-    from terok_compute.config import load_config
-    from terok_compute.gateway import Gateway
-    from terok_compute.handshake import (
+    from compute_mcp.config import load_config
+    from compute_mcp.gateway import Gateway
+    from compute_mcp.handshake import (
         _poll,
         _request_enrollment,
         _update_bashrc,
@@ -104,7 +104,7 @@ async def test_handshake_end_to_end(tmp_path):
 
         rc = tmp_path / ".bashrc"
         _update_bashrc(rc, source_file=None, url=base, token=result["token"])
-        assert "TEROK_COMPUTE_TOKEN" in rc.read_text()
+        assert "COMPUTEMCP_TOKEN" in rc.read_text()
 
         # The delivered token authenticates.
         async with aiohttp.ClientSession(

@@ -1,22 +1,22 @@
 # SPDX-FileCopyrightText: René Widera
 #
 # SPDX-License-Identifier: ISC
-"""Operator CLI for a running Terok Compute Gateway.
+"""Operator CLI for a running computeMCP gateway.
 
 Talks to the gateway's authenticated HTTP API, so it works against a gateway
 managed by systemd where the interactive console is not available.
 
 Examples::
 
-    terok-compute-gatewayctl status
-    terok-compute-gatewayctl clients
-    terok-compute-gatewayctl client alpaka
-    terok-compute-gatewayctl target-refresh hal
-    terok-compute-gatewayctl client-refresh alpaka
-    terok-compute-gatewayctl client-connect alpaka
-    terok-compute-gatewayctl client-stop alpaka
-    terok-compute-gatewayctl client-kill alpaka
-    terok-compute-gatewayctl reload
+    computeMCP-gatewayctl status
+    computeMCP-gatewayctl clients
+    computeMCP-gatewayctl client alpaka
+    computeMCP-gatewayctl target-refresh hal
+    computeMCP-gatewayctl client-refresh alpaka
+    computeMCP-gatewayctl client-connect alpaka
+    computeMCP-gatewayctl client-stop alpaka
+    computeMCP-gatewayctl client-kill alpaka
+    computeMCP-gatewayctl reload
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from .config import (
 def _resolve_gateway(config: GatewayConfig, override: str | None) -> str:
     if override:
         return override.rstrip("/")
-    env = os.environ.get("TEROK_COMPUTE_GATEWAY")
+    env = os.environ.get("COMPUTEMCP_GATEWAY")
     if env:
         return env.rstrip("/")
     host = config.server.listen
@@ -52,7 +52,7 @@ def _resolve_token(config_path: str, token_file: str | None,
                    client: str, token: str | None) -> str:
     if token:
         return token
-    env = os.environ.get("TEROK_COMPUTE_TOKEN")
+    env = os.environ.get("COMPUTEMCP_TOKEN")
     if env:
         return env
     # Fall back to reading the plaintext token from a tokens file, if present.
@@ -74,18 +74,18 @@ def _resolve_token(config_path: str, token_file: str | None,
             if key == client:
                 return str(value)
     raise SystemExit(
-        "no token available: set TEROK_COMPUTE_TOKEN, pass --token, or keep a "
+        "no token available: set COMPUTEMCP_TOKEN, pass --token, or keep a "
         "plaintext token in the tokens file (hashes cannot be used by the CLI)"
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="terok-compute-gatewayctl")
+    parser = argparse.ArgumentParser(prog="computeMCP-gatewayctl")
     parser.add_argument(
         "--config",
         default=str(default_config_path()),
         help="gateway config.toml (default: "
-        "~/.config/terok-compute-gateway/config.toml)",
+        "~/.config/computeMCP-gateway/config.toml)",
     )
     parser.add_argument("--token-file", help="override [auth] token_file")
     parser.add_argument("--gateway", help="gateway base URL (default from config/env)")

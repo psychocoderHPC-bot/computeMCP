@@ -5,8 +5,8 @@ import os
 
 import pytest
 
-from terok_compute.files import parse_mode
-from terok_compute.ssh_backend import SSHError
+from compute_mcp.files import parse_mode
+from compute_mcp.ssh_backend import SSHError
 
 
 def test_parse_mode_octal_strings():
@@ -28,7 +28,7 @@ def test_parse_mode_invalid():
 
 
 def test_matches_globs():
-    from terok_compute.mcp_server import _matches
+    from compute_mcp.mcp_server import _matches
 
     assert _matches("src/a.c", [], []) is True
     assert _matches("src/a.c", ["src/*"], []) is True
@@ -79,7 +79,7 @@ class FakeGatewayClient:
 
 
 async def test_upload_tree_mirrors_and_filters(tmp_path):
-    from terok_compute.mcp_server import _upload_tree
+    from compute_mcp.mcp_server import _upload_tree
 
     root = tmp_path / "src"
     (root / "sub").mkdir(parents=True)
@@ -102,7 +102,7 @@ async def test_upload_tree_mirrors_and_filters(tmp_path):
 
 
 async def test_upload_tree_skip_existing(tmp_path):
-    from terok_compute.mcp_server import _upload_tree
+    from compute_mcp.mcp_server import _upload_tree
 
     root = tmp_path / "src"
     root.mkdir()
@@ -122,7 +122,7 @@ async def test_upload_tree_skip_existing(tmp_path):
 
 
 async def test_download_tree_recursive(tmp_path):
-    from terok_compute.mcp_server import _download_tree
+    from compute_mcp.mcp_server import _download_tree
 
     client = FakeGatewayClient()
     client.dirs.update({"/remote/dst", "/remote/dst/sub"})
