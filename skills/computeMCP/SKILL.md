@@ -16,6 +16,15 @@ The connection model is:
 you (this container) --> compute MCP --> gateway --> remote dev container
 ```
 
+## Before you act: load this skill
+
+Read this entire skill before the first `computeMCP_*` call. Loading it is
+mandatory for every compute MCP action: discovery, exec, sessions, file
+transfer, and remote-agent delegation. Do not call `computeMCP_targets()`,
+open a session, transfer a file, or delegate to a remote agent before you
+have read this document. Skipping the load has already caused missed rules,
+such as the non-TTY stdin warning in section 2.
+
 ## 0. Tool names and client namespacing
 
 This document names tools as the MCP server defines them (`computeMCP_targets`,
@@ -319,6 +328,8 @@ computeMCP_session_close(sid)
 
 ## 7. Rules
 
+- Read this skill before the first `computeMCP_*` call; loading is mandatory
+  for all compute MCP actions.
 - Call `computeMCP_targets()` first; use only returned target names.
 - All `computeMCP_*` operations run inside the **remote development container**,
   not on the host and not on the gateway.
