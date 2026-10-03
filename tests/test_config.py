@@ -134,6 +134,98 @@ def test_node_info_direct_list_normalized_to_tuple_and_hashable():
     assert hash(target) is not None
 
 
+def test_agent_default_is_empty():
+    assert parse_config(base_raw()).targets["hal"].agent == ()
+
+
+def test_agent_inline_tables_parsed_to_tuple_of_pairs():
+    raw = base_raw(
+        agent=[
+            {"agent": "opencode", "model": "GWen 3.5"},
+            {"agent": "codex", "model": "Sole"},
+        ]
+    )
+    assert parse_config(raw).targets["hal"].agent == (
+        ("opencode", "GWen 3.5"),
+        ("codex", "Sole"),
+    )
+
+
+def test_agent_spaces_preserved():
+    raw = base_raw(agent=[{"agent": "my agent", "model": "big model v2"}])
+    assert parse_config(raw).targets["hal"].agent == (("my agent", "big model v2"),)
+
+
+def test_agent_non_list_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent="opencode"))
+
+
+def test_agent_bare_string_entry_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=["opencode@GWen 3.5"]))
+
+
+def test_agent_unknown_key_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[{"agent": "opencode", "model": "x", "extra": "y"}]))
+
+
+def test_agent_missing_agent_key_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[{"model": "GWen 3.5"}]))
+
+
+def test_agent_missing_model_key_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[{"agent": "opencode"}]))
+
+
+def test_agent_empty_string_value_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[{"agent": "", "model": "GWen 3.5"}]))
+
+
+def test_agent_non_string_value_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[{"agent": "opencode", "model": 3}]))
+
+
+def test_agent_empty_model_value_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[{"agent": "opencode", "model": ""}]))
+
+
+def test_agent_non_string_agent_value_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[{"agent": 3, "model": "x"}]))
+
+
+def test_agent_normalized_tuple_entry_accepted():
+    raw = base_raw(agent=[("opencode", "GWen 3.5")])
+    assert parse_config(raw).targets["hal"].agent == (("opencode", "GWen 3.5"),)
+
+
+def test_agent_two_element_array_entry_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(agent=[["a", "b"]]))
+
+
+def test_agent_direct_normalized_to_tuple_and_hashable():
+    target = _direct_target(
+        agent=[("opencode", "GWen 3.5"), ("codex", "Sole")],
+    )
+    assert target.agent == (("opencode", "GWen 3.5"), ("codex", "Sole"))
+    assert isinstance(target.agent, tuple)
+    assert hash(target) is not None
+
+
+def test_agent_direct_dict_normalized_to_tuple_and_hashable():
+    target = _direct_target(agent=[{"agent": "opencode", "model": "GWen 3.5"}])
+    assert target.agent == (("opencode", "GWen 3.5"),)
+    assert hash(target) is not None
+
+
 def test_proxy_jump_parsed_for_tunnel():
     cfg = parse_config(base_raw(proxy_jump="rosi5"))
     assert cfg.targets["hal"].transport.proxy_jump == "rosi5"

@@ -821,6 +821,27 @@ targets = ["hal", "fwk394"]
   node_info = ["x86 CPU", "AMD GPU"]
   ```
 
+- `agent` is an optional ordered list of remote AI agents this target can
+  delegate work to, such as a test run or an implementation. Each entry is a
+  table with exactly `agent` and `model`, both non-empty strings (spaces are
+  allowed in both). The list order is the priority order: the caller should
+  try the entries in order and fall back to the first working one.
+  Unset or empty means no remote agent is configured.
+  `computeMCP_targets()`/`computeMCP_status()` return it as a list of
+  `{"agent": ..., "model": ...}` objects. Remote agents do not have the Terok
+  skills, so bring their results back for local review under the Terok rules.
+  This config field is unrelated to the SSH `user = "agent"` account name.
+
+  ```toml
+  [targets.rosi5]
+  ssh_targets = ["rosi5"]
+  sharing = "exclusive"     # Slurm allocation is ours
+  agent = [
+    { agent = "opencode", model = "GWen 3.5" },
+    { agent = "codex", model = "Sole" },
+  ]
+  ```
+
 - HPC / Slurm targets: a fixed login node can be reached with `proxy_jump`,
   while the dynamic compute node is discovered at connect time by a trusted
   `provision_command` (see the next subsection).

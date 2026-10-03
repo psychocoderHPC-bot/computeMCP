@@ -254,16 +254,22 @@ def _emit_status(args, body: dict) -> None:
         return
     print(
         f"{'TARGET':<18}{'STATE':<14}{'ROUTE':<14}{'LOCAL':<8}"
-        f"{'SHARING':<11}{'NODE_INFO':<42}CLIENTS"
+        f"{'SHARING':<11}{'NODE_INFO':<42}{'AGENT':<30}CLIENTS"
     )
     for t in body["targets"]:
         node_info = ", ".join(t.get("node_info") or []) or "-"
         if len(node_info) > 40:
             node_info = node_info[:39] + "\u2026"
+        agent = ", ".join(
+            f"{a.get('agent', '?')}@{a.get('model', '?')}"
+            for a in (t.get("agent") or [])
+        )
+        if len(agent) > 28:
+            agent = agent[:27] + "\u2026"
         print(
             f"{t['name']:<18}{t['state']:<14}{t.get('active_route') or '-':<14}"
             f"{t.get('local_port') or '-':<8}{t.get('sharing', 'unknown'):<11}"
-            f"{node_info:<42}{t.get('clients', 0)}"
+            f"{node_info:<42}{agent or '-':<30}{t.get('clients', 0)}"
         )
 
 

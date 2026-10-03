@@ -104,6 +104,13 @@ class TargetConfig:
     # Optional; an unset value is treated as an empty list.  Exposed to agents
     # via computeMCP_targets()/computeMCP_status().
     node_info: tuple[str, ...] = ()
+    # Optional ordered list of remote AI agents this target can delegate to,
+    # stored as ``(agent, model)`` pairs.  The list order is the priority
+    # order: the caller should try the entries in order and fall back to the
+    # first working one.  Empty means no remote agent is configured.  Unrelated
+    # to the SSH ``user = "agent"`` account name.  Exposed to agents via
+    # computeMCP_targets()/computeMCP_status().
+    agent: tuple[tuple[str, str], ...] = ()
     interactive_auth: bool = False
     # Optional trusted provisioning command (argv, no shell).  Run before the
     # tunnel is opened to discover a dynamic endpoint (e.g. a Slurm job's
@@ -161,6 +168,42 @@ class TargetConfig:
                 f"target {self.name!r} node_info must be a list of strings"
             )
         object.__setattr__(self, "node_info", tuple(self.node_info))
+        if not isinstance(self.agent, (tuple, list)):
+            raise ConfigError(
+                f"target {self.name!r} agent must be a list of tables"
+            )
+        normalized_agent: list[tuple[str, str]] = []
+        for entry in self.agent:
+            if isinstance(entry, dict):
+                if set(entry) != {"agent", "model"}:
+                    raise ConfigError(
+                        f"target {self.name!r} agent entries must have exactly "
+                        "the keys 'agent' and 'model'"
+                    )
+                agent_name = entry["agent"]
+                model = entry["model"]
+            elif isinstance(entry, tuple) and len(entry) == 2:
+                # An already-normalized ``(agent, model)`` pair, e.g. after a
+                # ``dataclasses.replace`` on a loaded target.  TOML arrays are
+                # lists, so a 2-element list is not a valid entry here.
+                agent_name, model = entry
+            else:
+                raise ConfigError(
+                    f"target {self.name!r} agent entries must be tables with "
+                    "'agent' and 'model'"
+                )
+            if not isinstance(agent_name, str) or not agent_name:
+                raise ConfigError(
+                    f"target {self.name!r} agent entry 'agent' must be a "
+                    "non-empty string"
+                )
+            if not isinstance(model, str) or not model:
+                raise ConfigError(
+                    f"target {self.name!r} agent entry 'model' must be a "
+                    "non-empty string"
+                )
+            normalized_agent.append((agent_name, model))
+        object.__setattr__(self, "agent", tuple(normalized_agent))
         if self.host_key_sha256 is not None:
             fp = self.host_key_sha256.strip()
             if not fp.startswith("SHA256:") or len(fp) < 12:
@@ -258,6 +301,9 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
     if "node_info" in value and not isinstance(value.get("node_info"), list):
         raise ConfigError(f"target {name!r} node_info must be a list of strings")
 
+    if "agent" in value and not isinstance(value.get("agent"), (list, tuple)):
+        raise ConfigError(f"target {name!r} agent must be a list of tables")
+
     user = value.get("user", "agent")
     has_ssh_targets = "ssh_targets" in value
     ssh_targets = tuple(value.get("ssh_targets", ()))
@@ -289,6 +335,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         connect_mode=value.get("connect_mode", "shared"),
         sharing=value.get("sharing", "unknown"),
         node_info=tuple(value.get("node_info", ())),
+        agent=value.get("agent", ()),
         interactive_auth=bool(value.get("interactive_auth", False)),
         provision_command=tuple(value.get("provision_command", ())),
         provision_timeout=_float(

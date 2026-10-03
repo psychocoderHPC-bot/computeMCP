@@ -122,6 +122,13 @@ sharing = "unknown"
 # or empty means no extra info: the agent discovers the system itself or the
 # user guides it.  Exposed to agents via computeMCP_targets()/computeMCP_status().
 # node_info = ["GPU nvidia", "x86 CPU", "AMD GPU"]
+# Optional ordered list of remote AI agents this target can delegate to.  Each
+# entry is an inline table with exactly `agent` and `model`, both non-empty
+# strings (spaces allowed).  The list order is the priority order; the caller
+# should try the entries in order and fall back to the first working one.
+# Empty = no remote agent.  Unrelated to the SSH `user = "agent"` account name.
+# Exposed to agents via computeMCP_targets()/computeMCP_status().
+# agent = [{ agent = "opencode", model = "GWen 3.5" }, { agent = "codex", model = "Sole" }]
 # Set true if the development container requires interactive authentication
 # (password / keyboard-interactive, e.g. a second factor). The gateway then
 # prompts on the operator console during `connect`/`refresh`/`exec`; when the
