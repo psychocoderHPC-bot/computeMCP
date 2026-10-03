@@ -868,6 +868,58 @@ Troubleshooting: run the script by hand first — the gateway logs its stdout an
 includes its stderr in the target's `last_error`, and the discovered address is
 shown as `provisioned_endpoint` in `status`/`GET /v1/targets/{name}`.
 
+### Recovering a stopped container (`connect_command`)
+
+The tunnel can be healthy while the development **container itself is stopped**.
+`provision_command` does not help there — it discovers an endpoint, it does not
+start the container. Use `connect_command` for that: a trusted argv that the
+gateway runs **on the remote host** (the machine hosting the container) through
+the target's SSH route when the container cannot be reached.
+
+```toml
+[targets.fwk388]
+ssh_targets = ["fwk388", "ex_fwk388"]
+user = "agent"
+client_key = "/home/USER/.ssh/computemcp_container"
+host_key_sha256 = "SHA256:..."
+connect_command = ["/home/USER/.config/computeMCP-gateway/ensure-container.sh"]
+connect_command_timeout = 120.0
+connect_command_mode = "on_failure"     # default; "always" runs pre-connect
+```
+
+Behaviour:
+
+- `connect_command_mode = "on_failure"` (default): run the command only after the
+  container connection fails, then retry the connection once. A healthy
+  container never pays for it.
+- `connect_command_mode = "always"`: run the command **before every** connection
+  attempt. This is simpler to reason about but the script **must be an
+  idempotent no-op when the container already runs**; otherwise every call pays
+  the command's cost.
+- Exit status is advisory: the gateway always re-probes/retries and only reports
+  success if the container is really reachable. stdout/stderr are logged.
+- The command is executed with `ssh -T <route> <argv...>` (plus `proxy_jump` if
+  set), so it runs on the remote host, not on the gateway.
+
+A reference script ships as
+[`scripts/ensure-container.sh`](scripts/ensure-container.sh). It inspects the
+`computeMCP-container` (override with `COMPUTEMCP_CONTAINER_NAME`), starts it if
+it is not running, waits for `running`, and is a **no-op when it already runs**
+(so it is safe with `connect_command_mode = "always"`). Docker and Podman are
+both supported. Copy it to the remote host and reference its absolute path:
+
+```bash
+scp scripts/ensure-container.sh <remote-host>:~/.config/computeMCP-gateway/
+ssh <remote-host> chmod +x ~/.config/computeMCP-gateway/ensure-container.sh
+```
+
+Run it by hand first to verify it detects and starts the container before wiring
+it into the gateway.
+
+Troubleshooting: run the script by hand first — the gateway logs its stdout and
+includes its stderr in the target's `last_error`, and the discovered address is
+shown as `provisioned_endpoint` in `status`/`GET /v1/targets/{name}`.
+
 - File transfer: small files use `computeMCP_file_read`/`computeMCP_file_write`
   (content in the response). For large or binary files use
   `computeMCP_file_upload`/`computeMCP_file_download`, which stream over SFTP and

@@ -154,6 +154,66 @@ class TunnelManager:
             )
         return tunnel
 
+    async def run_connect_command(self, target: TargetConfig, route: str) -> None:
+        """Run the target's trusted ``connect_command`` on the REMOTE host.
+
+        The command is executed on the remote side of the SSH connection that
+        owns the forward (the machine that hosts the development container), via
+        ``ssh -T <route> <argv...>`` so the gateway can forward stdout/stderr.
+        It is used to bring a stopped container back up.  Exit status and output
+        are logged but never fatal: the caller re-tries the connection to decide
+        whether recovery worked.
+        """
+        transport = target.transport
+        argv = ["ssh"]
+        if self.ssh.config:
+            argv += ["-F", self.ssh.config]
+        if transport.proxy_jump:
+            argv += ["-J", transport.proxy_jump]
+        argv += [
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={int(self.ssh.connect_timeout)}",
+            route,
+        ]
+        argv += list(target.connect_command)
+        log.info(
+            "target %s: running connect_command via %s: %s",
+            target.name, route, " ".join(target.connect_command),
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, ValueError) as exc:
+            log.warning("target %s: connect_command could not start: %s", target.name, exc)
+            return
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=target.connect_command_timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            log.warning(
+                "target %s: connect_command timed out after %.0fs",
+                target.name, target.connect_command_timeout,
+            )
+            return
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip() or "no stderr"
+            log.warning(
+                "target %s: connect_command exited %s: %s",
+                target.name, proc.returncode, detail,
+            )
+        else:
+            log.info("target %s: connect_command completed", target.name)
+
+
     async def connect(
         self,
         target: TargetConfig,

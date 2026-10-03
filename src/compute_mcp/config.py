@@ -105,6 +105,19 @@ class TargetConfig:
     # compute node + port).  The first ``host:port`` token on stdout wins.
     provision_command: tuple[str, ...] = ()
     provision_timeout: float = 900.0
+    # Optional trusted recovery command (argv, no shell) that runs ON THE REMOTE
+    # HOST (through the try-route ssh alias, plus proxy_jump) when the container
+    # cannot be reached over the tunnel -- i.e. when ``probe`` of the forwarded
+    # port fails.  Unlike provision_command it does not move the endpoint; it is
+    # meant to bring the container back up (e.g. start a stopped Docker
+    # container).  The gateway re-probes the tunnel after it exits.
+    connect_command: tuple[str, ...] = ()
+    connect_command_timeout: float = 120.0
+    # "on_failure" (default) run connect_command only when the initial probe
+    # fails (fast path: a healthy container never pays for it).  "always" run it
+    # before every connect attempt, which requires the script to be a no-op when
+    # the container already runs.
+    connect_command_mode: str = "on_failure"
     auto_connect: bool = False
     connect_backoff_initial: float = 1.0
     connect_backoff_max: float = 60.0
@@ -113,6 +126,15 @@ class TargetConfig:
         if self.provision_command and self.transport.kind != "tunnel":
             raise ConfigError(
                 f"target {self.name!r} provision_command requires tunnel transport"
+            )
+        if self.connect_command and self.transport.kind != "tunnel":
+            raise ConfigError(
+                f"target {self.name!r} connect_command requires tunnel transport"
+            )
+        if self.connect_command_mode not in ("on_failure", "always"):
+            raise ConfigError(
+                f"target {self.name!r} connect_command_mode must be "
+                "'on_failure' or 'always'"
             )
         validate_target_name(self.name)
         if not self.user:
@@ -254,6 +276,11 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         provision_timeout=_float(
             value.get("provision_timeout"), "provision_timeout", 900.0
         ),
+        connect_command=tuple(value.get("connect_command", ())),
+        connect_command_timeout=_float(
+            value.get("connect_command_timeout"), "connect_command_timeout", 120.0
+        ),
+        connect_command_mode=value.get("connect_command_mode", "on_failure"),
         auto_connect=bool(value.get("auto_connect", False)),
         connect_backoff_initial=_float(
             value.get("connect_backoff_initial"), "connect_backoff_initial", 1.0

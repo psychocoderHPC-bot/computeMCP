@@ -1284,3 +1284,122 @@ async def test_approve_rolls_back_token_when_config_append_fails(tmp_path, monke
     tokens = tmp_path / "tokens.toml"
     assert tokens.exists()
     assert "newci" not in load_tokens(tokens)
+
+
+# -- connect_command recovery ------------------------------------------------
+
+def _tunnel_target(name="hal", **overrides):
+    import dataclasses
+
+    base = TargetConfig(
+        name=name,
+        user="agent",
+        transport=TransportConfig(kind="tunnel", ssh_targets=("hal",)),
+        client_key="/tmp/key",
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    if overrides:
+        base = dataclasses.replace(base, **overrides)
+    return base
+
+
+async def test_connect_command_on_failure_runs_and_retries(monkeypatch):
+    from compute_mcp.ssh_backend import SSHError
+
+    gw = make_gateway()
+    import dataclasses
+
+    target = _tunnel_target(connect_command=("/bin/up.sh",))
+    gw.config = dataclasses.replace(gw.config, targets={**gw.config.targets, "hal": target})
+
+    calls = {"connect_cmd": 0, "attempt": 0}
+
+    async def fake_ensure(name):
+        return gw.runtimes[name]
+
+    def fake_endpoint(runtime):
+        return "127.0.0.1", 2222
+
+    async def fake_run_connect_command(t, route):
+        calls["connect_cmd"] += 1
+
+    async def fake_connection(t, host, port, prompter=None):
+        calls["attempt"] += 1
+        if calls["attempt"] == 1:
+            raise SSHError("container down")
+        return "CONN"
+
+    async def fake_disconnect(name):
+        return None
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", fake_endpoint)
+    monkeypatch.setattr(gw.tunnels, "run_connect_command", fake_run_connect_command)
+    monkeypatch.setattr(gw.backend, "connection", fake_connection)
+    monkeypatch.setattr(gw.backend, "disconnect", fake_disconnect)
+
+    t, conn = await gw._open_container_conn("hal")
+    assert conn == "CONN"
+    assert calls == {"connect_cmd": 1, "attempt": 2}
+
+
+async def test_connect_command_on_failure_not_run_on_success(monkeypatch):
+    gw = make_gateway()
+    import dataclasses
+
+    target = _tunnel_target(connect_command=("/bin/up.sh",))
+    gw.config = dataclasses.replace(gw.config, targets={**gw.config.targets, "hal": target})
+    calls = {"connect_cmd": 0}
+
+    async def fake_ensure(name):
+        return gw.runtimes[name]
+
+    def fake_endpoint(runtime):
+        return "127.0.0.1", 2222
+
+    async def fake_run_connect_command(t, route):
+        calls["connect_cmd"] += 1
+
+    async def fake_connection(t, host, port, prompter=None):
+        return "CONN"
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", fake_endpoint)
+    monkeypatch.setattr(gw.tunnels, "run_connect_command", fake_run_connect_command)
+    monkeypatch.setattr(gw.backend, "connection", fake_connection)
+
+    t, conn = await gw._open_container_conn("hal")
+    assert conn == "CONN"
+    assert calls["connect_cmd"] == 0
+
+
+async def test_connect_command_always_runs_before_open(monkeypatch):
+    gw = make_gateway()
+    import dataclasses
+
+    target = _tunnel_target(
+        connect_command=("/bin/up.sh",), connect_command_mode="always"
+    )
+    gw.config = dataclasses.replace(gw.config, targets={**gw.config.targets, "hal": target})
+    calls = {"connect_cmd": 0}
+
+    async def fake_ensure(name):
+        return gw.runtimes[name]
+
+    def fake_endpoint(runtime):
+        return "127.0.0.1", 2222
+
+    async def fake_run_connect_command(t, route):
+        calls["connect_cmd"] += 1
+
+    async def fake_connection(t, host, port, prompter=None):
+        return "CONN"
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", fake_endpoint)
+    monkeypatch.setattr(gw.tunnels, "run_connect_command", fake_run_connect_command)
+    monkeypatch.setattr(gw.backend, "connection", fake_connection)
+
+    t, conn = await gw._open_container_conn("hal")
+    assert conn == "CONN"
+    assert calls["connect_cmd"] == 1
