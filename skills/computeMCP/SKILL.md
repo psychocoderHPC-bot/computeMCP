@@ -132,6 +132,28 @@ computeMCP_exec(target="hal", command="make -j", cwd="/work/proj",
 computeMCP_exec(target="hal", command="wc -l", stdin="a\nb\nc\n")
 ```
 
+### Non-TTY stdin can block stdin-reading CLIs
+
+`opencode run ...` launched through `computeMCP_exec` can hang right after
+logging `init` and never create a session. The process parks in `ep_poll` with
+no network or DB activity, and only a hard kill ends it.
+
+`computeMCP_exec` runs the command over SSH with no input payload, so the
+remote command's stdin is an open pipe that never reaches EOF. Reading that
+pipe blocks until the tool timeout. Redirect stdin explicitly:
+
+```bash
+opencode run "..." </dev/null
+```
+
+Passing a finite `stdin` payload through `computeMCP_exec` writes the input and
+closes the channel, so a finite stdin payload closes the pipe after the input.
+An interactive terminal gives a TTY, which is why the same command does not
+block there.
+
+Other non-TTY CLIs that read stdin can block the same way. Redirect stdin with
+`</dev/null` unless the command consumes input.
+
 ## 3. Persistent and parallel sessions
 
 Long-running work belongs in a PTY session. Sessions are **independent**: you
