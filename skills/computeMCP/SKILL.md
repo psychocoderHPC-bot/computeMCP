@@ -51,7 +51,7 @@ computeMCP_targets()
 Then, optionally, inspect one:
 
 ```
-computeMCP_status(target)      # state, active route, clients, sharing, node_info, last_error
+computeMCP_status(target)      # state, active route, clients, sharing, node_info, agent, last_error
 ```
 
 Each target also carries a **`sharing`** field, which matters for benchmarks:
@@ -83,6 +83,41 @@ and must determine the system yourself (for example, inspect `/proc/cpuinfo`,
 Treat the hints as a starting hypothesis, understand them with your own
 reasoning, and verify them against the actual system. They are guidance, never a
 hard constraint.
+
+### Remote AI agents (`agent`)
+
+Each target may carry an **`agent`** field: an optional ordered list of remote
+AI agents that the operator configured for that system, such as a different
+model with different strengths. Each entry is a table with exactly two keys,
+`agent` and `model`, both non-empty strings; spaces are allowed in both. For
+example:
+
+```toml
+agent = [{ agent = "opencode", model = "GWen 3.5" }, { agent = "codex", model = "Sole" }]
+```
+
+`computeMCP_targets()` and `computeMCP_status(target)` return it as a list of
+objects:
+
+```
+[{"agent": "opencode", "model": "GWen 3.5"}, {"agent": "codex", "model": "Sole"}]
+```
+
+An empty list means the operator configured no remote agent for the target. The
+list order is the **priority order**: try the entries in order and fall back to
+the **first working one**. The field is unrelated to the SSH `user = "agent"`
+account name.
+
+**Delegation workflow.** You can delegate a bounded task — for example running a
+test matrix or drafting an implementation — to a remote agent on the target.
+Start probes with an agent you can invoke there (for example `opencode` or
+`codex` in a session), move to the next entry if it is unavailable, and keep the
+work scoped and reviewable.
+
+**Mandatory local review.** Remote agents do **not** have the Terok skills,
+rules, or context. Treat their output as an untrusted draft: bring every result
+back into this container and review it locally under the Terok rules before
+using or reporting it. Never let a remote agent's claims stand as evidence.
 
 If `computeMCP_targets` does not return a system you expect, or a target shows
 `state != "connected"` with an error, report the gateway status. If the MCP
@@ -236,8 +271,8 @@ with `skip_existing=True` to send only files still missing remotely, and use
 
 | Tool | Purpose |
 | --- | --- |
-| `computeMCP_targets()` | List available systems + `sharing`/`node_info` (do this first) |
-| `computeMCP_status(target)` | State/route/clients/`sharing`/`node_info`/errors for one system |
+| `computeMCP_targets()` | List available systems + `sharing`/`node_info`/`agent` (do this first) |
+| `computeMCP_status(target)` | State/route/clients/`sharing`/`node_info`/`agent`/errors for one system |
 | `computeMCP_exec(target, command, cwd?, timeout?, env?, stdin?)` | Short non-interactive command |
 | `computeMCP_session_create(target, cwd?, columns?, rows?)` | New PTY session |
 | `computeMCP_session_write(session_id, data)` | Send input to a session |
@@ -297,3 +332,6 @@ computeMCP_session_close(sid)
   give stable measurements.
 - Read `node_info` and treat it as a hypothesis, not ground truth; verify it
   against the actual system.
+- Try `agent` entries in list order and fall back to the first working one.
+  Remote agents lack the Terok skills: review every result locally before
+  trusting or reporting it.

@@ -881,6 +881,49 @@ async def test_node_info_exposed_in_target_status_and_discovery(monkeypatch):
         await client.close()
 
 
+def test_public_status_agent_empty_for_runtime_without_target():
+    gw = make_gateway()
+    gw.runtimes["orphan"] = TargetRuntime(name="orphan")
+    assert "orphan" not in gw.config.targets
+    assert gw.public_status("orphan")["agent"] == []
+
+
+async def test_agent_exposed_in_target_status_and_discovery(monkeypatch):
+    import dataclasses
+
+    gw = make_gateway()
+    hal = gw.config.targets["hal"]
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(
+                hal, agent=(("opencode", "GWen 3.5"), ("codex", "Sole"))
+            ),
+        },
+    )
+    client = await make_client(gw)
+    try:
+        resp = await client.get("/v1/targets/hal", headers=auth("alpaka-token"))
+        assert (await resp.json())["agent"] == [
+            {"agent": "opencode", "model": "GWen 3.5"},
+            {"agent": "codex", "model": "Sole"},
+        ]
+
+        resp = await client.get("/v1/targets", headers=auth("admin-token"))
+        body = await resp.json()
+        assert isinstance(body["targets"], list)
+        by_name = {t["name"]: t for t in body["targets"]}
+        assert by_name["hal"]["agent"] == [
+            {"agent": "opencode", "model": "GWen 3.5"},
+            {"agent": "codex", "model": "Sole"},
+        ]
+        assert by_name["gpu03"]["agent"] == []
+        assert "agent" in by_name["gpu03"]
+    finally:
+        await client.close()
+
+
 async def test_clients_endpoint_admin_only_and_lists_acl(monkeypatch):
     gw = make_gateway()
     client = await make_client(gw)
