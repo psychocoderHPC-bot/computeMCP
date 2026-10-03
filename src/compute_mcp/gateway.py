@@ -493,16 +493,46 @@ class Gateway:
         host, port = self._endpoint(self.runtimes[name])
         prompter = self._make_prompter(name) if target.interactive_auth else None
         dedicated = force_dedicated or target.connect_mode == "dedicated"
-        try:
+
+        async def attempt():
             if dedicated:
-                conn = await self.backend.open_connection(target, host, port, prompter)
-            else:
-                conn = await self.backend.connection(target, host, port, prompter)
+                return await self.backend.open_connection(target, host, port, prompter)
+            return await self.backend.connection(target, host, port, prompter)
+
+        # "always": run the trusted recovery command before every open.  It must
+        # be a no-op when the container already runs.
+        if target.connect_command and target.connect_command_mode == "always":
+            route = self.runtimes[name].active_route or (
+                target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
+            )
+            await self.tunnels.run_connect_command(target, route)
+
+        try:
+            conn = await attempt()
             return target, conn
-        except SSHError:
+        except SSHError as first:
+            # The tunnel is up but the container is unreachable (e.g. it is
+            # stopped).  In "on_failure" mode run the recovery command on the
+            # remote host and retry once.
+            if target.connect_command and target.connect_command_mode == "on_failure":
+                route = self.runtimes[name].active_route or (
+                    target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
+                )
+                log.info(
+                    "target %s unreachable (%s); running connect_command",
+                    name, first,
+                )
+                await self.tunnels.run_connect_command(target, route)
+                # Drop any cached (dead) connection before retrying.
+                await self.backend.disconnect(name)
+                try:
+                    conn = await attempt()
+                    return target, conn
+                except SSHError:
+                    pass
             if target.interactive_auth and not self._interactive:
                 raise InteractiveAuthRequired(name) from None
-            raise
+            raise first
 
     async def _connection_provider(self, name: str):
         return await self._open_container_conn(name)

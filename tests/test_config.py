@@ -112,6 +112,31 @@ def test_provision_command_rejected_for_direct():
         parse_config(raw)
 
 
+def test_connect_command_parsed():
+    cfg = parse_config(base_raw(connect_command=["/bin/up.sh"], connect_command_timeout=30))
+    t = cfg.targets["hal"]
+    assert t.connect_command == ("/bin/up.sh",)
+    assert t.connect_command_timeout == 30.0
+    assert t.connect_command_mode == "on_failure"
+
+
+def test_connect_command_mode_always():
+    cfg = parse_config(base_raw(connect_command=["/bin/up.sh"], connect_command_mode="always"))
+    assert cfg.targets["hal"].connect_command_mode == "always"
+
+
+def test_bad_connect_command_mode_rejected():
+    raw = base_raw(connect_command=["/bin/x"], connect_command_mode="sometimes")
+    with pytest.raises(ConfigError):
+        parse_config(raw)
+
+
+def test_connect_command_rejected_for_direct():
+    raw = base_raw(transport="direct", ssh_targets=[], connect_command=["/bin/x"])
+    with pytest.raises(ConfigError):
+        parse_config(raw)
+
+
 def test_invalid_target_name_rejected():
     raw = base_raw()
     raw["targets"]["bad name!"] = raw["targets"].pop("hal")

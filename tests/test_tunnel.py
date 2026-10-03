@@ -179,3 +179,21 @@ def test_probe_times_out_on_closed_port():
     port = sock.getsockname()[1]
     sock.close()
     assert asyncio.run(probe("127.0.0.1", port, timeout=1.0)) is False
+
+
+async def test_run_connect_command_invokes_remote_ssh(fake_ssh, tmp_path, monkeypatch):
+    # The fake ssh records argv; with no -L it exits 0 (the command form).
+    capture = tmp_path / "connect_argv.txt"
+    monkeypatch.setenv("FAKE_SSH_ARGV", str(capture))
+    mgr = TunnelManager(SSHConfig(internal_port_min=31500, internal_port_max=31510))
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(
+        target, connect_command=("/bin/up.sh", "--ensure")
+    )
+    await mgr.run_connect_command(target, "hal")
+    text = capture.read_text()
+    # Runs on the remote host through the route, in -T mode, passing the command.
+    assert "-T" in text
+    assert "hal /bin/up.sh --ensure" in text

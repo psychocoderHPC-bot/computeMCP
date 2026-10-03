@@ -164,6 +164,24 @@ user = "agent"
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 client_key = "/home/USER/.ssh/computemcp_container"
 
+# Optional recovery: run a trusted command ON THE REMOTE HOST when the container
+# cannot be reached (e.g. the Docker container is stopped). It does NOT change
+# the endpoint (that is provision_command's job); it is meant to bring the
+# container back up. The gateway re-probes after it exits.
+#
+#   connect_command_mode = "on_failure"  run only when the container is
+#                                        unreachable (default; a healthy
+#                                        container never pays for it)
+#   connect_command_mode = "always"      run before every connect; the script
+#                                        MUST be a no-op when already running
+#
+# The reference script scripts/ensure-container.sh starts the stopped container
+# and is a no-op when it already runs.
+#
+# connect_command = ["/home/USER/.config/computeMCP-gateway/ensure-container.sh"]
+# connect_command_timeout = 120.0
+# connect_command_mode = "on_failure"
+
 # A target with many simultaneous long-running sessions can opt out of the
 # remote sshd's per-connection MaxSessions limit.
 # [targets.gpu03]
