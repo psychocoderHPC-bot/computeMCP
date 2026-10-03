@@ -622,6 +622,10 @@ mkdir -p ~/.config/opencode/skills/computeMCP
 cp skills/computeMCP/SKILL.md ~/.config/opencode/skills/computeMCP/SKILL.md
 ```
 
+Running `opencode run` remotely through `computeMCP_exec` may need `</dev/null`:
+stdin is a non-TTY pipe there, and `opencode run` can wait on it until EOF. The
+skill covers the symptom and the workaround.
+
 ## Run the gateway
 
 ```bash
