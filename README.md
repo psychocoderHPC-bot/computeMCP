@@ -83,14 +83,14 @@ The `HOST_HOME` bind mount is what makes the toolchain persistent across
 container recreation; its `uid:gid` is reused for the `agent` user.
 
 ```bash
-mkdir -p ~/workspace/terok/terok-dev
+mkdir -p ~/workspace/computeMCP-container
 
 bash <<'BASH'
 set -euo pipefail
 
-CONTAINER_NAME="terok-dev"
-HOST_HOME="$HOME/workspace/terok/terok-dev"
-SSH_PUBLIC_KEY='REPLACE_WITH_TEROK_CONTAINER_PUBLIC_KEY'   # .pub half only
+CONTAINER_NAME="computeMCP-container"
+HOST_HOME="$HOME/workspace/computeMCP-container"
+SSH_PUBLIC_KEY='REPLACE_WITH_COMPUTEMCP_CONTAINER_PUBLIC_KEY'   # .pub half only
 
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
   echo "STOP: $CONTAINER_NAME already exists; it was not modified."
@@ -135,7 +135,7 @@ docker run -d \
     chown agent:agent /home/agent/.ssh/authorized_keys
     chmod 600 /home/agent/.ssh/authorized_keys
     printf "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nPubkeyAuthentication yes\n" \
-      > /etc/ssh/sshd_config.d/00-terok.conf
+      > /etc/ssh/sshd_config.d/00-computemcp.conf
     mkdir -p /run/sshd
     ssh-keygen -A
     /usr/sbin/sshd -t
@@ -157,11 +157,11 @@ Notes and invariants:
 - **GPU flags are creation-time only.** `--device`, `--gpus`, `--group-add`,
   `--security-opt` and `-p` are frozen in `HostConfig`; `stop`/`start` cannot add
   them. To change devices later, snapshot (`docker commit --change 'CMD
-  ["/usr/sbin/sshd","-D","-e"]' terok-dev terok-dev-snapshot`), rename the old
+  ["/usr/sbin/sshd","-D","-e"]' computeMCP-container computeMCP-container-snapshot`), rename the old
   container, and re-run under the same name — never delete it blindly. Keep the
   image tag free of an environment suffix.
 - **Driver policy:** the NVIDIA kernel driver lives on the host and MUST NOT be
-  installed inside the container. Verify with `docker exec terok-dev nvidia-smi`.
+  installed inside the container. Verify with `docker exec computeMCP-container nvidia-smi`.
 - The `agent` user, `sudo` without password, and key-only auth (no passwords, no
   root login) match the gateway's default target (`user = "agent"`).
 - For the next step, the sshd the gateway pins is this container's — read it from
@@ -201,7 +201,7 @@ docker run -d \
     chown agent:agent /home/agent/.ssh/authorized_keys
     chmod 600 /home/agent/.ssh/authorized_keys
     printf "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nPubkeyAuthentication yes\n" \
-      > /etc/ssh/sshd_config.d/00-terok.conf
+      > /etc/ssh/sshd_config.d/00-computemcp.conf
     mkdir -p /run/sshd
     ssh-keygen -A
     /usr/sbin/sshd -t
@@ -235,7 +235,7 @@ apply. Additional AMD-specific points:
   and MUST NOT be installed inside the container. The base `ubuntu:24.04` image
   ships **no ROCm user space** — the agent installs the matching ROCm userspace
   toolchain later, exactly as it installs CUDA toolkits for an NVIDIA target.
-  Once installed, verify with `docker exec terok-dev rocminfo` (and
+  Once installed, verify with `docker exec computeMCP-container rocminfo` (and
   `rocm-smi`), analogously to `nvidia-smi`.
 
 - **Creation-time only:** as with the NVIDIA flags, `--device`, `--group-add`
