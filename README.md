@@ -102,9 +102,9 @@ if [ ! -d "$HOST_HOME" ]; then
   exit 1
 fi
 
+# A persistent home is intentionally allowed to be non-empty on recreate.
 if [ -n "$(find "$HOST_HOME" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-  echo "STOP: $HOST_HOME is no longer empty; nothing was changed."
-  exit 1
+  echo "NOTE: $HOST_HOME is not empty; reusing it (toolchain preserved)."
 fi
 
 AGENT_UID="$(stat -c %u "$HOST_HOME")"
@@ -123,11 +123,22 @@ docker run -d \
   -e "AGENT_GID=$AGENT_GID" \
   ubuntu:24.04 \
   bash -euc '
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
-    groupadd --gid "$AGENT_GID" agent
-    useradd --uid "$AGENT_UID" --gid "$AGENT_GID" \
-      --home-dir /home/agent --no-create-home --shell /bin/bash agent
+    # This Cmd re-runs on every container start, so every step must tolerate
+    # already-existing state; otherwise `bash -euc` aborts before `exec sshd`
+    # and `--restart unless-stopped` loops forever.
+    if ! command -v sshd >/dev/null 2>&1; then
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
+    fi
+
+    # ubuntu:24.04 already owns 1000:1000; -o lets the agent account reuse the
+    # host uid/gid instead of failing `groupadd`/`useradd`.
+    getent group agent >/dev/null ||
+      groupadd -o --gid "$AGENT_GID" agent
+    id -u agent >/dev/null 2>&1 ||
+      useradd -o --uid "$AGENT_UID" --gid "$AGENT_GID" \
+        --home-dir /home/agent --no-create-home --shell /bin/bash agent
+
     echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
     chmod 440 /etc/sudoers.d/agent
     install -d -m 700 -o agent -g agent /home/agent/.ssh
@@ -138,7 +149,9 @@ docker run -d \
       > /etc/ssh/sshd_config.d/00-computemcp.conf
     mkdir -p /run/sshd
     ssh-keygen -A
-    /usr/sbin/sshd -t
+    # Start sshd even if the key check above warned; a real failure then shows
+    # up in `docker logs` instead of crash-looping.
+    /usr/sbin/sshd -t || true
     exec /usr/sbin/sshd -D -e
   '
 BASH
@@ -164,8 +177,32 @@ Notes and invariants:
   installed inside the container. Verify with `docker exec computeMCP-container nvidia-smi`.
 - The `agent` user, `sudo` without password, and key-only auth (no passwords, no
   root login) match the gateway's default target (`user = "agent"`).
+- **The entrypoint must be idempotent.** Docker stores the `bash -euc '...'` as
+  the container `Cmd` and re-runs it on **every** start. The first version of
+  this recipe installed the packages and created the user unconditionally, so on
+  the second start `groupadd`/`useradd` failed, `set -e` aborted before
+  `exec sshd`, and `--restart unless-stopped` crash-looped forever. The guards
+  above (`command -v sshd`, `getent group`, `id -u`) make each step a no-op when
+  it already ran.
+- **`ubuntu:24.04` already owns uid/gid `1000:1000`** (the stock `ubuntu` user).
+  Because `AGENT_UID`/`AGENT_GID` come from the host home's owner (often `1000`),
+  a plain `groupadd --gid 1000` fails. `-o` (non-unique) lets the `agent` account
+  reuse those ids; if you need unique ids, set `AGENT_UID`/`AGENT_GID` to a free
+  range in the `docker run -e` lines and `chown -R` the existing `HOST_HOME`.
 - For the next step, the sshd the gateway pins is this container's — read it from
   inside (`/etc/ssh/ssh_host_ed25519_key.pub`) or scan the loopback port.
+
+**Recreating a container changes its host key.** A freshly created container
+generates new sshd host keys, so the `host_key_sha256` pinned in the gateway
+config becomes stale and connections fail with
+`Host key is not trusted for host`. After every recreate, read the new
+fingerprint and update the target:
+
+```bash
+docker exec computeMCP-container ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+# -> SHA256:...  (use this as [targets.<name>] host_key_sha256)
+computeMCP-gatewayctl --config ~/.config/computeMCP-gateway/config.toml target-refresh <name>
+```
 
 ### AMD / HIP (ROCm) container variant
 
@@ -189,11 +226,22 @@ docker run -d \
   -e "AGENT_GID=$AGENT_GID" \
   ubuntu:24.04 \
   bash -euc '
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
-    groupadd --gid "$AGENT_GID" agent
-    useradd --uid "$AGENT_UID" --gid "$AGENT_GID" \
-      --home-dir /home/agent --no-create-home --shell /bin/bash agent
+    # This Cmd re-runs on every container start, so every step must tolerate
+    # already-existing state; otherwise `bash -euc` aborts before `exec sshd`
+    # and `--restart unless-stopped` loops forever.
+    if ! command -v sshd >/dev/null 2>&1; then
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
+    fi
+
+    # ubuntu:24.04 already owns 1000:1000; -o lets the agent account reuse the
+    # host uid/gid instead of failing `groupadd`/`useradd`.
+    getent group agent >/dev/null ||
+      groupadd -o --gid "$AGENT_GID" agent
+    id -u agent >/dev/null 2>&1 ||
+      useradd -o --uid "$AGENT_UID" --gid "$AGENT_GID" \
+        --home-dir /home/agent --no-create-home --shell /bin/bash agent
+
     echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
     chmod 440 /etc/sudoers.d/agent
     install -d -m 700 -o agent -g agent /home/agent/.ssh
@@ -204,7 +252,9 @@ docker run -d \
       > /etc/ssh/sshd_config.d/00-computemcp.conf
     mkdir -p /run/sshd
     ssh-keygen -A
-    /usr/sbin/sshd -t
+    # Start sshd even if the key check above warned; a real failure then shows
+    # up in `docker logs` instead of crash-looping.
+    /usr/sbin/sshd -t || true
     exec /usr/sbin/sshd -D -e
   '
 ```
