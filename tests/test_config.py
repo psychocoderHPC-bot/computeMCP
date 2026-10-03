@@ -133,6 +133,27 @@ def test_bad_host_key_fingerprint_rejected():
         parse_config(raw)
 
 
+def test_host_key_check_defaults_on():
+    cfg = parse_config(base_raw())
+    assert cfg.targets["hal"].host_key_check == "on"
+
+
+def test_host_key_check_off_without_pin_is_valid():
+    raw = base_raw()
+    target = raw["targets"]["hal"]
+    target.pop("host_key_sha256")
+    target["host_key_check"] = "off"
+    cfg = parse_config(raw)
+    assert cfg.targets["hal"].host_key_check == "off"
+    assert cfg.targets["hal"].host_key_sha256 is None
+
+
+def test_bad_host_key_check_rejected():
+    raw = base_raw(host_key_check="maybe")
+    with pytest.raises(ConfigError):
+        parse_config(raw)
+
+
 def test_client_requires_credentials():
     raw = base_raw()
     raw["clients"] = {"alpaka": {"targets": ["hal"]}}
