@@ -6,7 +6,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "terok-compute-gateway"
+name = "computeMCP-gateway"
 version = "0.1.0"
 description = "Secure gateway and MCP bridge giving Terok agents access to remote compute containers"
 requires-python = ">=3.11"
@@ -20,10 +20,10 @@ dependencies = [
 test = ["pytest>=8", "pytest-asyncio>=0.24"]
 
 [project.scripts]
-terok-compute-gateway = "terok_compute.gateway:main"
-terok-compute-mcp = "terok_compute.mcp_server:main"
-terok-compute-gatewayctl = "terok_compute.control:main"
-terok-handshake = "terok_compute.handshake:main"
+computeMCP-gateway = "compute_mcp.gateway:main"
+computeMCP-mcp = "compute_mcp.mcp_server:main"
+computeMCP-gatewayctl = "compute_mcp.control:main"
+computeMCP-handshake = "compute_mcp.handshake:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

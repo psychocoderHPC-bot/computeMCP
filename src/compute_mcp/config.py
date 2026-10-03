@@ -22,7 +22,7 @@ VALID_STATES = ("disconnected", "connecting", "connected", "failed")
 
 # Default location used when the operator does not point at a file explicitly.
 # ``$XDG_CONFIG_HOME`` is honored, falling back to ``~/.config``.
-DEFAULT_CONFIG_DIR = "terok-compute-gateway"
+DEFAULT_CONFIG_DIR = "computeMCP-gateway"
 DEFAULT_CONFIG_NAME = "config.toml"
 DEFAULT_TOKEN_NAME = "tokens.toml"
 

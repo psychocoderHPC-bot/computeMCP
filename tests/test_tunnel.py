@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from terok_compute.config import SSHConfig, TargetConfig, TransportConfig
-from terok_compute.tunnel import (
+from compute_mcp.config import SSHConfig, TargetConfig, TransportConfig
+from compute_mcp.tunnel import (
     TunnelError,
     TunnelManager,
     allocate_loopback_port,

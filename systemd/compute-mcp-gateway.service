@@ -2,16 +2,16 @@
 #
 # SPDX-License-Identifier: ISC
 [Unit]
-Description=Terok Compute Gateway
+Description=computeMCP gateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 # --config is omitted on purpose: the gateway defaults to
-# %h/.config/terok-compute-gateway/config.toml (and its sibling tokens.toml).
-ExecStart=%h/.local/bin/terok-compute-gateway --no-console
-# `systemctl --user reload terok-compute-gateway` re-reads the config and
+# %h/.config/computeMCP-gateway/config.toml (and its sibling tokens.toml).
+ExecStart=%h/.local/bin/computeMCP-gateway --no-console
+# `systemctl --user reload computeMCP-gateway` re-reads the config and
 # token file without dropping live tunnels.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

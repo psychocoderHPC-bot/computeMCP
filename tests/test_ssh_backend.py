@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from terok_compute.ssh_backend import InteractiveSSHClient
+from compute_mcp.ssh_backend import InteractiveSSHClient
 
 
 class FakeKey:
@@ -85,7 +85,7 @@ def test_no_pin_means_no_host_key_accepted():
 
 
 def test_sh_identifier_rejects_injection():
-    from terok_compute.ssh_backend import _sh_identifier, SSHError
+    from compute_mcp.ssh_backend import _sh_identifier, SSHError
 
     assert _sh_identifier("PATH") == "PATH"
     assert _sh_identifier("_X1") == "_X1"
@@ -98,7 +98,7 @@ def test_sh_identifier_rejects_injection():
 
 
 def test_shquote_escapes():
-    from terok_compute.ssh_backend import _shquote
+    from compute_mcp.ssh_backend import _shquote
 
     assert _shquote("abc") == "'abc'"
     assert _shquote("a'b") == "'a'\\''b'"

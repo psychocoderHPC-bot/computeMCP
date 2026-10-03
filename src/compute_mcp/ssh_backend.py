@@ -22,7 +22,7 @@ import asyncssh
 
 from .config import TargetConfig
 
-log = logging.getLogger("terok_compute.ssh")
+log = logging.getLogger("compute_mcp.ssh")
 
 
 class SSHError(RuntimeError):

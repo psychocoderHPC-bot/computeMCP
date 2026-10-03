@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from terok_compute.config import (
+from compute_mcp.config import (
     ConfigError,
     load_config,
     load_tokens,
@@ -178,7 +178,7 @@ def test_load_config_roundtrip(tmp_path: Path):
 
 
 def test_token_file_supplies_client_hashes(tmp_path):
-    from terok_compute.auth import hash_token
+    from compute_mcp.auth import hash_token
 
     tokens = tmp_path / "tokens.toml"
     tokens.write_text(f'[tokens]\nalpaka = "{hash_token("sekret")}"\n')
@@ -190,7 +190,7 @@ def test_token_file_supplies_client_hashes(tmp_path):
 
 
 def test_token_file_plaintext_is_hashed(tmp_path):
-    from terok_compute.auth import hash_token
+    from compute_mcp.auth import hash_token
 
     tokens = tmp_path / "tokens.toml"
     tokens.write_text('[tokens]\nalpaka = "plain-value"\n')
@@ -208,16 +208,16 @@ def test_missing_token_file_is_rejected(tmp_path):
 
 
 def test_default_paths_use_xdg_config_home(tmp_path, monkeypatch):
-    from terok_compute.config import default_config_path, default_token_path
+    from compute_mcp.config import default_config_path, default_token_path
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    assert default_config_path() == tmp_path / "terok-compute-gateway" / "config.toml"
-    assert default_token_path() == tmp_path / "terok-compute-gateway" / "tokens.toml"
+    assert default_config_path() == tmp_path / "computeMCP-gateway" / "config.toml"
+    assert default_token_path() == tmp_path / "computeMCP-gateway" / "tokens.toml"
 
 
 def test_load_config_defaults_to_xdg_config_home(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    cfgdir = tmp_path / "terok-compute-gateway"
+    cfgdir = tmp_path / "computeMCP-gateway"
     cfgdir.mkdir(parents=True)
     (cfgdir / "config.toml").write_text(
         textwrap.dedent(
@@ -239,10 +239,10 @@ def test_load_config_defaults_to_xdg_config_home(tmp_path, monkeypatch):
 
 
 def test_load_config_picks_up_sibling_default_token_file(tmp_path, monkeypatch):
-    from terok_compute.auth import hash_token
+    from compute_mcp.auth import hash_token
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    cfgdir = tmp_path / "terok-compute-gateway"
+    cfgdir = tmp_path / "computeMCP-gateway"
     cfgdir.mkdir(parents=True)
     (cfgdir / "config.toml").write_text(
         textwrap.dedent(
@@ -290,7 +290,7 @@ def _write_base_config(path: Path, extra: str = "") -> None:
 
 
 def test_append_client_preserves_existing_and_loads(tmp_path):
-    from terok_compute.config import append_client, append_token_hash
+    from compute_mcp.config import append_client, append_token_hash
 
     cfg = tmp_path / "config.toml"
     tok = tmp_path / "tokens.toml"
@@ -307,7 +307,7 @@ def test_append_client_preserves_existing_and_loads(tmp_path):
 
 
 def test_append_client_unknown_target_is_rejected(tmp_path):
-    from terok_compute.config import append_client, append_token_hash
+    from compute_mcp.config import append_client, append_token_hash
 
     cfg = tmp_path / "config.toml"
     tok = tmp_path / "tokens.toml"
@@ -320,7 +320,7 @@ def test_append_client_unknown_target_is_rejected(tmp_path):
 
 
 def test_append_client_duplicate_rejected(tmp_path):
-    from terok_compute.config import append_client
+    from compute_mcp.config import append_client
 
     cfg = tmp_path / "config.toml"
     _write_base_config(cfg)
@@ -329,7 +329,7 @@ def test_append_client_duplicate_rejected(tmp_path):
 
 
 def test_append_client_empty_acl(tmp_path):
-    from terok_compute.config import append_client, append_token_hash
+    from compute_mcp.config import append_client, append_token_hash
 
     cfg = tmp_path / "config.toml"
     tok = tmp_path / "tokens.toml"
@@ -342,8 +342,8 @@ def test_append_client_empty_acl(tmp_path):
 
 
 def test_append_token_hash_replaces_existing(tmp_path):
-    from terok_compute.auth import hash_token
-    from terok_compute.config import append_token_hash
+    from compute_mcp.auth import hash_token
+    from compute_mcp.config import append_token_hash
 
     tok = tmp_path / "tokens.toml"
     append_token_hash(tok, "ci", "first")

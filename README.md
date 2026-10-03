@@ -1,4 +1,4 @@
-is # Terok Compute Gateway
+# computeMCP gateway
 
 Secure host-side gateway and single MCP bridge that let AI agents running
 inside Terok containers use remote development/compute containers without ever
@@ -8,10 +8,10 @@ receiving the host's SSH credentials.
 OpenCode / agent
   |  MCP over stdio
   v
-terok-compute-mcp (inside Terok)
+computeMCP-mcp (inside Terok)
   |  authenticated HTTP over the one allowed host endpoint
   v
-terok-compute-gateway (on the Terok host)
+computeMCP-gateway (on the Terok host)
   |  ssh -N -L tunnels (owned by the gateway)
   +--> agent@hal development container
   +--> agent@fwk394 development container
@@ -23,7 +23,7 @@ name a configured target; an arbitrary SSH hostname is never accepted.
 ## Layout
 
 ```
-src/terok_compute/
+src/compute_mcp/
   config.py       TOML loading + validation, transport selection
   auth.py         constant-time bearer auth and per-client ACLs
   tunnel.py       asyncio SSH tunnel manager, route failover, recovery
@@ -32,32 +32,32 @@ src/terok_compute/
   files.py        SFTP file operations
   gateway.py      state machine, HTTP API, interactive console
   enrollment.py   unauthenticated request queue + operator approval
-  handshake.py    terok-handshake: request access from inside a container
-  mcp_server.py   MCP server (stdio) exposing compute_* tools
-  control.py      terok-compute-gatewayctl operator CLI
+  handshake.py    computeMCP-handshake: request access from inside a container
+  mcp_server.py   MCP server (stdio) exposing computeMCP_* tools
+  control.py      computeMCP-gatewayctl operator CLI
 tests/            unit tests (118)
 config.example.toml
-systemd/terok-compute-gateway.service
+systemd/computeMCP-gateway.service
 ```
 
 ## Install (gateway on the host, not as root)
 
 ```bash
-python3 -m venv ~/.local/share/terok-compute-gateway/venv
-~/.local/share/terok-compute-gateway/venv/bin/pip install -U pip
-~/.local/share/terok-compute-gateway/venv/bin/pip install .
-ln -s ~/.local/share/terok-compute-gateway/venv/bin/terok-compute-gateway ~/.local/bin/terok-compute-gateway
-mkdir -p ~/.config/terok-compute-gateway
-cp config.example.toml ~/.config/terok-compute-gateway/config.toml
+python3 -m venv ~/.local/share/computeMCP-gateway/venv
+~/.local/share/computeMCP-gateway/venv/bin/pip install -U pip
+~/.local/share/computeMCP-gateway/venv/bin/pip install .
+ln -s ~/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway ~/.local/bin/computeMCP-gateway
+mkdir -p ~/.config/computeMCP-gateway
+cp config.example.toml ~/.config/computeMCP-gateway/config.toml
 ```
 
 Create a dedicated gateway-to-container key (never the user's normal key):
 
 ```bash
-ssh-keygen -t ed25519 -f ~/.ssh/terok_compute_container -C terok-compute-gateway
+ssh-keygen -t ed25519 -f ~/.ssh/computemcp_container -C computeMCP-gateway
 # install only the .pub half in the remote development containers, as the
 # `authorized_keys` of the target `user` (default "agent"):
-ssh-copy-id -i ~/.ssh/terok_compute_container.pub agent@<container-host>
+ssh-copy-id -i ~/.ssh/computemcp_container.pub agent@<container-host>
 ```
 
 > **Replace every `/home/USER` placeholder.** `config.example.toml` uses
@@ -77,7 +77,7 @@ later — and **persistent** (no `--rm`).
 
 Recipe (adapted from the HAL remote-development handoff,
 `agent-config/terok/hal-remote-development-handoff.md`). Run this **on the
-remote host**, after generating `~/.ssh/terok_compute_container` on the gateway
+remote host**, after generating `~/.ssh/computemcp_container` on the gateway
 host (previous step). Paste only the **public** key; never copy the private key.
 The `HOST_HOME` bind mount is what makes the toolchain persistent across
 container recreation; its `uid:gid` is reused for the `agent` user.
@@ -278,7 +278,7 @@ every route reaches the same container sshd, so one fingerprint covers them all.
 ## Example configuration
 
 The full annotated file is [`config.example.toml`](config.example.toml); a
-minimal working `~/.config/terok-compute-gateway/config.toml` is:
+minimal working `~/.config/computeMCP-gateway/config.toml` is:
 
 ```toml
 [server]
@@ -298,7 +298,7 @@ max_per_client = 16
 
 [auth]
 # Filled in by `--generate-tokens` (hashes only; keep plaintext out of it).
-token_file = "/home/USER/.config/terok-compute-gateway/tokens.toml"
+token_file = "/home/USER/.config/computeMCP-gateway/tokens.toml"
 
 # Each Terok project gets its own token (the hash comes from the token file)
 # and an explicit list of the targets it may use. "*" means every target.
@@ -321,7 +321,7 @@ ssh_targets = ["hal", "ex_hal"]
 remote_host = "127.0.0.1"
 remote_port = 2222
 user = "agent"
-client_key = "/home/USER/.ssh/terok_compute_container"
+client_key = "/home/USER/.ssh/computemcp_container"
 # Mandatory: pin the container host key (see "Configuration notes").
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 host_key_algorithms = ["ssh-ed25519"]
@@ -334,7 +334,7 @@ transport = "direct"
 remote_host = "host.containers.internal"
 remote_port = 2222
 user = "agent"
-client_key = "/home/USER/.ssh/terok_compute_container"
+client_key = "/home/USER/.ssh/computemcp_container"
 known_hosts = "/home/USER/.ssh/known_hosts"
 
 # Another tunnelled target, used by the `alpaka` client above.
@@ -343,7 +343,7 @@ ssh_targets = ["fwk394", "ex_fwk394"]
 remote_host = "127.0.0.1"
 remote_port = 2222
 user = "agent"
-client_key = "/home/USER/.ssh/terok_compute_container"
+client_key = "/home/USER/.ssh/computemcp_container"
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 ```
 
@@ -352,18 +352,18 @@ live in the conventional location, `--config` and `--generate-tokens` can be
 omitted:
 
 ```bash
-terok-compute-gateway --generate-tokens   # -> ~/.config/terok-compute-gateway/tokens.toml
-terok-compute-gateway                     # -> ~/.config/terok-compute-gateway/config.toml
+computeMCP-gateway --generate-tokens   # -> ~/.config/computeMCP-gateway/tokens.toml
+computeMCP-gateway                     # -> ~/.config/computeMCP-gateway/config.toml
 ```
 
 **Path resolution.** `--config` defaults to
-`$XDG_CONFIG_HOME/terok-compute-gateway/config.toml` (or
-`~/.config/terok-compute-gateway/config.toml`); an explicit `--config` always
+`$XDG_CONFIG_HOME/computeMCP-gateway/config.toml` (or
+`~/.config/computeMCP-gateway/config.toml`); an explicit `--config` always
 wins. `--token-file` is resolved in this order: the flag, then
 `[auth] token_file`, then a `tokens.toml` sitting next to the config **if it
 exists**. A missing *explicit* token file is an error; a missing *conventional*
 one is not (inline client tokens may still be in use). Create the config
-directory once with `mkdir -p ~/.config/terok-compute-gateway`.
+directory once with `mkdir -p ~/.config/computeMCP-gateway`.
 
 ### Generate project tokens
 
@@ -373,10 +373,10 @@ printed once for you to inject into that project's Terok environment.
 
 ```bash
 # writes hashes to the default tokens.toml (chmod 600) and prints the tokens
-terok-compute-gateway --generate-tokens
+computeMCP-gateway --generate-tokens
 
 # or point somewhere else explicitly:
-terok-compute-gateway --config /path/config.toml --generate-tokens /path/tokens.toml
+computeMCP-gateway --config /path/config.toml --generate-tokens /path/tokens.toml
 ```
 
 Point the gateway at that file with `[auth] token_file = "..."` (or
@@ -384,22 +384,22 @@ Point the gateway at that file with `[auth] token_file = "..."` (or
 used automatically. Then, in each Terok container set the matching plaintext token:
 
 ```
-TEROK_COMPUTE_GATEWAY=http://host.containers.internal:2222
-TEROK_COMPUTE_TOKEN=<that project's generated token>
+COMPUTEMCP_GATEWAY=http://host.containers.internal:2222
+COMPUTEMCP_TOKEN=<that project's generated token>
 ```
 
 The token is the only credential the container holds; it is never the host SSH
 key and never committed to a repository.
 
-### Interactive enrollment with `terok-handshake`
+### Interactive enrollment with `computeMCP-handshake`
 
 Instead of pre-generating a token and copying it around, a container can ask for
-one. Run `terok-handshake` **inside the Terok container**; it queues a request,
+one. Run `computeMCP-handshake` **inside the Terok container**; it queues a request,
 waits while you approve it on the gateway console, receives the token, and wires
 it into the container:
 
 ```bash
-terok-handshake picongpu-bot-dev2 --port 2223 --system hal,fwk394
+computeMCP-handshake picongpu-bot-dev2 --port 2223 --system hal,fwk394
 # --system is a comma-separated allow-list; omit it for an empty ACL
 # (no targets) or pass --system '*' for all targets.
 ```
@@ -408,20 +408,20 @@ Flow:
 
 ```
 container                                     gateway (host)
-terok-handshake <client> --port 2223          console:
+computeMCP-handshake <client> --port 2223          console:
    │  POST /v1/enroll  {client_id,targets}       gateway> enrollments
    ├──────────────────────────────────────────►  REQUEST ... CLIENT ... TARGETS
    │  (request queued, pending operator)         gateway> approve <request-id>
    │  GET /v1/enroll/<id>  (poll)              → mint token, append
    │◄──────── {status: approved, token} ──────    [clients.<id>] + tokens.toml,
-   └ writes TEROK_COMPUTE_* to ~/.bashrc          reload
+   └ writes COMPUTEMCP_* to ~/.bashrc          reload
      and prints the MCP env snippet
 ```
 
 The `/v1/enroll` request is **unauthenticated but grants nothing** — it only
 places a bounded, expiring entry in a queue. Nothing is created until an
 operator approves it (console `approve <id>`, or
-`terok-compute-gatewayctl approve <id>` with an admin token). On approval the
+`computeMCP-gatewayctl approve <id>` with an admin token). On approval the
 gateway appends `[clients.<id>]` to `config.toml`, writes the token hash to
 `tokens.toml`, reloads, and hands the plaintext token to the requester exactly
 once; a poll secret proves ownership of the request.
@@ -430,7 +430,7 @@ Container-side writing:
 
 - Default: an idempotent, marker-delimited block in `~/.bashrc` (re-running
   replaces it).
-- `--env-file ~/.config/terok-compute/env`: write the token to that file (0600)
+- `--env-file ~/.config/computeMCP/env`: write the token to that file (0600)
   and only add a `source` line to `~/.bashrc`, keeping the secret out of the
   shell history file.
 - `--no-write`: don't touch any file; just print the MCP `environment` snippet.
@@ -472,16 +472,16 @@ shield:
 ## Install the MCP inside a Terok container
 
 ```bash
-python3 -m venv /home/dev/.local/share/terok-compute/venv
-/home/dev/.local/share/terok-compute/venv/bin/pip install <this-package>
-ln -s /home/dev/.local/share/terok-compute/venv/bin/terok-compute-mcp /home/dev/.local/bin/terok-compute-mcp
+python3 -m venv /home/dev/.local/share/computeMCP/venv
+/home/dev/.local/share/computeMCP/venv/bin/pip install <this-package>
+ln -s /home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp /home/dev/.local/bin/computeMCP-mcp
 ```
 
 Configure the task environment. The MCP process reads two variables at start:
 
 ```
-TEROK_COMPUTE_GATEWAY=http://host.containers.internal:2222
-TEROK_COMPUTE_TOKEN=<project-specific-token>
+COMPUTEMCP_GATEWAY=http://host.containers.internal:2222
+COMPUTEMCP_TOKEN=<project-specific-token>
 ```
 
 Pass them either through the environment or, more robustly, directly in the MCP
@@ -492,11 +492,11 @@ entry:
   "mcp": {
     "compute": {
       "type": "local",
-      "command": ["/home/dev/.local/bin/terok-compute-mcp"],
+      "command": ["/home/dev/.local/bin/computeMCP-mcp"],
       "enabled": true,
       "environment": {
-        "TEROK_COMPUTE_GATEWAY": "http://host.containers.internal:2222",
-        "TEROK_COMPUTE_TOKEN": "<project-specific-token>"
+        "COMPUTEMCP_GATEWAY": "http://host.containers.internal:2222",
+        "COMPUTEMCP_TOKEN": "<project-specific-token>"
       }
     }
   }
@@ -518,25 +518,25 @@ ProxyJump aliases or internal forward ports.
 
 A ready-to-use skill that teaches an AI agent how to drive the `compute` MCP
 (discover systems, run commands, parallel sessions, file transfer) ships in
-[`skills/terok-compute/SKILL.md`](skills/terok-compute/SKILL.md). Install it
+[`skills/computeMCP/SKILL.md`](skills/computeMCP/SKILL.md). Install it
 where the agent loads skills, for example:
 
 ```bash
-mkdir -p ~/.config/opencode/skills/terok-compute
-cp skills/terok-compute/SKILL.md ~/.config/opencode/skills/terok-compute/SKILL.md
+mkdir -p ~/.config/opencode/skills/computeMCP
+cp skills/computeMCP/SKILL.md ~/.config/opencode/skills/computeMCP/SKILL.md
 ```
 
 ## Run the gateway
 
 ```bash
 # interactive (operator console); uses the default config location
-terok-compute-gateway
+computeMCP-gateway
 
 # headless (systemd)
-terok-compute-gateway --no-console
+computeMCP-gateway --no-console
 
 # or point at an explicit file
-terok-compute-gateway --config /path/to/config.toml
+computeMCP-gateway --config /path/to/config.toml
 ```
 
 Console commands: `targets`, `status [target]`, `connect`, `refresh`,
@@ -553,18 +553,18 @@ adding or rotating a project token is a reload away.
 ## Operator terminal: refresh config and manage API keys
 
 Under systemd the gateway runs `--no-console`, so use the
-`terok-compute-gatewayctl` operator CLI. It talks to the running gateway's
+`computeMCP-gatewayctl` operator CLI. It talks to the running gateway's
 authenticated API (nothing needs to be stopped or restarted) and reads the
-plaintext token from `[auth] token_file` or `TEROK_COMPUTE_TOKEN`.
+plaintext token from `[auth] token_file` or `COMPUTEMCP_TOKEN`.
 
 ### Refresh the configuration
 
 ```bash
 # re-read config.toml + tokens.toml on the running gateway
-terok-compute-gatewayctl --config ~/.config/terok-compute-gateway/config.toml reload
+computeMCP-gatewayctl --config ~/.config/computeMCP-gateway/config.toml reload
 
 # under systemd, equivalent and cleaner:
-systemctl --user reload terok-compute-gateway     # sends SIGHUP
+systemctl --user reload computeMCP-gateway     # sends SIGHUP
 ```
 
 `systemctl --user reload` sends `SIGHUP`; the daemon re-parses the config and
@@ -574,13 +574,13 @@ previous configuration is kept.
 ### See each API key (Terok client), its systems and live sessions
 
 ```bash
-$ terok-compute-gatewayctl --config config.toml clients
+$ computeMCP-gatewayctl --config config.toml clients
 CLIENT            LABEL                 TARGETS                SESSIONS
 alpaka            alpaka CI             hal                    1
 picongpu          PIConGPU              hal-dedicated          0
 admin             operator              *                      0
 
-$ terok-compute-gatewayctl --config config.toml client alpaka
+$ computeMCP-gatewayctl --config config.toml client alpaka
 client:    alpaka
 label:     alpaka CI
 token fp:  sha256:dfa2d0e94f1f        # fingerprint only; the token is never shown
@@ -594,12 +594,12 @@ sessions:  1
 
 ```bash
 # activate every target this key may use
-terok-compute-gatewayctl --config config.toml client-connect alpaka
+computeMCP-gatewayctl --config config.toml client-connect alpaka
 # refresh (re-run route failover) only that key's targets
-terok-compute-gatewayctl --config config.toml client-refresh alpaka
+computeMCP-gatewayctl --config config.toml client-refresh alpaka
 # or a single target of that key
-terok-compute-gatewayctl --config config.toml client-refresh alpaka hal
-terok-compute-gatewayctl --config config.toml client-stop alpaka
+computeMCP-gatewayctl --config config.toml client-refresh alpaka hal
+computeMCP-gatewayctl --config config.toml client-stop alpaka
 ```
 
 Only targets inside the key's ACL are touched; anything else is refused.
@@ -607,14 +607,14 @@ Only targets inside the key's ACL are touched; anything else is refused.
 ### Other options
 
 ```bash
-terok-compute-gatewayctl --config config.toml status
-terok-compute-gatewayctl --config config.toml target-connect hal
-terok-compute-gatewayctl --config config.toml target-refresh hal
-terok-compute-gatewayctl --config config.toml target-stop hal
-terok-compute-gatewayctl --config config.toml sessions          # all clients (admin)
-terok-compute-gatewayctl --config config.toml client-kill alpaka # close its sessions
-terok-compute-gatewayctl --config config.toml --json clients
-terok-compute-gatewayctl --config config.toml --client alpaka clients  # ACL-checked
+computeMCP-gatewayctl --config config.toml status
+computeMCP-gatewayctl --config config.toml target-connect hal
+computeMCP-gatewayctl --config config.toml target-refresh hal
+computeMCP-gatewayctl --config config.toml target-stop hal
+computeMCP-gatewayctl --config config.toml sessions          # all clients (admin)
+computeMCP-gatewayctl --config config.toml client-kill alpaka # close its sessions
+computeMCP-gatewayctl --config config.toml --json clients
+computeMCP-gatewayctl --config config.toml --client alpaka clients  # ACL-checked
 ```
 
 `clients`, `client*` and the all-clients `sessions` view require an admin
@@ -680,7 +680,7 @@ targets = ["hal", "fwk394"]
   ```
 
 - `sharing` documents whether a system is dedicated or shared, so agents can
-  judge benchmark reliability. `compute_targets()`/`compute_status()` return it:
+  judge benchmark reliability. `computeMCP_targets()`/`computeMCP_status()` return it:
   - `"exclusive"` — dedicated to this task (e.g. a whole Slurm allocation);
     benchmarks are meaningful.
   - `"shared"` — other users/jobs may run concurrently; timings can be noisy.
@@ -724,10 +724,10 @@ Config:
 ```toml
 [targets.rosi5]
 user = "agent"
-client_key = "/home/USER/.ssh/terok_compute_container"
+client_key = "/home/USER/.ssh/computemcp_container"
 host_key_sha256 = "SHA256:..."     # pin of the container host key
 ssh_targets = ["rosi5"]            # SSH config alias of the login node
-provision_command = ["/home/USER/.config/terok-compute-gateway/rosi5-provision.sh"]
+provision_command = ["/home/USER/.config/computeMCP-gateway/rosi5-provision.sh"]
 provision_timeout = 900.0
 ```
 
@@ -803,13 +803,13 @@ Troubleshooting: run the script by hand first — the gateway logs its stdout an
 includes its stderr in the target's `last_error`, and the discovered address is
 shown as `provisioned_endpoint` in `status`/`GET /v1/targets/{name}`.
 
-- File transfer: small files use `compute_file_read`/`compute_file_write`
+- File transfer: small files use `computeMCP_file_read`/`computeMCP_file_write`
   (content in the response). For large or binary files use
-  `compute_file_upload`/`compute_file_download`, which stream over SFTP and
-  never place file bytes in the tool output. `compute_file_upload_tree` mirrors
+  `computeMCP_file_upload`/`computeMCP_file_download`, which stream over SFTP and
+  never place file bytes in the tool output. `computeMCP_file_upload_tree` mirrors
   a whole directory incrementally (`skip_existing`, `include`/`exclude` globs),
-  and `compute_file_download(..., recursive=True)` mirrors a remote tree.
-  Permissions can be set with `compute_file_chmod`.
+  and `computeMCP_file_download(..., recursive=True)` mirrors a remote tree.
+  Permissions can be set with `computeMCP_file_chmod`.
 - Command execution supports `env` (exported in the remote shell, so it works
   even when the container sshd does not accept env) and `stdin`. Persistent
   reads accept `wait=<seconds>` to block for new output instead of polling.
@@ -876,7 +876,7 @@ route failover (against a fake `ssh`), `connect_mode` validation, the HTTP API
 (auth, discovery, exec, dedicated-connection open/close, session isolation,
 streaming upload, reload, malformed-config safety), and the enrollment flow
 (unauthenticated request, admin approval, one-shot token delivery, `.bashrc`
-update, and end-to-end `terok-handshake` against a live gateway).
+update, and end-to-end `computeMCP-handshake` against a live gateway).
 
 End-to-end against the `dev-hal` development container used
 `transport = "direct"` for exec/PTY/SFTP/MCP plus a real `ssh -N -L` tunnel
