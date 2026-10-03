@@ -131,22 +131,32 @@ docker run -d \
       DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
     fi
 
-    # ubuntu:24.04 already owns 1000:1000; -o lets the agent account reuse the
-    # host uid/gid instead of failing `groupadd`/`useradd`.
-    getent group agent >/dev/null ||
-      groupadd -o --gid "$AGENT_GID" agent
-    id -u agent >/dev/null 2>&1 ||
-      useradd -o --uid "$AGENT_UID" --gid "$AGENT_GID" \
-        --home-dir /home/agent --no-create-home --shell /bin/bash agent
+    # Exactly one user named "agent" owns AGENT_UID. ubuntu:24.04 already ships
+    # a user at uid 1000 ("ubuntu"); AGENT_UID is the host-home owner (usually
+    # 1000), so that uid is normally already taken. Reuse (rename) the existing
+    # account instead of `useradd -o`, which would create a SECOND user sharing
+    # the uid and make the SSH login resolve to the wrong name. Renaming keeps
+    # the same uid/gid, so the bind-mounted home (owned by AGENT_UID) stays owned
+    # by the login user.
+    if ! id -u agent >/dev/null 2>&1; then
+      existing="$(getent passwd "$AGENT_UID" | cut -d: -f1 || true)"
+      if [ -n "$existing" ]; then
+        usermod -l agent "$existing"          # rename the existing account
+        grp="$(getent group "$AGENT_GID" | cut -d: -f1 || true)"
+        { [ -n "$grp" ] && [ "$grp" != "agent" ] && groupmod -n agent "$grp"; } || true
+      else
+        getent group agent >/dev/null || groupadd --gid "$AGENT_GID" agent
+        useradd --uid "$AGENT_UID" --gid "$AGENT_GID" \
+          --home-dir /home/agent --no-create-home --shell /bin/bash agent
+      fi
+      usermod -d /home/agent agent            # point home at the bind mount
+    fi
 
-    # Passwordless sudo.  ubuntu:24.04 already owns 1000:1000, so `useradd -o`
-    # can give `agent` the same uid; the SSH login then resolves to the existing
-    # `ubuntu` name and a rule keyed only on "agent" would be ignored.  Grant
-    # every name that maps to AGENT_UID (plus the numeric uid itself).
-    for u in agent "$(getent passwd "$AGENT_UID" | cut -d: -f1)" "#${AGENT_UID}"; do
-      [ -n "$u" ] || continue
-      printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" \
-        > "/etc/sudoers.d/computemcp-$(printf '%s' "$u" | tr -c 'A-Za-z0-9' '_')"
+    # Passwordless sudo for "agent" and the numeric uid, so it works whichever
+    # name AGENT_UID resolves to (defense in depth after the rename).
+    for u in agent "#${AGENT_UID}"; do
+      printf "%s ALL=(ALL) NOPASSWD:ALL\n" "$u" \
+        > "/etc/sudoers.d/computemcp-$(printf "%s" "$u" | tr -c "A-Za-z0-9" "_")"
     done
     chmod 440 /etc/sudoers.d/computemcp-*
     visudo -c
@@ -186,13 +196,12 @@ Notes and invariants:
   installed inside the container. Verify with `docker exec computeMCP-container nvidia-smi`.
 - The `agent` user, `sudo` without password, and key-only auth (no passwords, no
   root login) match the gateway's default target (`user = "agent"`).
-- **Passwordless sudo must cover the *name* the login resolves to.** Because
-  `useradd -o` reuses the base image's `1000:1000`, the SSH login typically
-  resolves to the pre-existing `ubuntu` account (same uid), not `agent`. A
-  sudoers rule keyed only on `agent` is then ignored and the agent has no sudo.
-  The recipe therefore grants `agent`, the passwd name that owns `AGENT_UID`
-  (`getent passwd "$AGENT_UID"`), and the numeric `#<uid>`, then checks the whole
-  config with `visudo -c`.
+- **Single `agent` user, no duplicate uid.** The entrypoint reuses (renames) the
+  base account that already owns `AGENT_UID` instead of `useradd -o`-ing a second
+  one, so the SSH login and `whoami` both resolve to `agent` rather than the stock
+  `ubuntu`. Passwordless sudo is granted to both `agent` and the numeric `#<uid>`
+  so it keeps working whichever name `AGENT_UID` resolves to, and the whole config
+  is checked with `visudo -c`.
 - **The entrypoint must be idempotent.** Docker stores the `bash -euc '...'` as
   the container `Cmd` and re-runs it on **every** start. The first version of
   this recipe installed the packages and created the user unconditionally, so on
@@ -201,10 +210,12 @@ Notes and invariants:
   above (`command -v sshd`, `getent group`, `id -u`) make each step a no-op when
   it already ran.
 - **`ubuntu:24.04` already owns uid/gid `1000:1000`** (the stock `ubuntu` user).
-  Because `AGENT_UID`/`AGENT_GID` come from the host home's owner (often `1000`),
-  a plain `groupadd --gid 1000` fails. `-o` (non-unique) lets the `agent` account
-  reuse those ids; if you need unique ids, set `AGENT_UID`/`AGENT_GID` to a free
-  range in the `docker run -e` lines and `chown -R` the existing `HOST_HOME`.
+  `AGENT_UID`/`AGENT_GID` come from the host home's owner (often `1000`), so that
+  uid/gid is usually already taken. The entrypoint therefore renames the existing
+  `AGENT_UID` account to `agent` (keeping the same uid/gid) instead of adding a
+  duplicate; if you want `agent` to have its own distinct uid, set
+  `AGENT_UID`/`AGENT_GID` to a free range in the `docker run -e` lines and
+  `chown -R` the existing `HOST_HOME` to match.
 - For the next step, the sshd the gateway pins is this container's — read it from
   inside (`/etc/ssh/ssh_host_ed25519_key.pub`) or scan the loopback port.
 
@@ -250,22 +261,32 @@ docker run -d \
       DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo
     fi
 
-    # ubuntu:24.04 already owns 1000:1000; -o lets the agent account reuse the
-    # host uid/gid instead of failing `groupadd`/`useradd`.
-    getent group agent >/dev/null ||
-      groupadd -o --gid "$AGENT_GID" agent
-    id -u agent >/dev/null 2>&1 ||
-      useradd -o --uid "$AGENT_UID" --gid "$AGENT_GID" \
-        --home-dir /home/agent --no-create-home --shell /bin/bash agent
+    # Exactly one user named "agent" owns AGENT_UID. ubuntu:24.04 already ships
+    # a user at uid 1000 ("ubuntu"); AGENT_UID is the host-home owner (usually
+    # 1000), so that uid is normally already taken. Reuse (rename) the existing
+    # account instead of `useradd -o`, which would create a SECOND user sharing
+    # the uid and make the SSH login resolve to the wrong name. Renaming keeps
+    # the same uid/gid, so the bind-mounted home (owned by AGENT_UID) stays owned
+    # by the login user.
+    if ! id -u agent >/dev/null 2>&1; then
+      existing="$(getent passwd "$AGENT_UID" | cut -d: -f1 || true)"
+      if [ -n "$existing" ]; then
+        usermod -l agent "$existing"          # rename the existing account
+        grp="$(getent group "$AGENT_GID" | cut -d: -f1 || true)"
+        { [ -n "$grp" ] && [ "$grp" != "agent" ] && groupmod -n agent "$grp"; } || true
+      else
+        getent group agent >/dev/null || groupadd --gid "$AGENT_GID" agent
+        useradd --uid "$AGENT_UID" --gid "$AGENT_GID" \
+          --home-dir /home/agent --no-create-home --shell /bin/bash agent
+      fi
+      usermod -d /home/agent agent            # point home at the bind mount
+    fi
 
-    # Passwordless sudo.  ubuntu:24.04 already owns 1000:1000, so `useradd -o`
-    # can give `agent` the same uid; the SSH login then resolves to the existing
-    # `ubuntu` name and a rule keyed only on "agent" would be ignored.  Grant
-    # every name that maps to AGENT_UID (plus the numeric uid itself).
-    for u in agent "$(getent passwd "$AGENT_UID" | cut -d: -f1)" "#${AGENT_UID}"; do
-      [ -n "$u" ] || continue
-      printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" \
-        > "/etc/sudoers.d/computemcp-$(printf '%s' "$u" | tr -c 'A-Za-z0-9' '_')"
+    # Passwordless sudo for "agent" and the numeric uid, so it works whichever
+    # name AGENT_UID resolves to (defense in depth after the rename).
+    for u in agent "#${AGENT_UID}"; do
+      printf "%s ALL=(ALL) NOPASSWD:ALL\n" "$u" \
+        > "/etc/sudoers.d/computemcp-$(printf "%s" "$u" | tr -c "A-Za-z0-9" "_")"
     done
     chmod 440 /etc/sudoers.d/computemcp-*
     visudo -c
