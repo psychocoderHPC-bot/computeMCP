@@ -139,8 +139,17 @@ docker run -d \
       useradd -o --uid "$AGENT_UID" --gid "$AGENT_GID" \
         --home-dir /home/agent --no-create-home --shell /bin/bash agent
 
-    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
-    chmod 440 /etc/sudoers.d/agent
+    # Passwordless sudo.  ubuntu:24.04 already owns 1000:1000, so `useradd -o`
+    # can give `agent` the same uid; the SSH login then resolves to the existing
+    # `ubuntu` name and a rule keyed only on "agent" would be ignored.  Grant
+    # every name that maps to AGENT_UID (plus the numeric uid itself).
+    for u in agent "$(getent passwd "$AGENT_UID" | cut -d: -f1)" "#${AGENT_UID}"; do
+      [ -n "$u" ] || continue
+      printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" \
+        > "/etc/sudoers.d/computemcp-$(printf '%s' "$u" | tr -c 'A-Za-z0-9' '_')"
+    done
+    chmod 440 /etc/sudoers.d/computemcp-*
+    visudo -c
     install -d -m 700 -o agent -g agent /home/agent/.ssh
     printf "%s\n" "$SSH_PUBLIC_KEY" > /home/agent/.ssh/authorized_keys
     chown agent:agent /home/agent/.ssh/authorized_keys
@@ -177,6 +186,13 @@ Notes and invariants:
   installed inside the container. Verify with `docker exec computeMCP-container nvidia-smi`.
 - The `agent` user, `sudo` without password, and key-only auth (no passwords, no
   root login) match the gateway's default target (`user = "agent"`).
+- **Passwordless sudo must cover the *name* the login resolves to.** Because
+  `useradd -o` reuses the base image's `1000:1000`, the SSH login typically
+  resolves to the pre-existing `ubuntu` account (same uid), not `agent`. A
+  sudoers rule keyed only on `agent` is then ignored and the agent has no sudo.
+  The recipe therefore grants `agent`, the passwd name that owns `AGENT_UID`
+  (`getent passwd "$AGENT_UID"`), and the numeric `#<uid>`, then checks the whole
+  config with `visudo -c`.
 - **The entrypoint must be idempotent.** Docker stores the `bash -euc '...'` as
   the container `Cmd` and re-runs it on **every** start. The first version of
   this recipe installed the packages and created the user unconditionally, so on
@@ -242,8 +258,17 @@ docker run -d \
       useradd -o --uid "$AGENT_UID" --gid "$AGENT_GID" \
         --home-dir /home/agent --no-create-home --shell /bin/bash agent
 
-    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
-    chmod 440 /etc/sudoers.d/agent
+    # Passwordless sudo.  ubuntu:24.04 already owns 1000:1000, so `useradd -o`
+    # can give `agent` the same uid; the SSH login then resolves to the existing
+    # `ubuntu` name and a rule keyed only on "agent" would be ignored.  Grant
+    # every name that maps to AGENT_UID (plus the numeric uid itself).
+    for u in agent "$(getent passwd "$AGENT_UID" | cut -d: -f1)" "#${AGENT_UID}"; do
+      [ -n "$u" ] || continue
+      printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$u" \
+        > "/etc/sudoers.d/computemcp-$(printf '%s' "$u" | tr -c 'A-Za-z0-9' '_')"
+    done
+    chmod 440 /etc/sudoers.d/computemcp-*
+    visudo -c
     install -d -m 700 -o agent -g agent /home/agent/.ssh
     printf "%s\n" "$SSH_PUBLIC_KEY" > /home/agent/.ssh/authorized_keys
     chown agent:agent /home/agent/.ssh/authorized_keys
