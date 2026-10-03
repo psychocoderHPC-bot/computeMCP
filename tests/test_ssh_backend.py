@@ -84,6 +84,16 @@ def test_no_pin_means_no_host_key_accepted():
     assert client.validate_host_public_key("h", "1.2.3.4", 22, FakeKey()) is False
 
 
+def test_accept_any_mode_accepts_any_host_key():
+    client = InteractiveSSHClient(pin=None, prompter=None, accept_any=True)
+    assert client.validate_host_public_key("h", "1.2.3.4", 22, FakeKey()) is True
+    # A pin that would not match is also accepted when verification is off.
+    client = InteractiveSSHClient(
+        pin="SHA256:does-not-match", prompter=None, accept_any=True
+    )
+    assert client.validate_host_public_key("h", "1.2.3.4", 22, FakeKey()) is True
+
+
 def test_sh_identifier_rejects_injection():
     from compute_mcp.ssh_backend import _sh_identifier, SSHError
 

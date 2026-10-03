@@ -3,10 +3,12 @@
 # SPDX-License-Identifier: ISC
 """AsyncSSH backend: container SSH connections, exec, PTY sessions and SFTP.
 
-Host-key verification is mandatory.  A target must configure either an explicit
-``host_key_sha256`` pin or a ``known_hosts`` file; connecting without one raises
-:class:`HostKeyError`.  This prevents silently trusting whatever key appears on
-a local forwarded port.
+Host-key verification is controlled per target by ``host_key_check``.  The
+default (``"on"``) requires an explicit ``host_key_sha256`` pin or a
+``known_hosts`` file and refuses to connect without one, which prevents
+silently trusting whatever key appears on a local forwarded port.  A target may
+opt out with ``host_key_check = "off"``; this accepts any host key and is only
+safe when the forwarded endpoint itself is trusted (e.g. a single-user dev box).
 """
 
 from __future__ import annotations
@@ -71,15 +73,23 @@ class InteractiveSSHClient(asyncssh.SSHClient):
         self,
         pin: str | None = None,
         prompter: _Prompter | None = None,
+        accept_any: bool = False,
     ) -> None:
         self._pin = (
             _b64_normalize(pin[len("SHA256:"):] if pin.startswith("SHA256:") else pin)
             if pin
             else None
         )
+        # accept_any disables identity checking entirely (host_key_check="off").
+        # It only has an effect when asyncssh actually consults this hook, which
+        # it does while a trusted-host-key set is present; _dial passes an empty
+        # set for that case.
+        self._accept_any = accept_any
         self._prompter = prompter
 
     def validate_host_public_key(self, host, addr, port, key) -> bool:
+        if self._accept_any:
+            return True
         if self._pin is None:
             return False
         actual = key.get_fingerprint("sha256")
@@ -196,16 +206,31 @@ class SSHBackend:
         # authentication stays key/agent-only and no secret can be injected.
         active_prompter = prompter if target.interactive_auth else None
         pin = target.host_key_sha256 if target.host_key_sha256 else None
-        if target.host_key_sha256:
+        accept_any = target.host_key_check == "off"
+        if pin:
             known_hosts = _empty_known_hosts
         elif target.known_hosts:
             known_hosts = target.known_hosts
+        elif accept_any:
+            # Verification intentionally disabled.  Pass an empty trusted-key
+            # set (not None) so asyncssh still consults the client hook, which
+            # accepts any key, and so host_key_algorithms can restrict
+            # negotiation if set.
+            known_hosts = _empty_known_hosts
+            log.warning(
+                "target %r has host_key_check='off': accepting any host key "
+                "(not recommended for shared hosts)",
+                target.name,
+            )
         else:
             raise HostKeyError(
                 f"target {target.name!r} has no host_key_sha256 or known_hosts; "
-                "refusing to connect without host-key verification"
+                "refusing to connect without host-key verification "
+                "(set host_key_check='off' to disable explicitly)"
             )
-        client_factory = lambda: InteractiveSSHClient(pin, active_prompter)
+        client_factory = lambda: InteractiveSSHClient(
+            pin, active_prompter, accept_any=accept_any
+        )
 
         client_keys = [target.client_key] if target.client_key else None
         server_host_key_algs = target.host_key_algorithms or ()

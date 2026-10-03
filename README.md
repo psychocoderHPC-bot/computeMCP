@@ -640,12 +640,27 @@ targets = ["hal", "fwk394"]
   gateway) and skips the SSH tunnel.
 - Internal forward ports always bind `127.0.0.1` and are allocated from
   `[ssh] internal_port_min..internal_port_max`.
-- Host-key verification is mandatory. A target must set either
+- Host-key verification is on by default. A target must set either
   `host_key_sha256` or `known_hosts`; otherwise the connection is refused.
   Because a tunnel maps an ephemeral port, fingerprint pinning via
   `host_key_sha256` is the recommended mode. Restrict `host_key_algorithms`
   (e.g. `["ssh-ed25519"]`) to the pinned key's algorithm when a server offers
   several.
+- `host_key_check = "off"` explicitly disables host-key verification and
+  accepts any host key; `host_key_algorithms` (if set) then only restricts
+  negotiation and no longer verifies the server's identity. It is only safe when
+  the forwarded endpoint itself is trusted (e.g. a single-user dev box); never
+  use it on a host where another user could hijack the forwarded port. A warning
+  is logged for every such target on connect. Both `host_key_check` and
+  `host_key_algorithms` are optional.
+
+  ```toml
+  [targets.fwk388]
+  ssh_targets = ["fwk388", "ex_fwk388"]
+  user = "agent"
+  client_key = "/home/USER/.ssh/computemcp_container"
+  host_key_check = "off"     # accept any host key (trusted dev box only)
+  ```
 - `connect_mode` controls concurrency per target:
   - `"shared"` (default): all exec/sessions multiplex over one cached SSH
     connection. Fast, but bounded by the remote sshd's `MaxSessions`

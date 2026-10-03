@@ -96,6 +96,14 @@ user = "agent"
 # the one you pinned so the fingerprint always matches.
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 host_key_algorithms = ["ssh-ed25519"]
+# Host-key verification policy:
+#   "on"  (default) require host_key_sha256 or known_hosts; refuse otherwise.
+#   "off" disable verification and accept any host key.  Only safe when the
+#         forwarded endpoint itself is trusted (single-user dev box); never on
+#         a host where another user could hijack the forwarded port.
+# With "off", host_key_algorithms (above) still restricts negotiated algorithms
+# if set, but it does NOT verify the server's identity.
+host_key_check = "on"
 client_key = "/home/USER/.ssh/computemcp_container"
 # "shared" (default) multiplexes all exec/sessions over one SSH connection.
 # "dedicated" opens a fresh connection per exec/session, bypassing the remote

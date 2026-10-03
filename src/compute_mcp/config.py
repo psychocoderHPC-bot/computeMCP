@@ -89,6 +89,11 @@ class TargetConfig:
     known_hosts: str | None = None
     host_key_sha256: str | None = None
     host_key_algorithms: tuple[str, ...] = ()
+    # Host-key verification policy.  "on" (default) requires host_key_sha256 or
+    # known_hosts and refuses to connect otherwise.  "off" explicitly disables
+    # verification for this target and is only safe when the forwarded endpoint
+    # itself is trusted (never on a host shared with others).
+    host_key_check: str = "on"
     connect_mode: str = "shared"
     # Whether the underlying system is dedicated to this job or shared with
     # other users/jobs.  Relevant for benchmark trust; "unknown" when the
@@ -127,6 +132,10 @@ class TargetConfig:
                     f"target {self.name!r} host_key_sha256 must look like 'SHA256:...'"
                 )
             object.__setattr__(self, "host_key_sha256", fp)
+        if self.host_key_check not in ("on", "off"):
+            raise ConfigError(
+                f"target {self.name!r} host_key_check must be 'on' or 'off'"
+            )
 
 
 @dataclass(frozen=True)
@@ -237,6 +246,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         known_hosts=value.get("known_hosts"),
         host_key_sha256=value.get("host_key_sha256"),
         host_key_algorithms=tuple(value.get("host_key_algorithms", ())),
+        host_key_check=value.get("host_key_check", "on"),
         connect_mode=value.get("connect_mode", "shared"),
         sharing=value.get("sharing", "unknown"),
         interactive_auth=bool(value.get("interactive_auth", False)),
