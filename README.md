@@ -751,8 +751,9 @@ targets = ["hal", "fwk394"]
   negotiation and no longer verifies the server's identity. It is only safe when
   the forwarded endpoint itself is trusted (e.g. a single-user dev box); never
   use it on a host where another user could hijack the forwarded port. A warning
-  is logged for every such target on connect. Both `host_key_check` and
-  `host_key_algorithms` are optional.
+  is logged for every such target on connect. `host_key_check` itself is
+  optional, but `host_key_algorithms` should still be set explicitly (see
+  below).
 
   ```toml
   [targets.fwk388]
@@ -760,7 +761,20 @@ targets = ["hal", "fwk394"]
   user = "agent"
   client_key = "/home/USER/.ssh/computemcp_container"
   host_key_check = "off"     # accept any host key (trusted dev box only)
+  host_key_algorithms = ["ssh-ed25519"]  # needed even with host_key_check = "off"
   ```
+- Set `host_key_algorithms = ["ssh-ed25519"]` whenever the container sshd
+  offers several host-key algorithms (for example dropbear, which offers
+  `ssh-ed25519`, `rsa-sha2-256` and `ssh-rsa`). This is required even when
+  `host_key_check = "off"`: `"off"` only disables verification of the server's
+  identity, it does not control which host-key algorithm is negotiated. Without
+  an explicit `host_key_algorithms`, asyncssh can pick an algorithm the server
+  cannot complete key exchange with and the connection aborts with
+  `Connection lost`. Restrict it to an algorithm the server supports, e.g.
+  `["ssh-ed25519"]`.
+- `host_key_algorithms` must be a TOML array of strings (`["ssh-ed25519"]`),
+  not a quoted string; a string is treated as a sequence of characters and the
+  gateway fails with `ValueError: s is not a valid host key algorithm`.
 - `connect_mode` controls concurrency per target:
   - `"shared"` (default): all exec/sessions multiplex over one cached SSH
     connection. Fast, but bounded by the remote sshd's `MaxSessions`
