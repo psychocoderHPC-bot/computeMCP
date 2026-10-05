@@ -66,7 +66,7 @@ class TransportConfig:
     remote_port: int = 2222
     ssh_targets: tuple[str, ...] = ()
     # Optional ProxyJump alias for the gateway -> login-node hop, e.g.
-    # ``proxy_jump = "rosi5"`` results in ``ssh -J rosi5 <ssh_target>``.
+    # ``proxy_jump = "rosi5"`` dials ``rosi5`` first, then the route alias.
     proxy_jump: str | None = None
 
     def __post_init__(self) -> None:
@@ -88,6 +88,10 @@ class TargetConfig:
     client_key: str | None = None
     known_hosts: str | None = None
     host_key_sha256: str | None = None
+    # Optional SHA256 pin for the LOGIN/ROUTE host key, distinct from
+    # ``host_key_sha256`` which pins the CONTAINER host.  Used by the route-first
+    # connection (gateway -> login node) before any container exists.
+    route_host_key_sha256: str | None = None
     host_key_algorithms: tuple[str, ...] = ()
     # Host-key verification policy.  "on" (default) requires host_key_sha256 or
     # known_hosts and refuses to connect otherwise.  "off" explicitly disables
@@ -211,6 +215,14 @@ class TargetConfig:
                     f"target {self.name!r} host_key_sha256 must look like 'SHA256:...'"
                 )
             object.__setattr__(self, "host_key_sha256", fp)
+        if self.route_host_key_sha256 is not None:
+            fp = self.route_host_key_sha256.strip()
+            if not fp.startswith("SHA256:") or len(fp) < 12:
+                raise ConfigError(
+                    f"target {self.name!r} route_host_key_sha256 must look like "
+                    "'SHA256:...'"
+                )
+            object.__setattr__(self, "route_host_key_sha256", fp)
         if self.host_key_check not in ("on", "off"):
             raise ConfigError(
                 f"target {self.name!r} host_key_check must be 'on' or 'off'"
@@ -330,6 +342,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         client_key=value.get("client_key"),
         known_hosts=value.get("known_hosts"),
         host_key_sha256=value.get("host_key_sha256"),
+        route_host_key_sha256=value.get("route_host_key_sha256"),
         host_key_algorithms=tuple(value.get("host_key_algorithms", ())),
         host_key_check=value.get("host_key_check", "on"),
         connect_mode=value.get("connect_mode", "shared"),

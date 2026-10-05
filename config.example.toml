@@ -73,9 +73,11 @@ targets = ["*"]
 
 # ---------------------------------------------------------------------------
 # Targets.  `ssh_targets` are aliases from the local user's SSH config, in
-# priority order.  The gateway starts `ssh -N -L` through the first alias that
-# works.  Transport defaults to "tunnel" when ssh_targets is present, and
-# "direct" otherwise.
+# priority order.  The gateway resolves each alias with `ssh -G` (host, user,
+# port, identityfile, ProxyJump) and keeps the first working route.  A
+# `proxycommand` (rather than a ProxyJump alias) is rejected with a clear error.
+# Transport defaults to "tunnel" when ssh_targets is present, and "direct"
+# otherwise.
 # ---------------------------------------------------------------------------
 [targets.hal]
 ssh_targets = ["hal", "ex_hal"]
@@ -96,6 +98,10 @@ user = "agent"
 # the one you pinned so the fingerprint always matches.
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 host_key_algorithms = ["ssh-ed25519"]
+# Optional: pin the LOGIN node host key (the route connection), not the
+# container key.  Unset falls back to the local ~/.ssh/known_hosts (previous
+# behavior).  Distinct from host_key_sha256 above, which pins the CONTAINER.
+# route_host_key_sha256 = "SHA256:REPLACE_WITH_LOGIN_NODE_HOST_KEY_FINGERPRINT"
 # Host-key verification policy:
 #   "on"  (default) require host_key_sha256 or known_hosts; refuse otherwise.
 #   "off" disable verification and accept any host key.  Only safe when the
@@ -129,11 +135,18 @@ sharing = "unknown"
 # Empty = no remote agent.  Unrelated to the SSH `user = "agent"` account name.
 # Exposed to agents via computeMCP_targets()/computeMCP_status().
 # agent = [{ agent = "opencode", model = "GWen 3.5" }, { agent = "codex", model = "Sole" }]
-# Set true if the development container requires interactive authentication
-# (password / keyboard-interactive, e.g. a second factor). The gateway then
-# prompts on the operator console during `connect`/`refresh`/`exec`; when the
-# gateway runs headless it fails those operations with a clear error.
+# Set true if the LOGIN/ROUTE connection requires a second factor instead of
+# accepting the key alone.  The factor can be a one-time password
+# (keyboard-interactive/OTP), a password, or the passphrase of the SSH client
+# key; it is supplied per request with `--2fa SECRET` on
+# `target-connect`/`target-refresh` (or the console `connect`/`refresh`) and is
+# never persisted or logged.  interactive_auth overrides and ignores
+# auto_connect: such a target does NOT connect at startup or on config reload.
+# A request without --2fa logs a warning and changes nothing.  The container hop
+# stays key-based.
 interactive_auth = false
+# Start this target automatically at gateway startup and on config reload.
+# Ignored when interactive_auth = true.
 auto_connect = true
 connect_backoff_initial = 1.0
 connect_backoff_max = 60.0
@@ -148,13 +161,17 @@ connect_backoff_max = 60.0
 # client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 # host_key_algorithms = ["ssh-ed25519"]
+# # Optional: pin the login node host key; unset uses ~/.ssh/known_hosts.
+# # route_host_key_sha256 = "SHA256:REPLACE_WITH_LOGIN_NODE_HOST_KEY_FINGERPRINT"
 # # Gateway reaches the login node via this SSH config alias.
 # ssh_targets = ["rosi5"]
-# # Optional: jump through another alias (results in `ssh -J <alias> ...`).
+# # Optional: jump through another alias (dialed first, then the route alias).
 # proxy_jump = "rosi5"
-# # Trusted argv (no shell). It starts/attaches the Slurm job, sets up a
-# # forward from the login node to the compute container, and prints
-# # `host:port` (optionally prefixed with ENDPOINT) on stdout.
+# # Trusted argv (no shell).  It runs ON the login node over the authenticated
+# # route connection (not as a local subprocess), starts/attaches the Slurm
+# # job, sets up a forward from the login node to the compute container, and
+# # prints `host:port` (optionally prefixed with ENDPOINT) on stdout.  The
+# # gateway forwards that endpoint over the same connection.
 # provision_command = ["/home/USER/.config/computeMCP-gateway/rosi5-provision.sh"]
 # provision_timeout = 900.0
 
@@ -179,7 +196,9 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # Optional recovery: run a trusted command ON THE REMOTE HOST when the container
 # cannot be reached (e.g. the Docker container is stopped). It does NOT change
 # the endpoint (that is provision_command's job); it is meant to bring the
-# container back up. The gateway re-probes after it exits.
+# container back up.  The command runs ON the remote machine over the
+# authenticated route connection (no separate ssh -T).  The gateway re-probes
+# after it exits.
 #
 #   connect_command_mode = "on_failure"  run only when the container is
 #                                        unreachable (default; a healthy

@@ -12,7 +12,7 @@ computeMCP-mcp (inside Terok)
   |  authenticated HTTP over the one allowed host endpoint
   v
 computeMCP-gateway (on the Terok host)
-  |  ssh -N -L tunnels (owned by the gateway)
+  |  authenticated SSH route connections (owned by the gateway)
   +--> agent@hal development container
   +--> agent@fwk394 development container
 ```
@@ -35,7 +35,7 @@ src/compute_mcp/
   handshake.py    computeMCP-handshake: request access from inside a container
   mcp_server.py   MCP server (stdio) exposing computeMCP_* tools
   control.py      computeMCP-gatewayctl operator CLI
-tests/            unit tests (118)
+tests/            unit tests (see `pytest -q`)
 config.example.toml
 systemd/computeMCP-gateway.service
 ```
@@ -179,8 +179,8 @@ BASH
 Notes and invariants:
 
 - **Bind the SSH port to loopback only** (`127.0.0.1:2222`), never `0.0.0.0`.
-  The gateway reaches it through its own `ssh -N -L` tunnel; the container port
-  must not be exposed publicly.
+  The gateway reaches it through its own authenticated route connection; the
+  container port must not be exposed publicly.
 - **Persistence:** `--restart unless-stopped` and the bind-mounted `HOST_HOME`
   keep the toolchain and `agent` home across container recreation. Never recreate
   the container merely to restart it.
@@ -643,6 +643,8 @@ Console commands: `targets`, `status [target]`, `connect`, `refresh`,
 `reconnect`, `stop`, `connect-all`, `stop-all`, `reload`, `clients`,
 `client <name>`, `client-refresh|connect|stop <name> [target]`,
 `client-kill <name>`, `sessions [target]`, `close-session <id>`, `quit`.
+`connect` and `refresh` accept `--2fa SECRET` for an interactive target, for
+example `connect --2fa SECRET hal`.
 
 `reload` fully parses and validates the TOML before replacing the active
 configuration; on failure the old configuration is retained. Unchanged
@@ -711,6 +713,9 @@ computeMCP-gatewayctl --config config.toml status
 computeMCP-gatewayctl --config config.toml target-connect hal
 computeMCP-gatewayctl --config config.toml target-refresh hal
 computeMCP-gatewayctl --config config.toml target-stop hal
+# interactive targets: pass the per-request second factor
+computeMCP-gatewayctl --config config.toml target-connect --2fa SECRET hal
+computeMCP-gatewayctl --config config.toml target-refresh --2fa SECRET hal
 computeMCP-gatewayctl --config config.toml sessions          # all clients (admin)
 computeMCP-gatewayctl --config config.toml client-kill alpaka # close its sessions
 computeMCP-gatewayctl --config config.toml --json clients
@@ -732,8 +737,10 @@ targets = ["hal", "fwk394"]
 ## Configuration notes
 
 - `ssh_targets` are SSH config aliases used **in priority order**. The gateway
-  runs `ssh -N -o ExitOnForwardFailure=yes ... -L 127.0.0.1:<port>:<remote>` and
-  keeps the first working route. Only TOML values are ever passed to `ssh`.
+  resolves each alias with `ssh -G` (host, user, port, identityfile, ProxyJump)
+  and keeps the first working route. A `proxycommand` (rather than a ProxyJump
+  alias) is rejected with a clear error. Only TOML values are ever passed to
+  `ssh`.
 - `transport = "tunnel"` (default when `ssh_targets` is present) forwards to
   `remote_host:remote_port` through the host. `transport = "direct"` connects
   straight to `remote_host:remote_port` (useful for tests or a co-located
@@ -783,14 +790,25 @@ targets = ["hal", "fwk394"]
     afterward, so the `MaxSessions` limit no longer bounds total parallel
     sessions. Costs one handshake per operation.
 - Interactive (second-factor) authentication: set `interactive_auth = true`
-  when the development container asks for a password or a keyboard-interactive
-  challenge (OTP/2FA) instead of accepting the key alone. The gateway prompts
-  on the operator console during `connect`, `refresh`, and the first `exec`/
-  session. Passwords are read without echo; up to 3 attempts are allowed. Run
-  the gateway in the foreground console for this to work. Headless (systemd)
-  operations on such a target fail with a clear `503` error rather than
-  hanging, because there is no one to prompt. Only the container hop is
-  prompted; the host `ssh -N -L` tunnel must stay key/agent-based.
+  when the LOGIN/ROUTE connection to the target requires a second factor
+  instead of accepting the key alone. The factor can be a one-time password
+  (keyboard-interactive/OTP), a password, or the passphrase of the SSH client
+  key. It is used once per request and is never persisted or logged.
+
+  When `interactive_auth = true` the gateway does not connect at startup or on
+  config reload: it overrides and ignores `auto_connect`. The operator supplies
+  the factor per request on the operator CLI or console. If a request omits it,
+  the gateway logs a warning and does not connect or refresh, so the target
+  state is unchanged, and the CLI/console print the warning. `exec`/session on
+  such a disconnected target returns a clear error pointing at
+  `target-connect --2fa`.
+
+  When `interactive_auth` is false or absent and a `--2fa` factor IS given, the
+  gateway warns, ignores the factor, and proceeds with the normal key-based
+  connect.
+
+  The container hop stays key-based; there is no separate container password
+  prompt. The old console `getpass` container prompt was removed.
 
   ```toml
   [targets.hal]
@@ -800,12 +818,36 @@ targets = ["hal", "fwk394"]
   host_key_sha256 = "SHA256:..."
   ```
 
+  Operator CLI:
+
+  ```bash
+  computeMCP-gatewayctl --config config.toml target-connect --2fa SECRET hal
+  computeMCP-gatewayctl --config config.toml target-refresh --2fa SECRET hal
+  ```
+
   Console transcript:
 
   ```
-  gateway> connect hal
-  [hal] Password:
+  gateway> connect --2fa SECRET hal
   {'name': 'hal', 'state': 'connected', ...}
+  ```
+
+- Route loss, and how targets recover:
+  - Non-interactive targets auto-reconnect with backoff. Reconnection re-runs
+    provisioning, so `provision_command` must stay idempotent.
+  - Interactive targets FAIL CLOSED: they do NOT auto-reconnect, because the
+    second factor may have rotated. The gateway leaves them disconnected and
+    sets an actionable `last_error` (pointing at `target-connect --2fa`).
+
+- `route_host_key_sha256` pins the LOGIN node host key. Unset uses the local
+  `~/.ssh/known_hosts`, the previous behavior. It is distinct from
+  `host_key_sha256`, which pins the CONTAINER key.
+
+  ```toml
+  [targets.rosi5]
+  ssh_targets = ["rosi5"]
+  # route_host_key_sha256 = "SHA256:..."   # login node; falls back to known_hosts
+  host_key_sha256 = "SHA256:..."           # container sshd
   ```
 
 - `sharing` documents whether a system is dedicated or shared, so agents can
@@ -871,10 +913,10 @@ How the pieces connect:
 
 ```
 compute-gateway (host)
-  |  ssh -N -L 127.0.0.1:<local>:127.0.0.1:2200 rosi5     (your local key)
+  |  authenticated SSH route connection to rosi5        (your local key)
   v
 rosi5 login node
-  |  ssh -N -L 127.0.0.1:2200:<compute-node>:2222 <compute-node>  (login node's key)
+  |  login-node forward 127.0.0.1:2200 -> <compute-node>:2222  (login node's key)
   v
 <compute-node>  ->  127.0.0.1:2222  (development container sshd)
 ```
@@ -891,9 +933,19 @@ user = "agent"
 client_key = "/home/USER/.ssh/computemcp_container"
 host_key_sha256 = "SHA256:..."     # pin of the container host key
 ssh_targets = ["rosi5"]            # SSH config alias of the login node
+# Optional: pin the LOGIN node host key. Unset falls back to the local
+# ~/.ssh/known_hosts. Distinct from host_key_sha256 (the container key).
+# route_host_key_sha256 = "SHA256:..."
 provision_command = ["/home/USER/.config/computeMCP-gateway/rosi5-provision.sh"]
 provision_timeout = 900.0
 ```
+
+`provision_command` now runs ON the remote machine over the authenticated route
+connection, not as a local subprocess and not via a separate `ssh -T`. Its
+contract is unchanged: it prints the first `host:port` (an optional `ENDPOINT `
+prefix is allowed) and always yields a free forward channel. The gateway
+forwards that endpoint over the same connection (`forward_local_port`), so the
+external `ssh -N -L` tunnel is gone.
 
 **The contract** (what the script must do):
 
@@ -918,7 +970,7 @@ gateway own `sbatch` by changing only this script):
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOGIN="${TEROK_LOGIN:-rosi5}"                    # ssh alias of the login node
+LOGIN="${TEROK_LOGIN:-rosi5}"                    # informational: this runs on the login node
 JOB_NAME="${TEROK_JOB_NAME:-terok-dev}"
 CONTAINER_PORT="${TEROK_CONTAINER_PORT:-2222}"   # container's sshd port on the node
 LOGIN_FORWARD_PORT="${TEROK_FORWARD_PORT:-2200}"
@@ -939,17 +991,14 @@ for _ in $(seq 1 120); do
 done
 [ -n "$node" ] || { echo "job $jobid never started" >&2; exit 1; }
 
-# 3. Create the login-node listener if it is not already up. The login -> compute
-#    hop uses the login node's own keys/ssh-agent.
-remote_cmd="$(cat <<EOF
-if ! ss -ltn 2>/dev/null | grep -q '127.0.0.1:${LOGIN_FORWARD_PORT}'; then
-  nohup ssh -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
-    -L 127.0.0.1:${LOGIN_FORWARD_PORT}:${node}:${CONTAINER_PORT} ${node} \
-    >/dev/null 2>&1 &
+# 3. Create the login-node listener if it is not already up. The script runs on
+#    the login node over the route connection, so the login -> compute hop uses
+#    the login node's own keys/ssh-agent with no extra ssh hop.
+if ! ss -ltn 2>/dev/null | grep -q "127.0.0.1:${LOGIN_FORWARD_PORT}"; then
+    nohup ssh -N -o ExitOnForwardFailure=yes -o BatchMode=yes \
+      -L 127.0.0.1:${LOGIN_FORWARD_PORT}:${node}:${CONTAINER_PORT} ${node} \
+      >/dev/null 2>&1 &
 fi
-EOF
-)"
-ssh "$LOGIN" "$remote_cmd"
 
 # 4. Print the endpoint; the gateway reaches it through ssh_targets=["rosi5"].
 printf 'ENDPOINT 127.0.0.1:%s\n' "$LOGIN_FORWARD_PORT"
@@ -961,7 +1010,8 @@ printed endpoint. `refresh rosi5` re-runs the script and follows the new node.
 Alternative: if your site lets the gateway reach the compute node directly
 (both hops accept the gateway's key), skip the login-node listener entirely —
 print `ENDPOINT <compute-node>:<port>` and add `proxy_jump = "rosi5"`, so the
-gateway runs `ssh -J rosi5 <ssh_target>` and forwards straight to the node.
+gateway dials `rosi5` first and forwards straight to the node over that
+connection.
 
 Troubleshooting: run the script by hand first — the gateway logs its stdout and
 includes its stderr in the target's `last_error`, and the discovered address is
@@ -997,8 +1047,9 @@ Behaviour:
   the command's cost.
 - Exit status is advisory: the gateway always re-probes/retries and only reports
   success if the container is really reachable. stdout/stderr are logged.
-- The command is executed with `ssh -T <route> <argv...>` (plus `proxy_jump` if
-  set), so it runs on the remote host, not on the gateway.
+- The command runs ON the remote machine over the authenticated route
+  connection, so it executes on the remote host, not on the gateway. There is
+  no separate `ssh -T` subprocess.
 
 A reference script ships as
 [`scripts/ensure-container.sh`](scripts/ensure-container.sh). It inspects the
@@ -1056,6 +1107,12 @@ POST   /v1/enroll-requests/{request}/deny    # admin
 `GET /v1/files/read?encoding=stream` streams raw bytes; `PUT /v1/files/upload`
 streams the request body into SFTP without buffering. Both support large files.
 
+`POST /v1/targets/{target}/connect` and `/refresh` accept an optional JSON body
+`{"factor": "..."}` carrying the per-request second factor for an
+`interactive_auth` target. The factor is used once, never persisted or logged.
+The MCP/agent tool surface is unchanged; agents do not call these endpoints
+directly.
+
 `GET /v1/targets` returns only targets allowed by the authenticated client's
 ACL. An unauthorized target produces `403` without revealing whether it exists.
 `GET /v1/sessions` lists only the caller's sessions; admins may add `?all=true`
@@ -1073,6 +1130,12 @@ short `sha256:` fingerprint.
 - Sessions are owned by the client that created them; another client gets
   `404`.
 - Tokens are compared in constant time and stored as `sha256:` hashes.
+- A second factor passed with `--2fa` (or the JSON `factor` field) is used once
+  per request and is never persisted or logged. An interactive target does not
+  auto-reconnect, so a rotated factor cannot be replayed by the gateway.
+- The gateway runs provisioning and recovery commands on the remote machine over
+  the authenticated route connection; they are trusted operator TOML and are
+  never taken from a client.
 - The service runs as a normal user, never root.
 - Enrollment grants nothing on its own: `/v1/enroll` is unauthenticated but
   only queues a bounded, expiring request; access exists only after an explicit
@@ -1095,7 +1158,7 @@ streaming upload, reload, malformed-config safety), and the enrollment flow
 update, and end-to-end `computeMCP-handshake` against a live gateway).
 
 End-to-end against the `dev-hal` development container used
-`transport = "direct"` for exec/PTY/SFTP/MCP plus a real `ssh -N -L` tunnel
-target with `ssh_targets = ["broken-alias", "hal-test"]`, verifying route
-failover, `refresh`, loopback binding, stop, and automatic recovery after the
-tunnel process was killed.
+`transport = "direct"` for exec/PTY/SFTP/MCP plus a route-connected target with
+`ssh_targets = ["broken-alias", "hal-test"]`, verifying route failover,
+`refresh`, loopback binding, stop, and automatic recovery after the route
+connection was killed.

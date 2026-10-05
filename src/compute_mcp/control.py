@@ -113,8 +113,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("target-connect", help="connect a target")
     p.add_argument("target")
+    p.add_argument("--2fa", dest="factor", metavar="SECRET",
+                   help="second factor (password/OTP) for interactive_auth targets")
     p = sub.add_parser("target-refresh", help="refresh a target")
     p.add_argument("target")
+    p.add_argument("--2fa", dest="factor", metavar="SECRET",
+                   help="second factor (password/OTP) for interactive_auth targets")
     p = sub.add_parser("target-stop", help="stop a target")
     p.add_argument("target")
 
@@ -148,10 +152,11 @@ class Control:
         if self._session:
             await self._session.close()
 
-    async def request(self, method: str, path: str) -> dict:
+    async def request(self, method: str, path: str, json_body: dict | None = None) -> dict:
         assert self._session is not None
         async with self._session.request(
             method, f"{self.base}{path}",
+            json=json_body,
             timeout=aiohttp.ClientTimeout(total=self.timeout),
         ) as response:
             text = await response.text()
@@ -203,11 +208,17 @@ async def _run(args: argparse.Namespace) -> int:
             )
             _emit(args, body, lambda b: f"denied {b['request_id']}")
         elif cmd == "target-connect":
-            body = await control.request("POST", f"/v1/targets/{args.target}/connect")
-            _emit(args, body, lambda b: f"{b['name']} -> {b['state']} ({b['active_route']})")
+            body = await control.request(
+                "POST", f"/v1/targets/{args.target}/connect",
+                json_body={"factor": args.factor} if args.factor is not None else None,
+            )
+            _emit_target(args, body)
         elif cmd == "target-refresh":
-            body = await control.request("POST", f"/v1/targets/{args.target}/refresh")
-            _emit(args, body, lambda b: f"{b['name']} -> {b['state']} ({b['active_route']})")
+            body = await control.request(
+                "POST", f"/v1/targets/{args.target}/refresh",
+                json_body={"factor": args.factor} if args.factor is not None else None,
+            )
+            _emit_target(args, body)
         elif cmd == "target-stop":
             body = await control.request("POST", f"/v1/targets/{args.target}/stop")
             _emit(args, body, lambda b: f"{b['name']} -> {b['state']}")
@@ -246,6 +257,17 @@ def _emit(args, body: dict, render) -> None:
         print(json.dumps(body, indent=2))
     else:
         print(render(body))
+
+
+def _emit_target(args, body: dict) -> None:
+    """Print a target state line plus any gateway warning (to stderr)."""
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return
+    print(f"{body['name']} -> {body['state']} ({body.get('active_route')})")
+    warning = body.get("warning")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
 
 
 def _emit_status(args, body: dict) -> None:

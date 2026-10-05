@@ -12,7 +12,6 @@ import dataclasses
 import getpass
 import logging
 import posixpath
-import re
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -60,26 +59,20 @@ from .sessions import (
     SessionNotFound,
 )
 from .ssh_backend import HostKeyError, SSHError, SSHBackend
-from .tunnel import Tunnel, TunnelError, TunnelManager, probe
+from .tunnel import Tunnel, TunnelError, TunnelManager
 
 log = logging.getLogger("compute_mcp.gateway")
 
 RECOVERY_POLL_SECONDS = 5.0
 
 
-class ProvisionError(RuntimeError):
-    """A target's provisioning command failed or printed no usable endpoint."""
-
-
 class InteractiveAuthRequired(RuntimeError):
-    """A target needs interactive authentication but no console is available."""
+    """A target needs a second factor and no factor was supplied for the request."""
 
     def __init__(self, target: str) -> None:
         super().__init__(
-            f"target {target!r} requires interactive authentication (e.g. 2FA), "
-            "but the gateway is not running an interactive console or is "
-            "answering a non-interactive request. Run the gateway in the "
-            "foreground console and retry."
+            f"target {target!r} requires interactive authentication (second "
+            f"factor); run target-connect --2fa <secret> {target}"
         )
         self.target = target
 
@@ -96,6 +89,10 @@ class TargetRuntime:
     needs_refresh: bool = False
     backoff: float = 0.0
     provisioned_endpoint: str | None = None
+    # True while an interactive (2FA) target still needs a factor before it can
+    # be used.  Never carries a secret; only tells operators why a connect was
+    # refused/failed so a real tunnel error is not masked as "needs 2FA".
+    awaiting_factor: bool = False
     recovery_task: asyncio.Task | None = field(default=None, repr=False)
 
     def public(self, clients: int = 0) -> dict:
@@ -111,6 +108,7 @@ class TargetRuntime:
             "clients": clients,
             "needs_refresh": self.needs_refresh,
             "provisioned_endpoint": self.provisioned_endpoint,
+            "awaiting_factor": self.awaiting_factor,
         }
 
 
@@ -178,8 +176,14 @@ class Gateway:
         self.sessions.start()
         self._watch_task = asyncio.create_task(self._watch_tunnels())
         for name, target in self.config.targets.items():
-            if target.auto_connect:
+            if target.auto_connect and not target.interactive_auth:
                 asyncio.create_task(self._safe_connect(name))
+            elif target.auto_connect:
+                log.info(
+                    "target %s: skipping auto-connect (interactive_auth requires "
+                    "a second factor)",
+                    name,
+                )
 
     async def stop(self) -> None:
         self._stopping = True
@@ -206,32 +210,21 @@ class Gateway:
             if runtime.state == "connected":
                 if target.transport.kind == "direct":
                     return runtime
-                if runtime.tunnel and runtime.tunnel.process and runtime.tunnel.process.returncode is None:
+                if runtime.tunnel and runtime.tunnel.is_alive():
                     return runtime
-                self._mark_lost(runtime, "tunnel process exited")
+                self._mark_lost(runtime, "tunnel connection closed")
             return await self._connect_locked(target, runtime)
 
-    async def _connect_locked(self, target: TargetConfig, runtime: TargetRuntime) -> TargetRuntime:
+    async def _connect_locked(
+        self, target: TargetConfig, runtime: TargetRuntime, factor: str | None = None
+    ) -> TargetRuntime:
         runtime.state = "connecting"
         runtime.last_error = None
-        transport = target.transport
-        if target.provision_command:
-            try:
-                transport = await self._provision(target)
-            except ProvisionError as exc:
-                runtime.state = "failed"
-                runtime.last_error = str(exc)
-                runtime.active_route = None
-                runtime.local_port = None
-                raise TunnelError(str(exc)) from exc
-            runtime.provisioned_endpoint = (
-                f"{transport.remote_host}:{transport.remote_port}"
-            )
         try:
             tunnel = await self.tunnels.connect(
                 target,
                 on_route=lambda route, exc: log.debug("route %s failed: %s", route, exc),
-                transport=transport,
+                factor=factor,
             )
         except TunnelError as exc:
             runtime.state = "failed"
@@ -242,10 +235,16 @@ class Gateway:
         runtime.tunnel = tunnel
         runtime.active_route = tunnel.route
         runtime.local_port = tunnel.local_port
+        if tunnel.provisioned_endpoint is not None:
+            host, port = tunnel.provisioned_endpoint
+            runtime.provisioned_endpoint = f"{host}:{port}"
+        else:
+            runtime.provisioned_endpoint = None
         runtime.connected_since = datetime.now(timezone.utc)
         runtime.needs_refresh = False
         runtime.backoff = 0.0
         runtime.state = "connected"
+        runtime.awaiting_factor = False
         return runtime
 
     def _mark_lost(self, runtime: TargetRuntime, reason: str) -> None:
@@ -258,49 +257,65 @@ class Gateway:
         runtime.last_error = reason
         runtime.connected_since = None
 
-    async def connect_target(self, name: str) -> dict:
+    async def connect_target(self, name: str, factor: str | None = None) -> dict:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
             if runtime.state == "connected":
                 return runtime.public(self.sessions.count_for_target(name))
-            await self._connect_locked(target, runtime)
-        await self._preauth_if_interactive(name)
-        return self.runtimes[name].public(self.sessions.count_for_target(name))
+            warning = self._factor_warning(target, factor)
+            if target.interactive_auth and factor is None:
+                return self._interactive_skip(runtime)
+            if warning is not None:
+                factor = None  # key-only downstream
+            await self._connect_locked(target, runtime, factor=factor)
+            result = runtime.public(self.sessions.count_for_target(name))
+        if warning:
+            result["warning"] = warning
+        return result
 
-    async def _preauth_if_interactive(self, name: str) -> None:
-        """Force the container handshake now so the console can prompt for 2FA.
-
-        Establishing the tunnel does not authenticate to the container; doing it
-        here makes ``connect``/``refresh`` an accurate "is this target usable"
-        check and collects any second factor while the operator is present.
-        """
-        target = self.config.targets[name]
-        if not target.interactive_auth:
-            return
-        host, port = self._endpoint(self.runtimes[name])
-        prompter = self._make_prompter(name)
-        try:
-            if target.connect_mode == "dedicated":
-                conn = await self.backend.open_connection(target, host, port, prompter)
-                await self.backend.close_connection(conn)
-            else:
-                await self.backend.connection(target, host, port, prompter)
-        except SSHError:
-            if not self._interactive:
-                raise InteractiveAuthRequired(name) from None
-            raise
-
-    async def refresh_target(self, name: str) -> dict:
+    async def refresh_target(self, name: str, factor: str | None = None) -> dict:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
+            # Fail closed before any teardown when a second factor is needed
+            # but not supplied for this request.
+            if target.interactive_auth and factor is None:
+                return self._interactive_skip(runtime)
+            warning = self._factor_warning(target, factor)
+            if warning is not None:
+                factor = None  # key-only downstream
             await self._stop_locked(name)
             await self.backend.disconnect(name)
             await self.sessions.close_for_target(name, reason="refresh")
-            await self._connect_locked(target, runtime)
-        await self._preauth_if_interactive(name)
-        return self.runtimes[name].public(self.sessions.count_for_target(name))
+            await self._connect_locked(target, runtime, factor=factor)
+            result = runtime.public(self.sessions.count_for_target(name))
+        if warning:
+            result["warning"] = warning
+        return result
+
+    def _factor_warning(self, target: TargetConfig, factor: str | None) -> str | None:
+        """Return a user-facing warning for a mismatched factor, never the secret."""
+        if not target.interactive_auth and factor is not None:
+            message = (
+                "second factor provided but target does not use "
+                "interactive_auth; ignoring"
+            )
+            log.warning("target %s: %s", target.name, message)
+            return message
+        return None
+
+    def _interactive_skip(self, runtime: TargetRuntime) -> dict:
+        """Refuse a connect/refresh needing a factor without tearing anything down."""
+        message = (
+            "target requires interactive authentication; run "
+            f"target-connect --2fa <secret> {runtime.name}"
+        )
+        log.warning("target %s: %s", runtime.name, message)
+        runtime.awaiting_factor = True
+        result = runtime.public(self.sessions.count_for_target(runtime.name))
+        result["warning"] = message
+        return result
 
     async def stop_target(self, name: str) -> dict:
         self._target(name)
@@ -325,8 +340,24 @@ class Gateway:
         runtime.active_route = None
         runtime.local_port = None
         runtime.connected_since = None
+        runtime.awaiting_factor = False
 
     # -- recovery ----------------------------------------------------------
+    def _schedule_recovery(self, name: str, runtime: TargetRuntime) -> None:
+        """Start the reconnect loop once, storing the handle for cancellation."""
+        existing = runtime.recovery_task
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._reconnect_with_backoff(name))
+        runtime.recovery_task = task
+
+        def _clear(_task: asyncio.Task, rt: TargetRuntime = runtime) -> None:
+            # Only clear our own handle; a newer loop may have replaced it.
+            if rt.recovery_task is _task:
+                rt.recovery_task = None
+
+        task.add_done_callback(_clear)
+
     async def _watch_tunnels(self) -> None:
         try:
             while not self._stopping:
@@ -336,11 +367,14 @@ class Gateway:
                     if target is None or target.transport.kind == "direct":
                         continue
                     if runtime.state == "connected" and runtime.tunnel is not None:
-                        proc = runtime.tunnel.process
-                        if proc is not None and proc.returncode is not None:
-                            await self._handle_loss(name, f"tunnel exited rc={proc.returncode}")
-                    elif runtime.state in ("disconnected", "failed") and runtime.needs_refresh:
-                        asyncio.create_task(self._reconnect_with_backoff(name))
+                        if not runtime.tunnel.is_alive():
+                            await self._handle_loss(name, "tunnel connection closed")
+                    elif (
+                        runtime.state in ("disconnected", "failed")
+                        and runtime.needs_refresh
+                        and not target.interactive_auth
+                    ):
+                        self._schedule_recovery(name, runtime)
         except asyncio.CancelledError:
             raise
 
@@ -349,23 +383,44 @@ class Gateway:
             runtime = self.runtimes[name]
             if runtime.state != "connected":
                 return
+            target = self.config.targets.get(name)
             log.warning("target %s lost: %s", name, reason)
             self._mark_lost(runtime, reason)
-            runtime.needs_refresh = True
+            if target is not None and target.interactive_auth:
+                # Fail closed: reconnecting needs a second factor that only a
+                # new target-connect request can supply.  Do not auto-reconnect.
+                runtime.awaiting_factor = True
+                runtime.last_error = (
+                    "connection lost; reconnect requires a second factor, run "
+                    "target-connect --2fa"
+                )
+                runtime.needs_refresh = False
+                reconnect = False
+            else:
+                runtime.needs_refresh = True
+                reconnect = True
         await self.backend.disconnect(name)
         await self.sessions.close_for_target(name, reason="tunnel lost")
-        asyncio.create_task(self._reconnect_with_backoff(name))
+        if reconnect:
+            self._schedule_recovery(name, runtime)
 
     async def _reconnect_with_backoff(self, name: str) -> None:
         target = self.config.targets.get(name)
-        if target is None:
+        runtime = self.runtimes.get(name)
+        if target is None or runtime is None:
             return
-        runtime = self.runtimes[name]
         runtime.backoff = max(runtime.backoff, target.connect_backoff_initial)
         try:
             while not self._stopping:
                 await asyncio.sleep(runtime.backoff)
-                if self.runtimes[name].state == "connected":
+                # The target may have been stopped/removed or replaced while we
+                # slept; never dial for an obsolete runtime or a stopping gateway.
+                if self._stopping or self.runtimes.get(name) is not runtime:
+                    return
+                target = self.config.targets.get(name)
+                if target is None:
+                    return
+                if runtime.state == "connected":
                     return
                 try:
                     await self.ensure_connected(name)
@@ -376,56 +431,7 @@ class Gateway:
         except asyncio.CancelledError:
             raise
 
-    # -- dynamic provisioning (Slurm and similar) ------------------------
-    async def _provision(self, target: TargetConfig) -> "TransportConfig":
-        """Run the target's trusted provisioning command and parse an endpoint.
-
-        The command must be from the trusted TOML (never client input).  It is
-        executed without a shell.  It should start/attach a job (e.g. a Slurm
-        allocation) and arrange a forward to the container's SSH port, then
-        print ``host:port`` (or ``ENDPOINT host:port``) on stdout.  The gateway
-        tunnels through an ssh alias to that discovered endpoint.
-        """
-        argv = list(target.provision_command)
-        log.info("provisioning target %s: %s", target.name, " ".join(argv))
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except (OSError, ValueError) as exc:
-            raise ProvisionError(
-                f"target {target.name!r} provisioning command could not start: {exc}"
-            ) from exc
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=target.provision_timeout
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
-            raise ProvisionError(
-                f"target {target.name!r} provisioning timed out after "
-                f"{target.provision_timeout:.0f}s"
-            ) from None
-        if proc.returncode != 0:
-            detail = stderr.decode(errors="replace").strip() or "no stderr"
-            raise ProvisionError(
-                f"target {target.name!r} provisioning exited {proc.returncode}: {detail}"
-            )
-        endpoint = _parse_provision_endpoint(stdout.decode(errors="replace"))
-        if endpoint is None:
-            raise ProvisionError(
-                f"target {target.name!r} provisioning printed no host:port endpoint"
-            )
-        host, port = endpoint
-        log.info("target %s provisioned endpoint %s:%d", target.name, host, port)
-        return dataclasses.replace(
-            target.transport, remote_host=host, remote_port=port
-        )
-
+    # -- dynamic provisioning moved into tunnel.connect -------------------
     # -- interactive authentication --------------------------------------
     async def _prompt_line(self, prompt: str, echo: bool) -> str | None:
         """Read a line from the console, off the event loop.
@@ -485,27 +491,43 @@ class Gateway:
     async def _open_container_conn(self, name: str, force_dedicated: bool = False):
         """Open the container SSH connection for a target.
 
-        Raises :class:`InteractiveAuthRequired` when the target needs 2FA but
-        the gateway is not interactive, instead of a generic SSH error.
+        The container hop is key-only: an interactive (2FA) target must already
+        have been connected by an explicit ``--2fa`` request.  Otherwise this
+        raises :class:`InteractiveAuthRequired` with the actionable command.
         """
         target = self._target(name)
-        await self.ensure_connected(name)
-        host, port = self._endpoint(self.runtimes[name])
-        prompter = self._make_prompter(name) if target.interactive_auth else None
+        try:
+            await self.ensure_connected(name)
+        except (TunnelError, SSHError, HostKeyError):
+            # A real tunnel/host-key/dial failure on an interactive target must
+            # surface as-is (502).  Map to 503 only when this target is known to
+            # still be awaiting a factor.
+            if target.interactive_auth and self.runtimes[name].awaiting_factor:
+                raise InteractiveAuthRequired(name) from None
+            raise
+        runtime = self.runtimes[name]
+        if (
+            target.interactive_auth
+            and runtime.awaiting_factor
+            and runtime.state != "connected"
+        ):
+            raise InteractiveAuthRequired(name)
+        host, port = self._endpoint(runtime)
         dedicated = force_dedicated or target.connect_mode == "dedicated"
 
         async def attempt():
             if dedicated:
-                return await self.backend.open_connection(target, host, port, prompter)
-            return await self.backend.connection(target, host, port, prompter)
+                return await self.backend.open_connection(target, host, port)
+            return await self.backend.connection(target, host, port)
 
         # "always": run the trusted recovery command before every open.  It must
         # be a no-op when the container already runs.
         if target.connect_command and target.connect_command_mode == "always":
-            route = self.runtimes[name].active_route or (
+            route = runtime.active_route or (
                 target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
             )
-            await self.tunnels.run_connect_command(target, route)
+            connection = runtime.tunnel.connection if runtime.tunnel else None
+            await self.tunnels.run_connect_command(target, route, connection=connection)
 
         try:
             conn = await attempt()
@@ -515,14 +537,15 @@ class Gateway:
             # stopped).  In "on_failure" mode run the recovery command on the
             # remote host and retry once.
             if target.connect_command and target.connect_command_mode == "on_failure":
-                route = self.runtimes[name].active_route or (
+                route = runtime.active_route or (
                     target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
                 )
                 log.info(
                     "target %s unreachable (%s); running connect_command",
                     name, first,
                 )
-                await self.tunnels.run_connect_command(target, route)
+                connection = runtime.tunnel.connection if runtime.tunnel else None
+                await self.tunnels.run_connect_command(target, route, connection=connection)
                 # Drop any cached (dead) connection before retrying.
                 await self.backend.disconnect(name)
                 try:
@@ -530,7 +553,7 @@ class Gateway:
                     return target, conn
                 except SSHError:
                     pass
-            if target.interactive_auth and not self._interactive:
+            if target.interactive_auth:
                 raise InteractiveAuthRequired(name) from None
             raise first
 
@@ -605,8 +628,14 @@ class Gateway:
             if name not in self.runtimes:
                 self.runtimes[name] = TargetRuntime(name=name)
                 report["added"].append(name)
-                if target.auto_connect:
+                if target.auto_connect and not target.interactive_auth:
                     asyncio.create_task(self._safe_connect(name))
+                elif target.auto_connect:
+                    log.info(
+                        "target %s: skipping auto-connect (interactive_auth "
+                        "requires a second factor)",
+                        name,
+                    )
                 continue
             runtime = self.runtimes[name]
             if self._target_changed(runtime, target):
@@ -626,6 +655,14 @@ class Gateway:
         return False
 
     async def _safe_refresh(self, name: str) -> None:
+        target = self.config.targets.get(name)
+        if target is not None and target.interactive_auth:
+            log.info(
+                "target %s: skipping automatic refresh (interactive_auth requires "
+                "a second factor)",
+                name,
+            )
+            return
         with contextlib.suppress(TunnelError, SSHError, HostKeyError):
             await self.refresh_target(name)
 
@@ -651,17 +688,42 @@ class Gateway:
             raise web.HTTPNotFound(text="unknown target")
         return web.json_response(self.public_status(name))
 
+    async def _request_factor(self, request: web.Request) -> str | None:
+        """Read the optional ``{"factor": "..."}`` JSON body.
+
+        An absent or empty body is allowed (returns ``None``).  Malformed JSON or
+        a non-string factor is a 400.  The value is never logged or echoed.
+        """
+        if not request.can_read_body:
+            return None
+        try:
+            body = await request.json()
+        except Exception as exc:  # noqa: BLE001 - bad client body
+            raise web.HTTPBadRequest(text="body must be JSON") from exc
+        if body in (None, {}):
+            return None
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="body must be a JSON object")
+        factor = body.get("factor")
+        if factor is None:
+            return None
+        if not isinstance(factor, str):
+            raise web.HTTPBadRequest(text="'factor' must be a string")
+        return factor or None
+
     async def h_connect(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
-        return web.json_response(await self.connect_target(name))
+        factor = await self._request_factor(request)
+        return web.json_response(await self.connect_target(name, factor=factor))
 
     async def h_refresh(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
-        return web.json_response(await self.refresh_target(name))
+        factor = await self._request_factor(request)
+        return web.json_response(await self.refresh_target(name, factor=factor))
 
     async def h_stop(self, request: web.Request) -> web.Response:
         client = self._auth(request)
@@ -1291,6 +1353,29 @@ class Gateway:
         finally:
             self._interactive = False
 
+    @staticmethod
+    def _parse_factor_args(args: list[str]) -> tuple[str | None, list[str]]:
+        """Split ``[--2fa SECRET]`` out of console args, preserving order.
+
+        Supports both ``connect --2fa SECRET <target>`` and
+        ``connect <target> --2fa SECRET``.  Raises :class:`ValueError` when
+        ``--2fa`` has no value.  The secret is returned, never logged.
+        """
+        factor: str | None = None
+        rest: list[str] = []
+        index = 0
+        while index < len(args):
+            token = args[index]
+            if token == "--2fa":
+                if index + 1 >= len(args) or args[index + 1].startswith("--"):
+                    raise ValueError("--2fa requires a value")
+                factor = args[index + 1]
+                index += 2
+                continue
+            rest.append(token)
+            index += 1
+        return factor, rest
+
     async def _console_command(self, line: str) -> bool:
         parts = line.split()
         cmd, args = parts[0], parts[1:]
@@ -1298,8 +1383,9 @@ class Gateway:
             return False
         if cmd == "help":
             print(
-                "targets | status [target] | connect <t> | refresh <t> | "
-                "reconnect <t> | stop <t> | connect-all | stop-all | reload |\n"
+                "targets | status [target] | connect [--2fa SECRET] <t> | "
+                "refresh [--2fa SECRET] <t> | reconnect <t> | stop <t> | "
+                "connect-all | stop-all | reload |\n"
                 "clients | client <name> | client-refresh <name> | "
                 "client-connect <name> | client-stop <name> | client-kill <name> |\n"
                 "sessions [target] | close-session <id> |\n"
@@ -1313,16 +1399,28 @@ class Gateway:
                 print(self.public_status(args[0]))
             else:
                 self._print_status_table()
-        elif cmd in ("connect", "refresh", "reconnect", "stop"):
-            if not args:
-                print(f"usage: {cmd} <target>")
+        elif cmd in ("connect", "refresh"):
+            try:
+                factor, rest = self._parse_factor_args(list(args))
+            except ValueError:
+                print(f"usage: {cmd} <target> [--2fa SECRET]")
+                return True
+            if len(rest) != 1:
+                print(f"usage: {cmd} <target> [--2fa SECRET]")
                 return True
             if cmd == "connect":
-                print(await self.connect_target(args[0]))
-            elif cmd == "stop":
-                print(await self.stop_target(args[0]))
-            else:  # refresh / reconnect both re-run route failover
+                print(await self.connect_target(rest[0], factor=factor))
+            else:
+                print(await self.refresh_target(rest[0], factor=factor))
+        elif cmd in ("reconnect", "stop"):
+            if len(args) != 1:
+                print(f"usage: {cmd} <target>")
+                return True
+            if cmd == "reconnect":
+                # refresh without a factor: interactive targets warn and skip.
                 print(await self.refresh_target(args[0]))
+            else:
+                print(await self.stop_target(args[0]))
         elif cmd == "connect-all":
             for name in self.config.targets:
                 with contextlib.suppress(Exception):
@@ -1490,28 +1588,6 @@ class Gateway:
                 f"{agent or '-':<30}"
                 f"{self.sessions.count_for_target(name):<8}{uptime}"
             )
-
-
-_ENDPOINT_RE = re.compile(
-    r"^(?:ENDPOINT\s+)?(?P<host>[A-Za-z0-9_.\-]+):(?P<port>\d{1,5})\s*$",
-    re.IGNORECASE,
-)
-
-
-def _parse_provision_endpoint(output: str) -> tuple[str, int] | None:
-    """Return the first ``host:port`` line from provisioning stdout.
-
-    A leading ``ENDPOINT`` marker is accepted but optional, so a script can
-    print other diagnostic lines and one final endpoint line.
-    """
-    for line in output.splitlines():
-        match = _ENDPOINT_RE.match(line.strip())
-        if not match:
-            continue
-        port = int(match.group("port"))
-        if 0 < port < 65536:
-            return match.group("host"), port
-    return None
 
 
 def _decode(value) -> str:

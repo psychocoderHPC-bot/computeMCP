@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: ISC
 import asyncio
 import base64
+import dataclasses
 import json
 import time
 
@@ -623,105 +624,175 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
 
 
 def test_parse_provision_endpoint():
-    from compute_mcp.gateway import _parse_provision_endpoint
+    from compute_mcp.tunnel import parse_provision_endpoint
 
-    assert _parse_provision_endpoint("cn123:2345\n") == ("cn123", 2345)
-    assert _parse_provision_endpoint("ENDPOINT 10.0.0.5:2222\n") == ("10.0.0.5", 2222)
-    assert _parse_provision_endpoint("job 123 running\nENDPOINT cn1:9\n") == ("cn1", 9)
-    assert _parse_provision_endpoint("no endpoint here\n") is None
-    assert _parse_provision_endpoint("host:99999\n") is None
+    assert parse_provision_endpoint("cn123:2345\n") == ("cn123", 2345)
+    assert parse_provision_endpoint("ENDPOINT 10.0.0.5:2222\n") == ("10.0.0.5", 2222)
+    assert parse_provision_endpoint("job 123 running\nENDPOINT cn1:9\n") == ("cn1", 9)
+    assert parse_provision_endpoint("no endpoint here\n") is None
+    assert parse_provision_endpoint("host:99999\n") is None
     # the first valid line wins
-    assert _parse_provision_endpoint("a:1\nb:2\n") == ("a", 1)
+    assert parse_provision_endpoint("a:1\nb:2\n") == ("a", 1)
 
 
-async def test_provision_runs_command_and_overrides_endpoint(tmp_path, monkeypatch):
+async def test_provision_runs_command_and_overrides_endpoint(monkeypatch):
+    """Provisioning now happens inside tunnel.connect; the gateway stores it."""
     gw = make_gateway()
-    import dataclasses
-
-    target = gw.config.targets["hal"]
-    target = dataclasses.replace(
-        target, transport=TransportConfig(kind="tunnel", ssh_targets=("rosi5",))
-    )
+    target = _tunnel_target(provision_command=("printf", "cmd01:2200\n"))
     gw.config = dataclasses.replace(
-        gw.config,
-        targets={
-            **gw.config.targets,
-            "hal": dataclasses.replace(
-                target, provision_command=("printf", "cmd01:2200\n")
-            ),
-        },
-    )
-    transport = await gw._provision(gw.config.targets["hal"])
-    assert transport.remote_host == "cmd01"
-    assert transport.remote_port == 2200
-
-
-async def test_provision_failure_raises(tmp_path, monkeypatch):
-    from compute_mcp.gateway import ProvisionError
-
-    gw = make_gateway()
-    import dataclasses
-
-    target = gw.config.targets["hal"]
-    target = dataclasses.replace(
-        target, transport=TransportConfig(kind="tunnel", ssh_targets=("rosi5",))
-    )
-    gw.config = dataclasses.replace(
-        gw.config,
-        targets={
-            **gw.config.targets,
-            "hal": dataclasses.replace(
-                target,
-                provision_command=(
-                    "python3", "-c", "import sys; sys.stderr.write('no nodes'); sys.exit(3)"
-                ),
-            ),
-        },
-    )
-    with pytest.raises(ProvisionError):
-        await gw._provision(gw.config.targets["hal"])
-
-
-async def test_connect_uses_provisioned_transport(monkeypatch):
-    gw = make_gateway()
-    import dataclasses
-
-    target = gw.config.targets["hal"]
-    target = dataclasses.replace(
-        target, transport=TransportConfig(kind="tunnel", ssh_targets=("rosi5",))
-    )
-    gw.config = dataclasses.replace(
-        gw.config,
-        targets={
-            **gw.config.targets,
-            "hal": dataclasses.replace(
-                target, provision_command=("printf", "cn9:3210\n")
-            ),
-        },
+        gw.config, targets={**gw.config.targets, "hal": target}
     )
     seen = {}
 
-    async def fake_connect(target, on_route=None, transport=None):
-        seen["transport"] = transport or target.transport
-        return _FakeTunnel(target, transport or target.transport)
+    async def fake_connect(target, on_route=None, factor=None, **kwargs):
+        seen["kwargs"] = kwargs
+        return _FakeTunnel(
+            target, route="rosi5", local_port=30000,
+            provisioned_endpoint=("cmd01", 2200),
+        )
 
     monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
     runtime = gw.runtimes["hal"]
     await gw._connect_locked(gw.config.targets["hal"], runtime)
-    assert seen["transport"].remote_host == "cn9"
-    assert seen["transport"].remote_port == 3210
+    # No transport override: a non-None transport would make TunnelManager skip
+    # provisioning (provision=False) and the provision_command would never run.
+    assert "transport" not in seen["kwargs"]
+    assert runtime.provisioned_endpoint == "cmd01:2200"
+
+
+async def test_provision_failure_raises(monkeypatch):
+    from compute_mcp.tunnel import TunnelError
+
+    gw = make_gateway()
+    target = _tunnel_target(provision_command=("printf", "no endpoint\n"))
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+
+    async def fake_connect(target, on_route=None, transport=None, factor=None):
+        raise TunnelError("provisioning printed no host:port endpoint")
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    runtime = gw.runtimes["hal"]
+    with pytest.raises(TunnelError):
+        await gw._connect_locked(gw.config.targets["hal"], runtime)
+    assert runtime.state == "failed"
+    assert "no host:port endpoint" in runtime.last_error
+
+
+async def test_connect_uses_provisioned_transport(monkeypatch):
+    gw = make_gateway()
+    target = _tunnel_target(provision_command=("printf", "cn9:3210\n"))
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    seen = {}
+
+    async def fake_connect(target, on_route=None, factor=None, **kwargs):
+        seen["kwargs"] = kwargs
+        return _FakeTunnel(
+            target, route="rosi5", local_port=30001,
+            provisioned_endpoint=("cn9", 3210),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    runtime = gw.runtimes["hal"]
+    await gw._connect_locked(gw.config.targets["hal"], runtime)
+    # Provisioning lives inside tunnel.connect: the gateway must NOT pass a
+    # transport override, otherwise TunnelManager.connect would skip
+    # provision_command (provision=False) and the static endpoint would win.
+    assert "transport" not in seen["kwargs"]
     assert runtime.provisioned_endpoint == "cn9:3210"
+    assert gw.public_status("hal")["provisioned_endpoint"] == "cn9:3210"
+
+
+async def test_tunnel_connect_provision_flag_depends_on_override(monkeypatch):
+    """TunnelManager provisions only when no transport override is supplied."""
+    from compute_mcp.config import SSHConfig
+    from compute_mcp.tunnel import TunnelManager
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31700, internal_port_max=31710))
+    target = _tunnel_target(provision_command=("printf", "cn:1\n"))
+    flags = []
+
+    async def fake_open_for_route(
+        self, target, route, local_port, transport=None, *, factor=None, provision=True
+    ):
+        flags.append(provision)
+        return _FakeTunnel(target, route=route, local_port=local_port)
+
+    monkeypatch.setattr(TunnelManager, "open_for_route", fake_open_for_route)
+
+    # No override: the target's provision_command must run.
+    await mgr.connect(target)
+    assert flags == [True]
+
+    # Explicit override: the endpoint is already known, provisioning is skipped.
+    override = dataclasses.replace(
+        target.transport, remote_host="cn", remote_port=2222
+    )
+    await mgr.connect(target, transport=override)
+    assert flags == [True, False]
+
+
+async def test_connect_target_does_not_suppress_provisioning(monkeypatch):
+    """connect_target must let TunnelManager run provision_command.
+
+    Regression guard: passing ``transport=target.transport`` made
+    ``TunnelManager.connect`` treat the endpoint as already discovered and call
+    ``open_for_route(..., provision=False)``, so provisioning never ran.
+    """
+    gw = make_gateway()
+    target = _tunnel_target(provision_command=("printf", "127.0.0.1:2224\n"))
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    seen = {}
+
+    async def fake_connect(target, on_route=None, transport=None, factor=None, **kwargs):
+        seen["transport"] = transport
+        seen["kwargs"] = kwargs
+        return _FakeTunnel(
+            target, route="r", local_port=1234,
+            provisioned_endpoint=("127.0.0.1", 2224), connection=None,
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    result = await gw.connect_target("hal")
+    # No transport override: provisioning is not suppressed.
+    assert seen["transport"] is None
+    assert "transport" not in seen["kwargs"]
+    assert gw.runtimes["hal"].provisioned_endpoint == "127.0.0.1:2224"
+    assert result["state"] == "connected"
 
 
 class _FakeTunnel:
-    def __init__(self, target, transport):
+    """Stand-in for tunnel.RouteTunnel with the attributes the gateway reads."""
+
+    def __init__(
+        self,
+        target,
+        route="direct",
+        local_port=9,
+        provisioned_endpoint=None,
+        connection=None,
+        alive=True,
+    ):
         self.target = target
-        self.route = "direct"
-        self.local_port = transport.remote_port
+        self.route = route
+        self.local_port = local_port
+        self.provisioned_endpoint = provisioned_endpoint
+        self.connection = connection
         self.process = None
+        self._alive = alive
+        self.stopped = False
+
+    def is_alive(self):
+        return self._alive
 
     async def stop(self):
-        return None
+        self.stopped = True
+        self._alive = False
 
 
 async def test_interactive_prompter_prompts_when_console_active(monkeypatch):
@@ -799,10 +870,11 @@ async def test_headless_interactive_target_raises_clear_error(monkeypatch):
         await gw._open_container_conn("hal")
 
 
-async def test_interactive_target_preauth_prompts_on_connect(monkeypatch):
-    gw = make_gateway()
+async def test_interactive_target_connects_with_factor(monkeypatch):
+    """An interactive target dials the route with the supplied factor."""
     import dataclasses
 
+    gw = make_gateway()
     target = gw.config.targets["hal"]
     gw.config = dataclasses.replace(
         gw.config,
@@ -811,17 +883,45 @@ async def test_interactive_target_preauth_prompts_on_connect(monkeypatch):
             "hal": dataclasses.replace(target, interactive_auth=True),
         },
     )
-    gw.runtimes["hal"].state = "connected"
-    gw.runtimes["hal"].local_port = 9
+    seen = {}
+
+    async def fake_connect(target, on_route=None, transport=None, factor=None):
+        seen["factor"] = factor
+        return _FakeTunnel(target, route="hal", local_port=31000)
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    result = await gw.connect_target("hal", factor="SECRET")
+    assert seen["factor"] == "SECRET"
+    assert result["state"] == "connected"
+    assert "warning" not in result
+    # the factor must never be exposed in the public status
+    assert "SECRET" not in json.dumps(result)
+
+
+async def test_interactive_target_without_factor_warns_and_skips(monkeypatch):
+    import dataclasses
+
+    gw = make_gateway()
+    target = gw.config.targets["hal"]
+    gw.config = dataclasses.replace(
+        gw.config,
+        targets={
+            **gw.config.targets,
+            "hal": dataclasses.replace(target, interactive_auth=True),
+        },
+    )
     called = []
 
-    async def fake_conn(target, host, port, prompter=None):
-        called.append(prompter is not None)
-        return object()
+    async def fake_connect(target, on_route=None, transport=None, factor=None):
+        called.append(factor)
+        return _FakeTunnel(target)
 
-    monkeypatch.setattr(gw.backend, "connection", fake_conn)
-    await gw._preauth_if_interactive("hal")
-    assert called == [True]
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    result = await gw.connect_target("hal", factor=None)
+    assert called == []  # never dialled without a factor
+    assert result["state"] == "disconnected"
+    assert "warning" in result
+    assert "interactive authentication" in result["warning"]
 
 
 async def test_sharing_exposed_in_target_status_and_discovery(monkeypatch):
@@ -1390,15 +1490,23 @@ async def test_connect_command_on_failure_runs_and_retries(monkeypatch):
     gw.config = dataclasses.replace(gw.config, targets={**gw.config.targets, "hal": target})
 
     calls = {"connect_cmd": 0, "attempt": 0}
+    route_conn = object()
 
     async def fake_ensure(name):
+        # Simulate an existing live tunnel whose route connection is used for
+        # the recovery command.
+        gw.runtimes[name].tunnel = _FakeTunnel(
+            target, route="hal", local_port=2222, connection=route_conn
+        )
         return gw.runtimes[name]
 
     def fake_endpoint(runtime):
         return "127.0.0.1", 2222
 
-    async def fake_run_connect_command(t, route):
+    async def fake_run_connect_command(t, route, connection=None):
         calls["connect_cmd"] += 1
+        calls["route"] = route
+        calls["connection"] = connection
 
     async def fake_connection(t, host, port, prompter=None):
         calls["attempt"] += 1
@@ -1417,7 +1525,10 @@ async def test_connect_command_on_failure_runs_and_retries(monkeypatch):
 
     t, conn = await gw._open_container_conn("hal")
     assert conn == "CONN"
-    assert calls == {"connect_cmd": 1, "attempt": 2}
+    assert calls["connect_cmd"] == 1
+    assert calls["attempt"] == 2
+    assert calls["route"] == "hal"
+    assert calls["connection"] is route_conn
 
 
 async def test_connect_command_on_failure_not_run_on_success(monkeypatch):
@@ -1459,15 +1570,20 @@ async def test_connect_command_always_runs_before_open(monkeypatch):
     )
     gw.config = dataclasses.replace(gw.config, targets={**gw.config.targets, "hal": target})
     calls = {"connect_cmd": 0}
+    route_conn = object()
 
     async def fake_ensure(name):
+        gw.runtimes[name].tunnel = _FakeTunnel(
+            target, route="hal", local_port=2222, connection=route_conn
+        )
         return gw.runtimes[name]
 
     def fake_endpoint(runtime):
         return "127.0.0.1", 2222
 
-    async def fake_run_connect_command(t, route):
+    async def fake_run_connect_command(t, route, connection=None):
         calls["connect_cmd"] += 1
+        calls["connection"] = connection
 
     async def fake_connection(t, host, port, prompter=None):
         return "CONN"
@@ -1480,3 +1596,607 @@ async def test_connect_command_always_runs_before_open(monkeypatch):
     t, conn = await gw._open_container_conn("hal")
     assert conn == "CONN"
     assert calls["connect_cmd"] == 1
+    assert calls["connection"] is route_conn
+
+
+# ============================================================================
+# 2FA factor matrix and auto-connect / route-loss guards (fake route tunnel)
+# ============================================================================
+
+def _interactive_gateway(**target_overrides):
+    """A gateway whose `hal` target is interactive_auth with tunnel transport."""
+    gw = make_gateway()
+    target = _tunnel_target(interactive_auth=True, **target_overrides)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    return gw, target
+
+
+def _install_fake_connect(monkeypatch, gw, recorder):
+    async def fake_connect(target, on_route=None, transport=None, factor=None):
+        recorder["calls"].append({"target": target.name, "factor": factor})
+        return _FakeTunnel(
+            target, route=target.transport.ssh_targets[0], local_port=31000,
+            provisioned_endpoint=None,
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+
+
+async def test_factor_matrix_interactive_with_factor(monkeypatch):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    result = await gw.connect_target("hal", factor="SECRET")
+    assert rec["calls"] == [{"target": "hal", "factor": "SECRET"}]
+    assert result["state"] == "connected"
+    assert "warning" not in result
+
+
+async def test_factor_matrix_interactive_without_factor(monkeypatch):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    result = await gw.connect_target("hal", factor=None)
+    assert rec["calls"] == []  # no dial
+    assert result["state"] == "disconnected"
+    assert result["warning"]
+    assert "interactive authentication" in result["warning"]
+
+
+async def test_factor_matrix_non_interactive_with_factor(monkeypatch):
+    gw = make_gateway()
+    target = _tunnel_target(interactive_auth=False)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    result = await gw.connect_target("hal", factor="SECRET")
+    # The ignored factor must not be forwarded downstream (key-only connect).
+    assert rec["calls"] == [{"target": "hal", "factor": None}]
+    assert result["state"] == "connected"
+    assert "warning" in result
+    assert "does not use interactive_auth" in result["warning"]
+
+
+async def test_factor_matrix_non_interactive_without_factor(monkeypatch):
+    gw = make_gateway()
+    target = _tunnel_target(interactive_auth=False)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    result = await gw.connect_target("hal", factor=None)
+    assert rec["calls"] == [{"target": "hal", "factor": None}]
+    assert result["state"] == "connected"
+    assert "warning" not in result
+
+
+async def test_refresh_interactive_no_factor_no_teardown(monkeypatch):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    disconnected = []
+    stopped = []
+
+    async def fake_disconnect(name):
+        disconnected.append(name)
+
+    async def fake_stop():
+        stopped.append("tunnel")
+
+    # Simulate an existing live tunnel that must NOT be torn down.
+    gw.runtimes["hal"].state = "connected"
+    live = _FakeTunnel(
+        gw.config.targets["hal"], route="hal", local_port=31000, connection=object()
+    )
+    live.stop = fake_stop
+    gw.runtimes["hal"].tunnel = live
+
+    monkeypatch.setattr(gw.backend, "disconnect", fake_disconnect)
+    result = await gw.refresh_target("hal", factor=None)
+    assert rec["calls"] == []  # no reconnect dial
+    assert disconnected == []
+    assert stopped == []  # no teardown
+    assert result["state"] == "connected"
+    assert "warning" in result
+
+
+# -- auto_connect guard -----------------------------------------------------
+
+async def test_start_skips_auto_connect_for_interactive(monkeypatch):
+    gw, _ = _interactive_gateway(auto_connect=True)
+    scheduled = []
+
+    def fake_safe_connect(name):
+        scheduled.append(name)
+
+        async def _done():
+            return None
+
+        return _done()
+
+    monkeypatch.setattr(gw, "_safe_connect", fake_safe_connect)
+    monkeypatch.setattr(gw.sessions, "start", lambda: None)
+
+    async def fake_watch():
+        return None
+
+    monkeypatch.setattr(gw, "_watch_tunnels", fake_watch)
+    await gw.start()
+    # The interactive target must not be auto-connected.
+    assert scheduled == []
+    assert gw.runtimes["hal"].state != "connecting"
+
+
+async def test_apply_config_skips_auto_connect_for_interactive(monkeypatch):
+    gw, target = _interactive_gateway(auto_connect=True)
+    target2 = dataclasses.replace(
+        gw.config.targets["gpu03"], auto_connect=True, interactive_auth=False
+    )
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "gpu03": target2}
+    )
+    # Remove all runtimes so both targets are "added".
+    gw.runtimes.clear()
+    scheduled = []
+
+    def fake_safe_connect(name):
+        scheduled.append(name)
+
+        async def _done():
+            return None
+
+        return _done()
+
+    monkeypatch.setattr(gw, "_safe_connect", fake_safe_connect)
+
+    report = await gw.apply_config(gw.config)
+    assert set(report["added"]) == {"hal", "gpu03"}
+    # Only the non-interactive target got a scheduled connect.
+    assert scheduled == ["gpu03"]
+
+
+# -- route loss behaviour ---------------------------------------------------
+
+async def test_route_loss_non_interactive_schedules_reconnect(monkeypatch):
+    gw = make_gateway()
+    target = _tunnel_target(interactive_auth=False)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].tunnel = _FakeTunnel(target, route="hal", local_port=31000)
+
+    scheduled = []
+
+    def fake_backoff(name):
+        scheduled.append(name)
+
+        async def _done():
+            return None
+
+        return _done()
+
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    monkeypatch.setattr(gw, "_reconnect_with_backoff", fake_backoff)
+
+    await gw._handle_loss("hal", "tunnel connection closed")
+    runtime = gw.runtimes["hal"]
+    assert runtime.needs_refresh is True
+    assert runtime.state == "disconnected"
+    assert scheduled == ["hal"]
+
+
+async def test_route_loss_interactive_fails_closed(monkeypatch):
+    gw, target = _interactive_gateway()
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].tunnel = _FakeTunnel(target, route="hal", local_port=31000)
+
+    scheduled = []
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    monkeypatch.setattr(
+        gw,
+        "_reconnect_with_backoff",
+        lambda name: scheduled.append(name) or _noop(),
+    )
+
+    await gw._handle_loss("hal", "tunnel connection closed")
+    runtime = gw.runtimes["hal"]
+    assert runtime.needs_refresh is False
+    assert runtime.state == "disconnected"
+    assert runtime.last_error
+    assert "second factor" in runtime.last_error
+    # Fail closed: no backoff/reconnect scheduled.
+    assert scheduled == []
+
+
+async def _async_noop(*a, **k):
+    return None
+
+
+async def _async_noop_kw(*a, **k):
+    return None
+
+
+# -- console 2FA parsing -----------------------------------------------------
+
+async def test_console_connect_factor_before_and_after_target(monkeypatch):
+    gw = make_gateway()
+    seen = []
+
+    async def fake_connect(name, factor=None):
+        seen.append((name, factor))
+        return {"state": "connected"}
+
+    monkeypatch.setattr(gw, "connect_target", fake_connect)
+    import io
+    import contextlib
+
+    for line in ("connect --2fa SECRET t", "connect t --2fa SECRET"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            await gw._console_command(line)
+        assert "SECRET" not in buf.getvalue()
+    assert seen == [("t", "SECRET"), ("t", "SECRET")]
+
+
+async def test_console_refresh_factor(monkeypatch):
+    gw = make_gateway()
+    seen = []
+
+    async def fake_refresh(name, factor=None):
+        seen.append((name, factor))
+        return {"state": "connected"}
+
+    monkeypatch.setattr(gw, "refresh_target", fake_refresh)
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await gw._console_command("refresh --2fa SECRET t")
+    assert "SECRET" not in buf.getvalue()
+    assert seen == [("t", "SECRET")]
+
+
+async def test_console_2fa_without_value_is_usage_error(capsys):
+    gw = make_gateway()
+    keep_going = await gw._console_command("connect --2fa")
+    out = capsys.readouterr().out
+    assert keep_going is True
+    assert out.startswith("usage: connect")
+
+
+async def test_factor_never_in_status_or_logs(monkeypatch, caplog):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    with caplog.at_level("DEBUG"):
+        result = await gw.connect_target("hal", factor="TOP-SECRET")
+    assert "TOP-SECRET" not in json.dumps(result)
+    assert "TOP-SECRET" not in caplog.text
+    assert "TOP-SECRET" not in json.dumps(gw.public_status("hal"))
+
+
+# -- HTTP factor body --------------------------------------------------------
+
+async def test_http_connect_factor_accepted(monkeypatch):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/targets/hal/connect",
+            headers=auth("alpaka-token"),
+            json={"factor": "SECRET"},
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        assert rec["calls"] == [{"target": "hal", "factor": "SECRET"}]
+        assert "SECRET" not in json.dumps(body)
+    finally:
+        await client.close()
+
+
+async def test_http_refresh_factor_accepted(monkeypatch):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/targets/hal/refresh",
+            headers=auth("alpaka-token"),
+            json={"factor": "SECRET"},
+        )
+        assert resp.status == 200, await resp.text()
+        assert rec["calls"] == [{"target": "hal", "factor": "SECRET"}]
+    finally:
+        await client.close()
+
+
+async def test_http_malformed_factor_body_rejected():
+    gw = make_gateway()
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/targets/hal/connect",
+            headers={**auth("alpaka-token"), "Content-Type": "application/json"},
+            data="not json",
+        )
+        assert resp.status == 400
+        resp = await client.post(
+            "/v1/targets/hal/connect",
+            headers=auth("alpaka-token"),
+            json={"factor": 1234},
+        )
+        assert resp.status == 400
+        resp = await client.post(
+            "/v1/targets/hal/refresh",
+            headers=auth("alpaka-token"),
+            json={"factor": ["x"]},
+        )
+        assert resp.status == 400
+    finally:
+        await client.close()
+
+
+async def test_http_factor_not_echoed_on_warning(monkeypatch):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    client = await make_client(gw)
+    try:
+        # interactive + no factor -> warning response, factor absent everywhere.
+        resp = await client.post(
+            "/v1/targets/hal/connect", headers=auth("alpaka-token"), json={}
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert "warning" in body
+        assert rec["calls"] == []
+    finally:
+        await client.close()
+
+
+# ============================================================================
+# F1: real tunnel errors vs InteractiveAuthRequired; awaiting_factor lifecycle
+# ============================================================================
+
+async def test_open_container_conn_reraises_real_tunnel_error(monkeypatch):
+    from compute_mcp.gateway import InteractiveAuthRequired
+    from compute_mcp.tunnel import TunnelError
+
+    gw, _ = _interactive_gateway()
+
+    async def boom(name):
+        raise TunnelError("dial exploded")
+
+    monkeypatch.setattr(gw, "ensure_connected", boom)
+    assert gw.runtimes["hal"].awaiting_factor is False
+    with pytest.raises(TunnelError) as excinfo:
+        await gw._open_container_conn("hal")
+    # The original error must survive; it must not be masked as 2FA-needed.
+    assert type(excinfo.value) is TunnelError
+    assert not isinstance(excinfo.value, InteractiveAuthRequired)
+
+
+async def test_open_container_conn_reraises_real_ssh_error(monkeypatch):
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, _ = _interactive_gateway()
+
+    async def boom(name):
+        raise SSHError("host key mismatch")
+
+    monkeypatch.setattr(gw, "ensure_connected", boom)
+    assert gw.runtimes["hal"].awaiting_factor is False
+    with pytest.raises(SSHError) as excinfo:
+        await gw._open_container_conn("hal")
+    assert type(excinfo.value) is SSHError
+
+
+async def test_open_container_conn_maps_to_interactive_when_awaiting(monkeypatch):
+    from compute_mcp.gateway import InteractiveAuthRequired
+    from compute_mcp.tunnel import TunnelError
+
+    gw, _ = _interactive_gateway()
+    gw.runtimes["hal"].awaiting_factor = True
+
+    async def boom(name):
+        raise TunnelError("dial exploded")
+
+    monkeypatch.setattr(gw, "ensure_connected", boom)
+    with pytest.raises(InteractiveAuthRequired):
+        await gw._open_container_conn("hal")
+
+
+def test_public_status_exposes_awaiting_factor():
+    gw, _ = _interactive_gateway()
+    assert gw.public_status("hal")["awaiting_factor"] is False
+    gw.runtimes["hal"].awaiting_factor = True
+    assert gw.public_status("hal")["awaiting_factor"] is True
+
+
+async def test_awaiting_factor_set_on_skip_cleared_on_success_and_stop(monkeypatch):
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+
+    # skip without a factor -> awaiting_factor set and exposed
+    result = await gw.connect_target("hal", factor=None)
+    assert gw.runtimes["hal"].awaiting_factor is True
+    assert result["awaiting_factor"] is True
+
+    # stop -> cleared
+    stopped = await gw.stop_target("hal")
+    assert gw.runtimes["hal"].awaiting_factor is False
+    assert stopped["awaiting_factor"] is False
+
+    # skip again -> set again (not connected, so the fail-closed path runs)
+    await gw.connect_target("hal", factor=None)
+    assert gw.runtimes["hal"].awaiting_factor is True
+
+    # successful connect with a factor -> cleared
+    await gw.connect_target("hal", factor="SECRET")
+    assert gw.runtimes["hal"].awaiting_factor is False
+
+
+# ============================================================================
+# F2: reconnect task dedup / cancellation / obsolete runtime
+# ============================================================================
+
+def _non_interactive_tunnel_gateway(**overrides):
+    gw = make_gateway()
+    target = _tunnel_target(interactive_auth=False, **overrides)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    return gw, target
+
+
+async def test_schedule_recovery_is_deduplicated(monkeypatch):
+    import contextlib
+
+    gw, _ = _non_interactive_tunnel_gateway()
+    started = []
+
+    async def slow(name):
+        started.append(name)
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(gw, "_reconnect_with_backoff", slow)
+    runtime = gw.runtimes["hal"]
+    gw._schedule_recovery("hal", runtime)
+    first = runtime.recovery_task
+    gw._schedule_recovery("hal", runtime)
+    assert runtime.recovery_task is first
+    await asyncio.sleep(0)  # let the single task start
+    assert started == ["hal"]
+    first.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await first
+
+
+async def test_stop_target_cancels_recovery_and_loop_does_not_dial(monkeypatch):
+    gw, _ = _non_interactive_tunnel_gateway(connect_backoff_initial=30.0)
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    dials = []
+
+    async def fake_ensure(name):
+        dials.append(name)
+        return gw.runtimes[name]
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    runtime = gw.runtimes["hal"]
+    gw._schedule_recovery("hal", runtime)
+    task = runtime.recovery_task
+    await asyncio.sleep(0)  # task captures the runtime and starts sleeping
+    assert task is not None and not task.done()
+    await gw.stop_target("hal")
+    assert task.cancelled() or task.done()
+    await asyncio.sleep(0.05)
+    assert dials == []
+
+
+async def test_reconnect_skips_dial_when_runtime_replaced(monkeypatch):
+    gw, _ = _non_interactive_tunnel_gateway(connect_backoff_initial=0.05)
+    dials = []
+
+    async def fake_ensure(name):
+        dials.append(name)
+        return gw.runtimes[name]
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    task = asyncio.create_task(gw._reconnect_with_backoff("hal"))
+    await asyncio.sleep(0)  # task captures the old runtime and starts sleeping
+    gw.runtimes["hal"] = TargetRuntime(name="hal")  # replacement
+    await asyncio.wait_for(task, timeout=5.0)
+    assert dials == []
+
+
+async def test_reconnect_skips_dial_when_stopping(monkeypatch):
+    gw, _ = _non_interactive_tunnel_gateway(connect_backoff_initial=0.0)
+    dials = []
+
+    async def fake_ensure(name):
+        dials.append(name)
+        return gw.runtimes[name]
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    gw._stopping = True
+    await asyncio.wait_for(gw._reconnect_with_backoff("hal"), timeout=5.0)
+    assert dials == []
+
+
+async def test_interactive_loss_no_recovery_task_and_actionable_error(monkeypatch):
+    gw, target = _interactive_gateway()
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].tunnel = _FakeTunnel(target, route="hal", local_port=31000)
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+
+    await gw._handle_loss("hal", "tunnel connection closed")
+    runtime = gw.runtimes["hal"]
+    assert runtime.recovery_task is None
+    assert runtime.awaiting_factor is True
+    assert runtime.needs_refresh is False
+    assert "target-connect --2fa" in runtime.last_error
+    assert gw.public_status("hal")["awaiting_factor"] is True
+
+
+# ============================================================================
+# Console --2fa missing value (refresh variant) and factor leakage
+# ============================================================================
+
+async def test_console_refresh_2fa_without_value_is_usage(monkeypatch, capsys):
+    gw = make_gateway()
+    called = []
+
+    async def fake_refresh(name, factor=None):
+        called.append(name)
+        return {"state": "connected"}
+
+    monkeypatch.setattr(gw, "refresh_target", fake_refresh)
+    keep_going = await gw._console_command("refresh --2fa")
+    out = capsys.readouterr().out
+    assert keep_going is True
+    assert out.startswith("usage: refresh")
+    assert called == []
+
+
+async def test_factor_not_leaked_on_route_dial_failure(monkeypatch, caplog):
+    from compute_mcp.tunnel import TunnelError
+
+    gw, _ = _interactive_gateway()
+
+    async def boom(target, on_route=None, transport=None, factor=None):
+        raise TunnelError("all routes failed")
+
+    monkeypatch.setattr(gw.tunnels, "connect", boom)
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(TunnelError):
+            await gw.connect_target("hal", factor="TOP-SECRET")
+    assert "TOP-SECRET" not in caplog.text
+    assert gw.runtimes["hal"].last_error is not None
+    assert "TOP-SECRET" not in gw.runtimes["hal"].last_error
+    assert "TOP-SECRET" not in json.dumps(gw.public_status("hal"))
