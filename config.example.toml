@@ -174,6 +174,9 @@ connect_backoff_max = 60.0
 # # gateway forwards that endpoint over the same connection.
 # provision_command = ["/home/USER/.config/computeMCP-gateway/rosi5-provision.sh"]
 # provision_timeout = 900.0
+# # `target-connect`/`target-refresh` wait for provision_timeout plus a short
+# # handshake margin, so this value also bounds the operator CLI wait.  Pass
+# # `--timeout SECONDS` to the CLI to override it for one call.
 
 # A target reachable without a tunnel (e.g. gateway co-located with the
 # container, or the dev-hal test setup in this repository).

@@ -726,6 +726,15 @@ computeMCP-gatewayctl --config config.toml --client alpaka clients  # ACL-checke
 (`targets = ["*"]`) token; other clients receive `403`. Token values and full
 hashes are never returned — only a short `sha256:` fingerprint.
 
+`--timeout` is optional. For `target-connect` and `target-refresh` (and
+`client-connect`/`client-refresh`) the CLI waits for the target's
+`provision_timeout` plus a short handshake margin, because a slow
+`provision_command` can legitimately run that long. This means `provision_timeout`
+also bounds how long the CLI waits. Pass `--timeout SECONDS` before or after the
+subcommand to override it for one call; the subcommand form wins over the
+global one. For every other command the timeout stays at 60 seconds unless
+`--timeout` is given.
+
 Add a human label to any client so the listings are readable:
 
 ```toml
