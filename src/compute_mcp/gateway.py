@@ -285,6 +285,9 @@ class Gateway:
             warning = self._factor_warning(target, factor)
             if warning is not None:
                 factor = None  # key-only downstream
+            # Release the old allocation before provisioning a new one.  The
+            # route connection is still alive here, so the command can run.
+            await self._run_close_command(name)
             await self._stop_locked(name)
             await self.backend.disconnect(name)
             await self.sessions.close_for_target(name, reason="refresh")
@@ -320,10 +323,40 @@ class Gateway:
     async def stop_target(self, name: str) -> dict:
         self._target(name)
         async with self._lock(name):
+            # Explicit stop and gateway shutdown both go through here; release
+            # the remote allocation while the route connection is still alive.
+            await self._run_close_command(name)
             await self._stop_locked(name)
         await self.backend.disconnect(name)
         await self.sessions.close_for_target(name, reason="target stopped")
         return self.runtimes[name].public(self.sessions.count_for_target(name))
+
+    async def _run_close_command(self, name: str) -> None:
+        """Run the target's trusted ``close_command`` on the live route.
+
+        Advisory: a missing connection, a non-zero exit or a timeout is logged
+        and swallowed so teardown still proceeds.  Deliberately NOT part of
+        ``_stop_locked``: config-reload removal uses ``_stop_locked`` directly
+        and must not release the allocation.
+        """
+        target = self.config.targets.get(name)
+        if target is None or not target.close_command:
+            return
+        runtime = self.runtimes[name]
+        connection = runtime.tunnel.connection if runtime.tunnel else None
+        if connection is None:
+            log.warning(
+                "target %s: close_command skipped, no live route connection",
+                name,
+            )
+            return
+        route = runtime.active_route or (
+            target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
+        )
+        try:
+            await self.tunnels.run_close_command(target, route, connection=connection)
+        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+            log.warning("target %s: close_command failed: %s", name, exc)
 
     async def _stop_locked(self, name: str) -> None:
         runtime = self.runtimes[name]

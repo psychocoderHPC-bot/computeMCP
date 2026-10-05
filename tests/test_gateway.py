@@ -2184,6 +2184,185 @@ async def test_console_refresh_2fa_without_value_is_usage(monkeypatch, capsys):
     assert called == []
 
 
+# ============================================================================
+# close_command: release on stop/shutdown/refresh, not on config-reload removal
+# ============================================================================
+
+def _close_gateway(close_command=("scancel", "--name", "terok-dev")):
+    gw = make_gateway()
+    target = _tunnel_target(close_command=close_command)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    return gw, target
+
+
+def _record_close(gw, monkeypatch, calls=None, *, boom=False):
+    calls = calls if calls is not None else []
+
+    async def fake_run_close_command(target, route, connection=None):
+        calls.append(
+            {
+                "target": target.name,
+                "route": route,
+                "connection": connection,
+                "tunnel_alive": gw.runtimes[target.name].tunnel is not None,
+            }
+        )
+        if boom:
+            raise RuntimeError("close boom")
+
+    monkeypatch.setattr(gw.tunnels, "run_close_command", fake_run_close_command)
+    return calls
+
+
+def _connect_fake_tunnel(gw, target, connection):
+    live = _FakeTunnel(target, route="hal", local_port=31000, connection=connection)
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.tunnel = live
+    return live
+
+
+async def test_stop_target_runs_close_command_before_teardown(monkeypatch):
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    conn = object()
+    live = _connect_fake_tunnel(gw, target, conn)
+    calls = _record_close(gw, monkeypatch)
+
+    await gw.stop_target("hal")
+
+    assert len(calls) == 1
+    assert calls[0]["route"] == "hal"
+    assert calls[0]["connection"] is conn
+    # It ran while the route connection was still alive, before teardown.
+    assert calls[0]["tunnel_alive"] is True
+    assert gw.runtimes["hal"].tunnel is None
+    assert live.stopped is True
+
+
+async def test_refresh_target_runs_close_command(monkeypatch):
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+    conn = object()
+    _connect_fake_tunnel(gw, target, conn)
+    calls = _record_close(gw, monkeypatch)
+
+    result = await gw.refresh_target("hal")
+
+    assert len(calls) == 1
+    assert calls[0]["connection"] is conn
+    assert calls[0]["tunnel_alive"] is True
+    # A fresh route was provisioned after the close.
+    assert rec["calls"] == [{"target": "hal", "factor": None}]
+    assert result["state"] == "connected"
+
+
+async def test_refresh_interactive_no_factor_does_not_run_close(monkeypatch):
+    gw = make_gateway()
+    target = _tunnel_target(interactive_auth=True, close_command=("scancel",))
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    conn = object()
+    _connect_fake_tunnel(gw, target, conn)
+    calls = _record_close(gw, monkeypatch)
+
+    result = await gw.refresh_target("hal", factor=None)
+
+    # A skipped refresh must not release the still-active allocation.
+    assert calls == []
+    assert result["awaiting_factor"] is True
+    assert gw.runtimes["hal"].tunnel is not None
+
+
+async def test_gateway_stop_runs_close_command_for_connected_target(monkeypatch):
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    monkeypatch.setattr(gw.sessions, "stop", _async_noop)
+    monkeypatch.setattr(gw.backend, "close_all", _async_noop)
+    conn = object()
+    _connect_fake_tunnel(gw, target, conn)
+    calls = _record_close(gw, monkeypatch)
+
+    await gw.stop()
+
+    assert len(calls) == 1
+    assert calls[0]["connection"] is conn
+
+
+async def test_apply_config_removal_does_not_run_close_command(monkeypatch):
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    conn = object()
+    _connect_fake_tunnel(gw, target, conn)
+    calls = _record_close(gw, monkeypatch)
+
+    new_config = dataclasses.replace(
+        gw.config, targets={"gpu03": gw.config.targets["gpu03"]}
+    )
+    report = await gw.apply_config(new_config)
+
+    assert report["removed"] == ["hal"]
+    # Removing a target by config reload must not release the allocation.
+    assert calls == []
+
+
+async def test_close_command_skipped_without_live_connection(monkeypatch, caplog):
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].tunnel = None
+    calls = _record_close(gw, monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        result = await gw.stop_target("hal")
+
+    assert calls == []  # not invoked without a connection
+    assert "no live route connection" in caplog.text
+    assert result["state"] == "disconnected"
+
+
+async def test_failing_close_command_still_stops(monkeypatch, caplog):
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    _connect_fake_tunnel(gw, target, object())
+    calls = _record_close(gw, monkeypatch, boom=True)
+
+    with caplog.at_level("WARNING"):
+        result = await gw.stop_target("hal")
+
+    assert len(calls) == 1
+    assert "close_command failed" in caplog.text
+    assert result["state"] == "disconnected"
+
+
+async def test_failing_close_command_still_refreshes(monkeypatch, caplog):
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+    _connect_fake_tunnel(gw, target, object())
+    _record_close(gw, monkeypatch, boom=True)
+
+    with caplog.at_level("WARNING"):
+        result = await gw.refresh_target("hal")
+
+    assert "close_command failed" in caplog.text
+    assert result["state"] == "connected"
+
+
 async def test_factor_not_leaked_on_route_dial_failure(monkeypatch, caplog):
     from compute_mcp.tunnel import TunnelError
 

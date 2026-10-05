@@ -545,6 +545,65 @@ async def test_run_connect_command_exception_is_logged_not_raised(caplog):
 
 
 # ---------------------------------------------------------------------------
+# run_close_command (advisory release, never fatal)
+# ---------------------------------------------------------------------------
+
+async def test_run_close_command_runs_shlex_quoted_with_timeout():
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31660, internal_port_max=31670))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]),
+        close_command=("scancel", "--name", "my job"),
+        close_command_timeout=45.0,
+    )
+    seen = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append((command, kwargs))
+            return _FakeRunResult(0, b"", b"")
+
+    await mgr.run_close_command(target, "hal", connection=_Conn())
+    assert len(seen) == 1
+    command, kwargs = seen[0]
+    # argv is shlex-quoted (the embedded space is protected).
+    assert command == "scancel --name 'my job'"
+    assert kwargs["timeout"] == 45.0
+    assert kwargs["check"] is False
+
+
+async def test_run_close_command_nonzero_exit_is_not_raised(caplog):
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31670, internal_port_max=31680))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), close_command=("scancel",)
+    )
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(9, b"out\n", b"nope\n")
+
+    with caplog.at_level("WARNING"):
+        await mgr.run_close_command(target, "hal", connection=_Conn())
+    assert "exited 9" in caplog.text
+    assert "nope" in caplog.text
+
+
+async def test_run_close_command_without_connection_is_noop(caplog):
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31680, internal_port_max=31690))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), close_command=("scancel",)
+    )
+    with caplog.at_level("WARNING"):
+        await mgr.run_close_command(target, "hal", connection=None)
+    assert "without a live route connection" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # open_for_route failure branches (fake route connection)
 # ---------------------------------------------------------------------------
 

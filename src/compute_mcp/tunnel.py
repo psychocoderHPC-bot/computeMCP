@@ -575,6 +575,64 @@ class TunnelManager:
             provisioned_endpoint=provisioned,
         )
 
+    async def _run_advisory_command(
+        self,
+        label: str,
+        argv: tuple[str, ...],
+        timeout: float,
+        target: TargetConfig,
+        route: str,
+        connection: asyncssh.SSHClientConnection | None,
+    ) -> None:
+        """Run a trusted advisory command on the remote route host.
+
+        The command runs on the REMOTE side of the live route connection (the
+        machine that hosts the development container) so the gateway can
+        forward stdout/stderr.  Exit status and output are logged but never
+        fatal: the caller decides what to do next.
+
+        Callers must pass the live ``connection`` (the route connection stored
+        on the tunnel).  When it is missing the call is a logged no-op.
+        """
+        if connection is None:
+            log.warning(
+                "target %s: %s requested without a live route connection",
+                target.name, label,
+            )
+            return
+        command = " ".join(shlex.quote(p) for p in argv)
+        log.info(
+            "target %s: running %s via %s: %s",
+            target.name, label, route, " ".join(argv),
+        )
+        try:
+            result = await connection.run(
+                command,
+                check=False,
+                timeout=timeout,
+                encoding=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+            log.warning(
+                "target %s: %s failed: %s", target.name, label, exc
+            )
+            return
+        stdout = result.stdout or b""
+        stderr = result.stderr or b""
+        if stdout:
+            log.debug(
+                "target %s: %s stdout: %s",
+                target.name, label, stdout.decode(errors="replace").strip(),
+            )
+        if result.exit_status != 0:
+            detail = stderr.decode(errors="replace").strip() or "no stderr"
+            log.warning(
+                "target %s: %s exited %s: %s",
+                target.name, label, result.exit_status, detail,
+            )
+        else:
+            log.info("target %s: %s completed", target.name, label)
+
     async def run_connect_command(
         self,
         target: TargetConfig,
@@ -593,45 +651,37 @@ class TunnelManager:
         ``connection`` (the route connection stored on the tunnel).  When it is
         missing the call is a logged no-op.
         """
-        if connection is None:
-            log.warning(
-                "target %s: connect_command requested without a live route "
-                "connection",
-                target.name,
-            )
-            return
-        command = " ".join(shlex.quote(p) for p in target.connect_command)
-        log.info(
-            "target %s: running connect_command via %s: %s",
-            target.name, route, " ".join(target.connect_command),
+        await self._run_advisory_command(
+            "connect_command",
+            target.connect_command,
+            target.connect_command_timeout,
+            target,
+            route,
+            connection,
         )
-        try:
-            result = await connection.run(
-                command,
-                check=False,
-                timeout=target.connect_command_timeout,
-                encoding=None,
-            )
-        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
-            log.warning(
-                "target %s: connect_command failed: %s", target.name, exc
-            )
-            return
-        stdout = result.stdout or b""
-        stderr = result.stderr or b""
-        if stdout:
-            log.debug(
-                "target %s: connect_command stdout: %s",
-                target.name, stdout.decode(errors="replace").strip(),
-            )
-        if result.exit_status != 0:
-            detail = stderr.decode(errors="replace").strip() or "no stderr"
-            log.warning(
-                "target %s: connect_command exited %s: %s",
-                target.name, result.exit_status, detail,
-            )
-        else:
-            log.info("target %s: connect_command completed", target.name)
+
+    async def run_close_command(
+        self,
+        target: TargetConfig,
+        route: str,
+        connection: asyncssh.SSHClientConnection | None = None,
+    ) -> None:
+        """Run the target's trusted ``close_command`` on the route host.
+
+        The command runs on the REMOTE side of the live route connection to
+        release the target (e.g. ``scancel`` the Slurm job) before the tunnel is
+        torn down.  Exit status and output are advisory: a non-zero exit or
+        timeout is logged and teardown still proceeds.  When there is no live
+        ``connection`` the call is a logged no-op.
+        """
+        await self._run_advisory_command(
+            "close_command",
+            target.close_command,
+            target.close_command_timeout,
+            target,
+            route,
+            connection,
+        )
 
     async def connect(
         self,

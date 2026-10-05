@@ -1026,6 +1026,29 @@ Troubleshooting: run the script by hand first — the gateway logs its stdout an
 includes its stderr in the target's `last_error`, and the discovered address is
 shown as `provisioned_endpoint` in `status`/`GET /v1/targets/{name}`.
 
+### Releasing the allocation (`close_command`)
+
+`provision_command` acquires a Slurm job, so stopping the target must release it
+again or the allocation is left behind. `close_command` is the symmetric trusted
+argv that runs ON the remote machine over the live route connection, for example
+`scancel` of the job the target acquired.
+
+```toml
+[targets.rosi5]
+provision_command = ["/home/USER/.config/computeMCP-gateway/rosi5-provision.sh"]
+close_command = ["scancel", "--name", "terok-dev"]
+close_command_timeout = 120.0
+```
+
+`close_command` runs on an explicit operator stop (the `target-stop`,
+`client-stop` and console `stop`/`stop-all` paths trigger it), on gateway
+shutdown, and before a target refresh so the old job is released before
+`provision_command` acquires a fresh one. It does NOT run when a config reload
+removes a target, because that removal only drops the target from the running
+config. Exit status and output are advisory: a non-zero exit or a timeout is
+logged as a warning and teardown proceeds. It has its own
+`close_command_timeout`, default 120 seconds.
+
 ### Recovering a stopped container (`connect_command`)
 
 The tunnel can be healthy while the development **container itself is stopped**.

@@ -248,6 +248,27 @@ def test_provision_command_rejected_for_direct():
         parse_config(raw)
 
 
+def test_close_command_parsed_with_timeout():
+    cfg = parse_config(
+        base_raw(close_command=["scancel", "--name", "job"], close_command_timeout=45)
+    )
+    t = cfg.targets["hal"]
+    assert t.close_command == ("scancel", "--name", "job")
+    assert t.close_command_timeout == 45.0
+
+
+def test_close_command_defaults_empty_and_timeout_120():
+    t = parse_config(base_raw()).targets["hal"]
+    assert t.close_command == ()
+    assert t.close_command_timeout == 120.0
+
+
+def test_close_command_rejected_for_direct():
+    raw = base_raw(transport="direct", ssh_targets=[], close_command=["scancel"])
+    with pytest.raises(ConfigError, match="close_command requires tunnel transport"):
+        parse_config(raw)
+
+
 def test_connect_command_parsed():
     cfg = parse_config(base_raw(connect_command=["/bin/up.sh"], connect_command_timeout=30))
     t = cfg.targets["hal"]

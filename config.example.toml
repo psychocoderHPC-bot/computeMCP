@@ -177,6 +177,13 @@ connect_backoff_max = 60.0
 # # `target-connect`/`target-refresh` wait for provision_timeout plus a short
 # # handshake margin, so this value also bounds the operator CLI wait.  Pass
 # # `--timeout SECONDS` to the CLI to override it for one call.
+# # Symmetric to provision_command: a trusted argv (no shell) that runs ON THE
+# # remote machine over the live route connection to release the allocation
+# # (e.g. scancel the Slurm job).  It runs on an explicit target/kill stop,
+# # gateway shutdown and before a refresh; it does NOT run when a config reload
+# # removes a target.  Non-zero exit or timeout is advisory.
+# close_command = ["scancel", "--name", "terok-dev"]
+# close_command_timeout = 120.0
 
 # A target reachable without a tunnel (e.g. gateway co-located with the
 # container, or the dev-hal test setup in this repository).

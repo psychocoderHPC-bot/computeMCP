@@ -121,6 +121,13 @@ class TargetConfig:
     # compute node + port).  The first ``host:port`` token on stdout wins.
     provision_command: tuple[str, ...] = ()
     provision_timeout: float = 900.0
+    # Optional trusted release command (argv, no shell) that runs ON THE REMOTE
+    # machine over the live route connection to release the target (e.g.
+    # ``scancel`` the Slurm job).  It runs on an explicit stop, gateway shutdown
+    # and before a refresh, but NOT when a config reload removes a target.
+    # Advisory: a non-zero exit or timeout is logged and teardown proceeds.
+    close_command: tuple[str, ...] = ()
+    close_command_timeout: float = 120.0
     # Optional trusted recovery command (argv, no shell) that runs ON THE REMOTE
     # HOST (through the try-route ssh alias, plus proxy_jump) when the container
     # cannot be reached over the tunnel -- i.e. when ``probe`` of the forwarded
@@ -142,6 +149,10 @@ class TargetConfig:
         if self.provision_command and self.transport.kind != "tunnel":
             raise ConfigError(
                 f"target {self.name!r} provision_command requires tunnel transport"
+            )
+        if self.close_command and self.transport.kind != "tunnel":
+            raise ConfigError(
+                f"target {self.name!r} close_command requires tunnel transport"
             )
         if self.connect_command and self.transport.kind != "tunnel":
             raise ConfigError(
@@ -353,6 +364,10 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         provision_command=tuple(value.get("provision_command", ())),
         provision_timeout=_float(
             value.get("provision_timeout"), "provision_timeout", 900.0
+        ),
+        close_command=tuple(value.get("close_command", ())),
+        close_command_timeout=_float(
+            value.get("close_command_timeout"), "close_command_timeout", 120.0
         ),
         connect_command=tuple(value.get("connect_command", ())),
         connect_command_timeout=_float(
