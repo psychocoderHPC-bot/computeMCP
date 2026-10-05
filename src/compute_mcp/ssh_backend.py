@@ -121,6 +121,37 @@ class InteractiveSSHClient(asyncssh.SSHClient):
 # Backwards-compatible name used by earlier code paths / tests.
 PinnedHostKeyClient = InteractiveSSHClient
 
+# Maximum number of interactive factor prompts answered before giving up.
+# Mirrors ``Gateway.MAX_AUTH_PROMPTS`` so the route dial and the container dial
+# bound operator prompts identically.
+MAX_FACTOR_PROMPTS = 3
+
+
+def make_factor_prompter(secret: str) -> _Prompter:
+    """Return a prompter that answers every auth prompt with ``secret``.
+
+    Used for a per-request second factor (password / OTP) on the gateway ->
+    login-node (route) connection.  The same value is returned for password and
+    keyboard-interactive prompts; attempts are capped at
+    :data:`MAX_FACTOR_PROMPTS`, after which ``None`` is returned so the SSH
+    library stops instead of retrying forever.  The secret is never logged.
+    """
+    attempts = 0
+
+    async def prompter(prompt: str, echo: bool) -> str | None:
+        nonlocal attempts
+        attempts += 1
+        if attempts > MAX_FACTOR_PROMPTS:
+            log.warning(
+                "route authentication: giving up after %d interactive "
+                "attempt(s)",
+                MAX_FACTOR_PROMPTS,
+            )
+            return None
+        return secret
+
+    return prompter
+
 
 def _empty_known_hosts(host: str, addr, port) -> tuple:
     # AsyncSSH expects seven sequences: trusted/revoked public keys,
@@ -130,6 +161,77 @@ def _empty_known_hosts(host: str, addr, port) -> tuple:
 
 def _b64_normalize(value: str) -> str:
     return value.rstrip("=")
+
+
+async def dial_route(
+    *,
+    name: str,
+    host: str,
+    port: int,
+    username: str,
+    client_keys: list[str] | tuple[str, ...] | None,
+    passphrase: str | None,
+    prompter: _Prompter | None,
+    host_key_sha256: str | None,
+    known_hosts,
+    host_key_algorithms: tuple[str, ...],
+    host_key_check: str = "on",
+    connect_timeout: float = 10.0,
+    keepalive_interval: int = 30,
+    keepalive_count_max: int = 3,
+) -> asyncssh.SSHClientConnection:
+    """Dial the gateway -> login/route host (the hop before the container).
+
+    This is the route-first primitive node T2 (``tunnel.py``) calls before any
+    container endpoint exists.  Unlike :meth:`SSHBackend._dial` it takes raw
+    connection parameters instead of a :class:`TargetConfig`, and pins the
+    *route* host key (``host_key_sha256`` here) independently of the container
+    pin.
+
+    ``prompter`` supplies a per-request second factor.  Authentication /
+    2FA failures are wrapped in :class:`SSHError` with a message that says so
+    when a prompter or passphrase was supplied.
+    """
+    accept_any = host_key_check == "off"
+    pin = host_key_sha256
+
+    client_factory = lambda: InteractiveSSHClient(
+        pin, prompter, accept_any=accept_any
+    )
+
+    if known_hosts is not None:
+        selected_known_hosts = known_hosts
+    elif pin or accept_any:
+        # A pin or disabled verification must not consult the user's
+        # ~/.ssh/known_hosts; pass an empty trusted-key set so asyncssh still
+        # calls the client hook and host_key_algorithms can restrict negotiation.
+        selected_known_hosts = _empty_known_hosts
+    else:
+        # No explicit source and no pin: fall back to asyncssh's default
+        # (~/.ssh/known_hosts); the client hook then validates against it.
+        selected_known_hosts = None
+
+    try:
+        return await asyncssh.connect(
+            host,
+            port=port,
+            username=username,
+            client_keys=list(client_keys) if client_keys else None,
+            passphrase=passphrase,
+            known_hosts=selected_known_hosts,
+            client_factory=client_factory,
+            server_host_key_algs=host_key_algorithms or (),
+            connect_timeout=connect_timeout,
+            keepalive_interval=keepalive_interval,
+            keepalive_count_max=keepalive_count_max,
+        )
+    except (asyncssh.Error, OSError) as exc:
+        if prompter is not None or passphrase is not None:
+            raise SSHError(
+                f"SSH route connection to {name!r} failed during authentication "
+                f"(interactive/2FA may be required): {exc}"
+            ) from exc
+        raise SSHError(f"SSH route connection to {name!r} failed: {exc}") from exc
 
 
 class SSHBackend:
@@ -201,6 +303,7 @@ class SSHBackend:
         host: str,
         port: int,
         prompter: _Prompter | None = None,
+        passphrase: str | None = None,
     ) -> asyncssh.SSHClientConnection:
         # Only pass the interactive prompter when the target opts in; otherwise
         # authentication stays key/agent-only and no secret can be injected.
@@ -240,6 +343,7 @@ class SSHBackend:
                 port=port,
                 username=target.user,
                 client_keys=client_keys,
+                passphrase=passphrase,
                 known_hosts=known_hosts,
                 client_factory=client_factory,
                 server_host_key_algs=server_host_key_algs,

@@ -35,6 +35,13 @@ from .config import (
     load_config,
 )
 
+# Fallback HTTP client timeout for commands that do not know a provisioning
+# deadline (status, clients, reload, ...) and when no flag overrides it.
+DEFAULT_TIMEOUT = 60.0
+# Extra slack on top of a target's provision_timeout so the HTTP client waits
+# past the provisioning command's own deadline for the connect handshake.
+PROVISION_HANDSHAKE_MARGIN = 60.0
+
 
 def _resolve_gateway(config: GatewayConfig, override: str | None) -> str:
     if override:
@@ -79,6 +86,32 @@ def _resolve_token(config_path: str, token_file: str | None,
     )
 
 
+def _resolve_timeout(
+    args: argparse.Namespace,
+    config: GatewayConfig,
+    target_names: list[str],
+) -> float:
+    """Pick the HTTP client timeout for a connect/refresh request.
+
+    Precedence: the subcommand ``--timeout`` wins, then the global ``--timeout``,
+    then the longest ``provision_timeout`` among the named known targets plus a
+    handshake margin, and finally :data:`DEFAULT_TIMEOUT`.
+    """
+    action_timeout = getattr(args, "action_timeout", None)
+    if action_timeout is not None:
+        return action_timeout
+    if getattr(args, "timeout", None) is not None:
+        return args.timeout
+    provisions = [
+        config.targets[name].provision_timeout
+        for name in target_names
+        if name in config.targets and config.targets[name].provision_timeout > 0
+    ]
+    if provisions:
+        return max(provisions) + PROVISION_HANDSHAKE_MARGIN
+    return DEFAULT_TIMEOUT
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="computeMCP-gatewayctl")
     parser.add_argument(
@@ -93,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--client", default="admin",
                         help="client id whose token to use (default: admin)")
     parser.add_argument("--json", action="store_true", help="print raw JSON")
-    parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--timeout", type=float, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status", help="show targets and their state")
@@ -113,8 +146,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("target-connect", help="connect a target")
     p.add_argument("target")
+    p.add_argument("--2fa", dest="factor", metavar="SECRET",
+                   help="second factor (password/OTP) for interactive_auth targets")
+    p.add_argument("--timeout", dest="action_timeout", type=float,
+                   default=argparse.SUPPRESS, metavar="SECONDS",
+                   help="override the request timeout; default is the target's "
+                   "provision_timeout plus a margin")
     p = sub.add_parser("target-refresh", help="refresh a target")
     p.add_argument("target")
+    p.add_argument("--2fa", dest="factor", metavar="SECRET",
+                   help="second factor (password/OTP) for interactive_auth targets")
+    p.add_argument("--timeout", dest="action_timeout", type=float,
+                   default=argparse.SUPPRESS, metavar="SECONDS",
+                   help="override the request timeout; default is the target's "
+                   "provision_timeout plus a margin")
     p = sub.add_parser("target-stop", help="stop a target")
     p.add_argument("target")
 
@@ -148,11 +193,19 @@ class Control:
         if self._session:
             await self._session.close()
 
-    async def request(self, method: str, path: str) -> dict:
+    async def request(
+        self,
+        method: str,
+        path: str,
+        json_body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
         assert self._session is not None
+        effective_timeout = self.timeout if timeout is None else timeout
         async with self._session.request(
             method, f"{self.base}{path}",
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            json=json_body,
+            timeout=aiohttp.ClientTimeout(total=effective_timeout),
         ) as response:
             text = await response.text()
             if response.status >= 400:
@@ -165,7 +218,10 @@ async def _run(args: argparse.Namespace) -> int:
     base = _resolve_gateway(config, args.gateway)
     token = _resolve_token(args.config, args.token_file, args.client, args.token)
 
-    async with Control(base, token, args.timeout) as control:
+    default_timeout = (
+        args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
+    )
+    async with Control(base, token, default_timeout) as control:
         cmd = args.command
         if cmd == "targets":
             body = await control.request("GET", "/v1/targets")
@@ -203,22 +259,32 @@ async def _run(args: argparse.Namespace) -> int:
             )
             _emit(args, body, lambda b: f"denied {b['request_id']}")
         elif cmd == "target-connect":
-            body = await control.request("POST", f"/v1/targets/{args.target}/connect")
-            _emit(args, body, lambda b: f"{b['name']} -> {b['state']} ({b['active_route']})")
+            body = await control.request(
+                "POST", f"/v1/targets/{args.target}/connect",
+                json_body={"factor": args.factor} if args.factor is not None else None,
+                timeout=_resolve_timeout(args, config, [args.target]),
+            )
+            _emit_target(args, body)
         elif cmd == "target-refresh":
-            body = await control.request("POST", f"/v1/targets/{args.target}/refresh")
-            _emit(args, body, lambda b: f"{b['name']} -> {b['state']} ({b['active_route']})")
+            body = await control.request(
+                "POST", f"/v1/targets/{args.target}/refresh",
+                json_body={"factor": args.factor} if args.factor is not None else None,
+                timeout=_resolve_timeout(args, config, [args.target]),
+            )
+            _emit_target(args, body)
         elif cmd == "target-stop":
             body = await control.request("POST", f"/v1/targets/{args.target}/stop")
             _emit(args, body, lambda b: f"{b['name']} -> {b['state']}")
         elif cmd.startswith("client-"):
-            await _client_action(args, control, cmd[len("client-"):])
+            await _client_action(args, control, config, cmd[len("client-"):])
         else:
             raise SystemExit(f"unknown command: {cmd}")
     return 0
 
 
-async def _client_action(args, control: Control, action: str) -> None:
+async def _client_action(
+    args, control: Control, config: GatewayConfig, action: str
+) -> None:
     name = args.name
     body = await control.request("GET", f"/v1/clients/{name}")
     if action == "kill":
@@ -232,9 +298,14 @@ async def _client_action(args, control: Control, action: str) -> None:
         _emit_sessions(args, body)
         return
     targets = args.target and [args.target] or body["targets"]
+    request_timeout = (
+        _resolve_timeout(args, config, targets)
+        if action in ("connect", "refresh")
+        else None
+    )
     for target in targets:
         path = f"/v1/targets/{target}/{action}"
-        result = await control.request("POST", path)
+        result = await control.request("POST", path, timeout=request_timeout)
         if args.json:
             print(json.dumps(result, indent=2))
         else:
@@ -246,6 +317,17 @@ def _emit(args, body: dict, render) -> None:
         print(json.dumps(body, indent=2))
     else:
         print(render(body))
+
+
+def _emit_target(args, body: dict) -> None:
+    """Print a target state line plus any gateway warning (to stderr)."""
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return
+    print(f"{body['name']} -> {body['state']} ({body.get('active_route')})")
+    warning = body.get("warning")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
 
 
 def _emit_status(args, body: dict) -> None:

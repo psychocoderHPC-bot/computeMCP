@@ -248,6 +248,27 @@ def test_provision_command_rejected_for_direct():
         parse_config(raw)
 
 
+def test_close_command_parsed_with_timeout():
+    cfg = parse_config(
+        base_raw(close_command=["scancel", "--name", "job"], close_command_timeout=45)
+    )
+    t = cfg.targets["hal"]
+    assert t.close_command == ("scancel", "--name", "job")
+    assert t.close_command_timeout == 45.0
+
+
+def test_close_command_defaults_empty_and_timeout_120():
+    t = parse_config(base_raw()).targets["hal"]
+    assert t.close_command == ()
+    assert t.close_command_timeout == 120.0
+
+
+def test_close_command_rejected_for_direct():
+    raw = base_raw(transport="direct", ssh_targets=[], close_command=["scancel"])
+    with pytest.raises(ConfigError, match="close_command requires tunnel transport"):
+        parse_config(raw)
+
+
 def test_connect_command_parsed():
     cfg = parse_config(base_raw(connect_command=["/bin/up.sh"], connect_command_timeout=30))
     t = cfg.targets["hal"]
@@ -531,3 +552,36 @@ def test_append_token_hash_replaces_existing(tmp_path):
     append_token_hash(tok, "ci", "first")
     append_token_hash(tok, "ci", "second")
     assert load_tokens(tok)["ci"] == hash_token("second")
+
+
+# -- route_host_key_sha256 ---------------------------------------------------
+
+def test_route_host_key_sha256_absent_by_default():
+    cfg = parse_config(base_raw())
+    assert cfg.targets["hal"].route_host_key_sha256 is None
+
+
+def test_route_host_key_sha256_parsed_and_stripped():
+    raw = base_raw(route_host_key_sha256="  SHA256:abcdefghijklmnopqrstuvwxyz0123456789  ")
+    cfg = parse_config(raw)
+    assert (
+        cfg.targets["hal"].route_host_key_sha256
+        == "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+    )
+
+
+def test_route_host_key_sha256_malformed_rejected():
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(route_host_key_sha256="md5:abc"))
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(route_host_key_sha256="SHA256:x"))
+
+
+def test_route_host_key_sha256_normalized_like_container_pin():
+    # Both pins must apply the same validation/normalization rule.
+    good = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+    for field in ("host_key_sha256", "route_host_key_sha256"):
+        cfg = parse_config(base_raw(**{field: f"  {good}  "}))
+        assert getattr(cfg.targets["hal"], field) == good
+        with pytest.raises(ConfigError):
+            parse_config(base_raw(**{field: "not-a-pin"}))

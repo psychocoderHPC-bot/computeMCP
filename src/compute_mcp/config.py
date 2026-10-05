@@ -66,7 +66,7 @@ class TransportConfig:
     remote_port: int = 2222
     ssh_targets: tuple[str, ...] = ()
     # Optional ProxyJump alias for the gateway -> login-node hop, e.g.
-    # ``proxy_jump = "rosi5"`` results in ``ssh -J rosi5 <ssh_target>``.
+    # ``proxy_jump = "rosi5"`` dials ``rosi5`` first, then the route alias.
     proxy_jump: str | None = None
 
     def __post_init__(self) -> None:
@@ -88,6 +88,10 @@ class TargetConfig:
     client_key: str | None = None
     known_hosts: str | None = None
     host_key_sha256: str | None = None
+    # Optional SHA256 pin for the LOGIN/ROUTE host key, distinct from
+    # ``host_key_sha256`` which pins the CONTAINER host.  Used by the route-first
+    # connection (gateway -> login node) before any container exists.
+    route_host_key_sha256: str | None = None
     host_key_algorithms: tuple[str, ...] = ()
     # Host-key verification policy.  "on" (default) requires host_key_sha256 or
     # known_hosts and refuses to connect otherwise.  "off" explicitly disables
@@ -117,6 +121,13 @@ class TargetConfig:
     # compute node + port).  The first ``host:port`` token on stdout wins.
     provision_command: tuple[str, ...] = ()
     provision_timeout: float = 900.0
+    # Optional trusted release command (argv, no shell) that runs ON THE REMOTE
+    # machine over the live route connection to release the target (e.g.
+    # ``scancel`` the Slurm job).  It runs on an explicit stop, gateway shutdown
+    # and before a refresh, but NOT when a config reload removes a target.
+    # Advisory: a non-zero exit or timeout is logged and teardown proceeds.
+    close_command: tuple[str, ...] = ()
+    close_command_timeout: float = 120.0
     # Optional trusted recovery command (argv, no shell) that runs ON THE REMOTE
     # HOST (through the try-route ssh alias, plus proxy_jump) when the container
     # cannot be reached over the tunnel -- i.e. when ``probe`` of the forwarded
@@ -138,6 +149,10 @@ class TargetConfig:
         if self.provision_command and self.transport.kind != "tunnel":
             raise ConfigError(
                 f"target {self.name!r} provision_command requires tunnel transport"
+            )
+        if self.close_command and self.transport.kind != "tunnel":
+            raise ConfigError(
+                f"target {self.name!r} close_command requires tunnel transport"
             )
         if self.connect_command and self.transport.kind != "tunnel":
             raise ConfigError(
@@ -211,6 +226,14 @@ class TargetConfig:
                     f"target {self.name!r} host_key_sha256 must look like 'SHA256:...'"
                 )
             object.__setattr__(self, "host_key_sha256", fp)
+        if self.route_host_key_sha256 is not None:
+            fp = self.route_host_key_sha256.strip()
+            if not fp.startswith("SHA256:") or len(fp) < 12:
+                raise ConfigError(
+                    f"target {self.name!r} route_host_key_sha256 must look like "
+                    "'SHA256:...'"
+                )
+            object.__setattr__(self, "route_host_key_sha256", fp)
         if self.host_key_check not in ("on", "off"):
             raise ConfigError(
                 f"target {self.name!r} host_key_check must be 'on' or 'off'"
@@ -330,6 +353,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         client_key=value.get("client_key"),
         known_hosts=value.get("known_hosts"),
         host_key_sha256=value.get("host_key_sha256"),
+        route_host_key_sha256=value.get("route_host_key_sha256"),
         host_key_algorithms=tuple(value.get("host_key_algorithms", ())),
         host_key_check=value.get("host_key_check", "on"),
         connect_mode=value.get("connect_mode", "shared"),
@@ -340,6 +364,10 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         provision_command=tuple(value.get("provision_command", ())),
         provision_timeout=_float(
             value.get("provision_timeout"), "provision_timeout", 900.0
+        ),
+        close_command=tuple(value.get("close_command", ())),
+        close_command_timeout=_float(
+            value.get("close_command_timeout"), "close_command_timeout", 120.0
         ),
         connect_command=tuple(value.get("connect_command", ())),
         connect_command_timeout=_float(

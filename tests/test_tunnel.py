@@ -2,15 +2,12 @@
 #
 # SPDX-License-Identifier: ISC
 import asyncio
-import os
 import socket
-import stat
-import sys
-from pathlib import Path
 
 import pytest
 
 from compute_mcp.config import SSHConfig, TargetConfig, TransportConfig
+from compute_mcp.ssh_backend import SSHError
 from compute_mcp.tunnel import (
     TunnelError,
     TunnelManager,
@@ -18,57 +15,37 @@ from compute_mcp.tunnel import (
     probe,
 )
 
-FAKE_SSH = r'''
-import os, socket, sys, time, signal
 
-args = sys.argv[1:]
-_capture = os.environ.get("FAKE_SSH_ARGV")
-if _capture:
-    with open(_capture, "w") as _fh:
-        _fh.write(" ".join(args))
-if any("broken" in a for a in args):
-    sys.stderr.write("simulated failure\n")
-    sys.exit(255)
-
-local = None
-for i, a in enumerate(args):
-    if a == "-L":
-        spec = args[i + 1]
-        local = int(spec.split(":")[1])
-        break
-
-if local is None:
-    sys.exit(0)
-
-sock = socket.socket()
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind(("127.0.0.1", local))
-sock.listen(5)
-
-def _term(*_):
-    sock.close()
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, _term)
-
-while True:
-    try:
-        conn, _ = sock.accept()
-        conn.close()
-    except OSError:
-        break
-'''
+class _FakeRunResult:
+    def __init__(self, exit_status, stdout, stderr):
+        self.exit_status = exit_status
+        self.stdout = stdout
+        self.stderr = stderr
 
 
-@pytest.fixture
-def fake_ssh(tmp_path, monkeypatch):
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    exe = bindir / "ssh"
-    exe.write_text(f"#!{sys.executable}\n{FAKE_SSH}")
-    exe.chmod(exe.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ.get("PATH", ""))
-    return bindir
+class _FakeConn:
+    """Minimal asyncssh-connection stand-in for unit tests."""
+
+    def __init__(self, addr):
+        self._addr = addr
+        self._closed = False
+        self.forwarded = []
+
+    def is_closed(self):
+        return self._closed
+
+    def close(self):
+        self._closed = True
+
+    async def wait_closed(self):
+        return None
+
+    async def forward_local_port(self, host, port, dest_host, dest_port):
+        self.forwarded.append((host, port, dest_host, dest_port))
+        return object()
+
+    async def run(self, command, **kwargs):
+        return _FakeRunResult(0, b"", b"")
 
 
 def make_target(name, ssh_targets, host_key="SHA256:abcdefghijklmnopqrstuvwxyz0123456789"):
@@ -90,44 +67,107 @@ def test_allocate_loopback_port_avoids_reserved():
         allocate_loopback_port(ssh, reserved)
 
 
-async def test_failover_uses_first_working_route(fake_ssh):
+async def test_failover_uses_first_working_route(monkeypatch):
     mgr = TunnelManager(SSHConfig(internal_port_min=31200, internal_port_max=31300))
     target = make_target("hal", ["broken-route", "good-route"])
     seen = []
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        if kwargs["name"] == "broken-route":
+            raise SSHError("route broken")
+        return _FakeConn(("127.0.0.1", kwargs["port"]))
+
+    async def fake_probe(host, port, timeout=8.0):
+        # Only the working route's forward is considered reachable.
+        return port == 22 or port in mgr.reserved
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    # Make every allocated local port "reachable" so the failover picks the
+    # second route.
     tunnel = await mgr.connect(target, on_route=lambda r, e: seen.append(r))
     try:
         assert tunnel.route == "good-route"
         assert seen == ["broken-route"]
-        assert await probe("127.0.0.1", tunnel.local_port)
     finally:
         await tunnel.stop()
         mgr.release(tunnel)
 
 
-async def test_all_routes_fail(fake_ssh):
+async def test_all_routes_fail(monkeypatch):
     mgr = TunnelManager(SSHConfig(internal_port_min=31310, internal_port_max=31320))
     target = make_target("x", ["broken-a", "broken-b"])
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        raise SSHError("route broken")
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+
     with pytest.raises(TunnelError):
         await mgr.connect(target)
 
 
-async def test_stop_releases_port(fake_ssh):
+async def test_stop_releases_port(monkeypatch):
     mgr = TunnelManager(SSHConfig(internal_port_min=31330, internal_port_max=31340))
     target = make_target("hal", ["good-route"])
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    conn = _FakeConn(("127.0.0.1", 22))
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
     tunnel = await mgr.connect(target)
     port = tunnel.local_port
     assert port in mgr.reserved
+    assert tunnel.is_alive()
     await tunnel.stop()
     mgr.release(tunnel)
     assert port not in mgr.reserved
-    assert not await probe("127.0.0.1", port, timeout=1.0)
+    assert not tunnel.is_alive()
 
 
-async def test_proxy_jump_and_dynamic_endpoint_in_argv(fake_ssh, tmp_path, monkeypatch):
-    # Capture the argv the fake ssh is invoked with.
-    capture = tmp_path / "argv.txt"
-    monkeypatch.setenv("FAKE_SSH_ARGV", str(capture))
-
+async def test_proxy_jump_and_dynamic_endpoint_in_route(monkeypatch):
+    """ProxyJump chains and the provisioned endpoint flow through the route."""
     mgr = TunnelManager(SSHConfig(internal_port_min=31400, internal_port_max=31410))
     target = make_target("rosi5", ["rosi5-alias"])
     transport = TransportConfig(
@@ -137,16 +177,222 @@ async def test_proxy_jump_and_dynamic_endpoint_in_argv(fake_ssh, tmp_path, monke
         remote_host="cn123",
         remote_port=2345,
     )
+    dialed = []
+    run_calls = []
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        if alias == "rosi5-alias":
+            return {
+                "alias": alias,
+                "hostname": "127.0.0.1",
+                "user": "agent",
+                "port": 22,
+                "identityfiles": (),
+                "jumps": (
+                    {
+                        "alias": "rosi5",
+                        "hostname": "127.0.0.1",
+                        "user": "agent",
+                        "port": 2200,
+                        "identityfiles": (),
+                        "jumps": (),
+                    },
+                ),
+            }
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    class _SessionConn(_FakeConn):
+        async def run(self, command, **kwargs):
+            run_calls.append(command)
+            return _FakeRunResult(0, b"cn123:2345\n", b"")
+
+    jump_conn = _FakeConn(("127.0.0.1", 2200))
+    final_conn = _SessionConn(("127.0.0.1", 22))
+
+    async def fake_dial_route(**kwargs):
+        # The first (jump) hop has tunnel=None; the final hop is dialled by
+        # asyncssh directly in _dial_hop, so only the jump hits dial_route.
+        dialed.append((kwargs["name"], kwargs["port"]))
+        return jump_conn
+
+    async def fake_asyncssh_connect(host, **kwargs):
+        dialed.append((host, kwargs.get("port")))
+        assert kwargs.get("tunnel") is jump_conn
+        return final_conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.asyncssh.connect", fake_asyncssh_connect)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
     tunnel = await mgr.connect(target, transport=transport)
     try:
         assert tunnel.route == "rosi5-alias"
-        # the forwarded target must be the dynamically provisioned endpoint
-        argv_text = capture.read_text()
-        assert "cn123:2345" in argv_text
-        assert "-J" in argv_text and "rosi5" in argv_text
+        # With an explicit transport override (the endpoint is already known)
+        # provisioning is skipped, but the forward must still target the
+        # transport endpoint through the ProxyJump chain.
+        assert final_conn.forwarded == [
+            ("127.0.0.1", tunnel.local_port, "cn123", 2345)
+        ]
+        # The jump hop is dialled through dial_route, and the final route hop
+        # through asyncssh with tunnel=jump_conn.
+        assert dialed[0] == ("rosi5-alias", 2200)
+        assert dialed[1] == ("127.0.0.1", 22)
     finally:
         await tunnel.stop()
         mgr.release(tunnel)
+
+
+def _hop(alias, jumps=()):
+    return {
+        "alias": alias,
+        "hostname": "127.0.0.1",
+        "user": "agent",
+        "port": 22,
+        "identityfiles": (),
+        "jumps": tuple(jumps),
+    }
+
+
+async def test_open_for_route_honors_configured_proxy_jump(monkeypatch):
+    """An explicit ``proxy_jump`` dials one ordered two-hop chain."""
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("hal",), proxy_jump="jump_alias"
+        ),
+        client_key="/tmp/key",
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    routes = {"hal": _hop("hal"), "jump_alias": _hop("jump_alias")}
+
+    resolved = []
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        resolved.append(alias)
+        return routes[alias]
+
+    dialed = []
+    tunnels = []
+    returned = []
+
+    async def fake_dial_hop(info, **kwargs):
+        dialed.append(info["alias"])
+        tunnels.append(kwargs.get("tunnel"))
+        conn = _FakeConn((info["hostname"], info["port"]))
+        returned.append(conn)
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel._dial_hop", fake_dial_hop)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31700, internal_port_max=31710))
+    tunnel = await mgr.open_for_route(target, "hal", 31700)
+    try:
+        # The configured jump is dialed first, the route alias last.
+        assert dialed == ["jump_alias", "hal"]
+        assert len(dialed) == len(set(dialed))
+        assert set(resolved) == {"hal", "jump_alias"}
+        # Both hops share one connection chain (no duplicate dialing).
+        assert tunnels[0] is None
+        assert tunnels[1] is returned[0]
+        assert returned[1] is tunnel.connection
+    finally:
+        await tunnel.stop()
+
+
+async def test_open_for_route_proxy_jump_precedes_alias_own_chain(monkeypatch):
+    """The configured jump is composed ahead of the alias's own ProxyJump chain."""
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("hal",), proxy_jump="jump_alias"
+        ),
+        client_key="/tmp/key",
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    route_info = _hop(
+        "hal",
+        jumps=(_hop("hal_inner"),),
+    )
+    jump_info = _hop("jump_alias", jumps=(_hop("jump_outer"),))
+    routes = {"hal": route_info, "jump_alias": jump_info}
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return routes[alias]
+
+    dialed = []
+
+    async def fake_dial_hop(info, **kwargs):
+        dialed.append(info["alias"])
+        return _FakeConn((info["hostname"], info["port"]))
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel._dial_hop", fake_dial_hop)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31720, internal_port_max=31730))
+    tunnel = await mgr.open_for_route(target, "hal", 31720)
+    try:
+        assert dialed == ["jump_outer", "jump_alias", "hal_inner", "hal"]
+        assert len(dialed) == len(set(dialed))
+    finally:
+        await tunnel.stop()
+
+
+async def test_open_for_route_without_proxy_jump_is_single_hop(monkeypatch):
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(kind="tunnel", ssh_targets=("hal",)),
+        client_key="/tmp/key",
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    resolved = []
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        resolved.append(alias)
+        return _hop(alias)
+
+    dialed = []
+
+    async def fake_dial_hop(info, **kwargs):
+        dialed.append(info["alias"])
+        return _FakeConn((info["hostname"], info["port"]))
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel._dial_hop", fake_dial_hop)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31740, internal_port_max=31750))
+    tunnel = await mgr.open_for_route(target, "hal", 31740)
+    try:
+        assert dialed == ["hal"]
+        assert resolved == ["hal"]
+    finally:
+        await tunnel.stop()
 
 
 async def test_direct_transport_uses_endpoint(tmp_path):
@@ -181,10 +427,7 @@ def test_probe_times_out_on_closed_port():
     assert asyncio.run(probe("127.0.0.1", port, timeout=1.0)) is False
 
 
-async def test_run_connect_command_invokes_remote_ssh(fake_ssh, tmp_path, monkeypatch):
-    # The fake ssh records argv; with no -L it exits 0 (the command form).
-    capture = tmp_path / "connect_argv.txt"
-    monkeypatch.setenv("FAKE_SSH_ARGV", str(capture))
+async def test_run_connect_command_runs_over_route_connection():
     mgr = TunnelManager(SSHConfig(internal_port_min=31500, internal_port_max=31510))
     target = make_target("hal", ["hal"])
     import dataclasses
@@ -192,8 +435,241 @@ async def test_run_connect_command_invokes_remote_ssh(fake_ssh, tmp_path, monkey
     target = dataclasses.replace(
         target, connect_command=("/bin/up.sh", "--ensure")
     )
-    await mgr.run_connect_command(target, "hal")
-    text = capture.read_text()
-    # Runs on the remote host through the route, in -T mode, passing the command.
-    assert "-T" in text
-    assert "hal /bin/up.sh --ensure" in text
+    seen = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    await mgr.run_connect_command(target, "hal", connection=_Conn())
+    assert seen == ["/bin/up.sh --ensure"]
+
+
+async def test_run_connect_command_without_connection_is_noop(caplog):
+    mgr = TunnelManager(SSHConfig(internal_port_min=31520, internal_port_max=31530))
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(target, connect_command=("/bin/up.sh",))
+    with caplog.at_level("WARNING"):
+        await mgr.run_connect_command(target, "hal", connection=None)
+    assert "without a live route connection" in caplog.text
+
+
+async def test_provision_on_route_sets_endpoint(monkeypatch):
+    """Without a transport override, tunnel.connect provisions on the route."""
+    mgr = TunnelManager(SSHConfig(internal_port_min=31540, internal_port_max=31550))
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(
+        target, provision_command=("printf", "cn7:4321\n")
+    )
+
+    class _SessionConn(_FakeConn):
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(0, b"cn7:4321\n", b"")
+
+    conn = _SessionConn(("127.0.0.1", 22))
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target)
+    try:
+        assert tunnel.provisioned_endpoint == ("cn7", 4321)
+        assert conn.forwarded == [
+            ("127.0.0.1", tunnel.local_port, "cn7", 4321)
+        ]
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
+# ---------------------------------------------------------------------------
+# run_connect_command failure paths (advisory, never fatal)
+# ---------------------------------------------------------------------------
+
+async def test_run_connect_command_nonzero_exit_is_logged_not_raised(caplog):
+    mgr = TunnelManager(SSHConfig(internal_port_min=31600, internal_port_max=31610))
+    import dataclasses
+
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), connect_command=("/bin/up.sh",)
+    )
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(7, b"out\n", b"boom\n")
+
+    with caplog.at_level("WARNING"):
+        await mgr.run_connect_command(target, "hal", connection=_Conn())
+    assert "exited 7" in caplog.text
+    assert "boom" in caplog.text
+
+
+async def test_run_connect_command_exception_is_logged_not_raised(caplog):
+    mgr = TunnelManager(SSHConfig(internal_port_min=31610, internal_port_max=31620))
+    import dataclasses
+
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), connect_command=("/bin/up.sh",)
+    )
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            raise OSError("channel closed")
+
+    with caplog.at_level("WARNING"):
+        # Must not raise: recovery is advisory and the caller retries.
+        await mgr.run_connect_command(target, "hal", connection=_Conn())
+    assert "connect_command failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# run_close_command (advisory release, never fatal)
+# ---------------------------------------------------------------------------
+
+async def test_run_close_command_runs_shlex_quoted_with_timeout():
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31660, internal_port_max=31670))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]),
+        close_command=("scancel", "--name", "my job"),
+        close_command_timeout=45.0,
+    )
+    seen = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append((command, kwargs))
+            return _FakeRunResult(0, b"", b"")
+
+    await mgr.run_close_command(target, "hal", connection=_Conn())
+    assert len(seen) == 1
+    command, kwargs = seen[0]
+    # argv is shlex-quoted (the embedded space is protected).
+    assert command == "scancel --name 'my job'"
+    assert kwargs["timeout"] == 45.0
+    assert kwargs["check"] is False
+
+
+async def test_run_close_command_nonzero_exit_is_not_raised(caplog):
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31670, internal_port_max=31680))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), close_command=("scancel",)
+    )
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(9, b"out\n", b"nope\n")
+
+    with caplog.at_level("WARNING"):
+        await mgr.run_close_command(target, "hal", connection=_Conn())
+    assert "exited 9" in caplog.text
+    assert "nope" in caplog.text
+
+
+async def test_run_close_command_without_connection_is_noop(caplog):
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31680, internal_port_max=31690))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), close_command=("scancel",)
+    )
+    with caplog.at_level("WARNING"):
+        await mgr.run_close_command(target, "hal", connection=None)
+    assert "without a live route connection" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# open_for_route failure branches (fake route connection)
+# ---------------------------------------------------------------------------
+
+def _install_route(monkeypatch, conn, local_port):
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    return TunnelManager(
+        SSHConfig(internal_port_min=local_port, internal_port_max=local_port)
+    )
+
+
+async def test_open_for_route_provision_nonzero_closes_all(monkeypatch):
+    class _Conn(_FakeConn):
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(3, b"", b"nope")
+
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(target, provision_command=("provision",))
+    conn = _Conn(("127.0.0.1", 22))
+    mgr = _install_route(monkeypatch, conn, 31630)
+    with pytest.raises(TunnelError, match="exited 3"):
+        await mgr.open_for_route(target, "hal", 31630)
+    assert conn.is_closed()
+
+
+async def test_open_for_route_provision_no_endpoint_closes_all(monkeypatch):
+    class _Conn(_FakeConn):
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(0, b"nothing here\n", b"")
+
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(target, provision_command=("provision",))
+    conn = _Conn(("127.0.0.1", 22))
+    mgr = _install_route(monkeypatch, conn, 31640)
+    with pytest.raises(TunnelError, match="no .*endpoint"):
+        await mgr.open_for_route(target, "hal", 31640)
+    assert conn.is_closed()
+
+
+async def test_open_for_route_forward_failure_releases_port(monkeypatch):
+    class _Conn(_FakeConn):
+        async def forward_local_port(self, *args, **kwargs):
+            raise OSError("cannot bind")
+
+    target = make_target("hal", ["hal"])
+    conn = _Conn(("127.0.0.1", 22))
+    mgr = _install_route(monkeypatch, conn, 31650)
+    # connect() reserves a port, fails forwarding, and must release it again.
+    with pytest.raises(TunnelError, match="no working route"):
+        await mgr.connect(target)
+    assert conn.is_closed()
+    assert mgr.reserved == frozenset()

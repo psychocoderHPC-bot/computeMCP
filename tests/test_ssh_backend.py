@@ -112,3 +112,117 @@ def test_shquote_escapes():
 
     assert _shquote("abc") == "'abc'"
     assert _shquote("a'b") == "'a'\\''b'"
+
+
+# -- route dial: known_hosts selection and prompter threading ---------------
+
+class _FakeSSHClient:
+    def is_closed(self):
+        return False
+
+
+async def _capture_dial_route(monkeypatch, **kwargs):
+    seen = {}
+
+    async def fake_connect(host, **connect_kwargs):
+        seen["host"] = host
+        seen.update(connect_kwargs)
+        return _FakeSSHClient()
+
+    monkeypatch.setattr(
+        "compute_mcp.ssh_backend.asyncssh.connect", fake_connect
+    )
+    from compute_mcp.ssh_backend import dial_route
+
+    defaults = dict(
+        name="route",
+        host="127.0.0.1",
+        port=22,
+        username="agent",
+        client_keys=None,
+        passphrase=None,
+        prompter=None,
+        host_key_sha256=None,
+        known_hosts=None,
+        host_key_algorithms=(),
+        host_key_check="on",
+    )
+    defaults.update(kwargs)
+    await dial_route(**defaults)
+    return seen
+
+
+async def test_dial_route_pin_uses_empty_trusted_set(monkeypatch):
+    from compute_mcp.ssh_backend import _empty_known_hosts
+
+    async def prompter(prompt, echo):
+        return "SECRET"
+
+    seen = await _capture_dial_route(
+        monkeypatch,
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+        prompter=prompter,
+        passphrase="PASSPHRASE",
+    )
+    # A pin must not silently fall back to ~/.ssh/known_hosts: an empty trusted
+    # set is passed so asyncssh still drives the client validation hook.
+    assert seen["known_hosts"] is _empty_known_hosts
+    assert seen["passphrase"] == "PASSPHRASE"
+    # The prompter is threaded into the client factory, not dropped.
+    client = seen["client_factory"]()
+    assert await client.password_auth_requested() == "SECRET"
+
+
+async def test_dial_route_without_pin_defers_known_hosts(monkeypatch):
+    seen = await _capture_dial_route(monkeypatch, host_key_sha256=None)
+    # No pin and no explicit known_hosts -> asyncssh default (None).
+    assert seen["known_hosts"] is None
+
+
+async def test_dial_route_explicit_known_hosts_wins(monkeypatch):
+    sentinel = lambda *a: ((), (), (), (), (), (), ())
+    seen = await _capture_dial_route(
+        monkeypatch,
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+        known_hosts=sentinel,
+    )
+    assert seen["known_hosts"] is sentinel
+
+
+async def test_dial_route_accept_any_uses_empty_trusted_set(monkeypatch):
+    from compute_mcp.ssh_backend import _empty_known_hosts
+
+    seen = await _capture_dial_route(
+        monkeypatch, host_key_check="off", host_key_sha256=None
+    )
+    assert seen["known_hosts"] is _empty_known_hosts
+
+
+# -- make_factor_prompter ----------------------------------------------------
+
+async def test_factor_prompter_answers_password_and_kbdint():
+    from compute_mcp.ssh_backend import make_factor_prompter
+
+    prompter = make_factor_prompter("SECRET")
+    assert await prompter("Password: ", False) == "SECRET"
+    assert await prompter("OTP code: ", True) == "SECRET"
+
+
+async def test_factor_prompter_caps_at_three():
+    from compute_mcp.ssh_backend import make_factor_prompter
+
+    prompter = make_factor_prompter("SECRET")
+    answers = [await prompter("p", False) for _ in range(5)]
+    assert answers[:3] == ["SECRET", "SECRET", "SECRET"]
+    assert answers[3:] == [None, None]
+
+
+async def test_factor_prompter_never_leaks_secret_in_repr(caplog):
+    from compute_mcp.ssh_backend import make_factor_prompter
+
+    prompter = make_factor_prompter("TOP-SECRET")
+    with caplog.at_level("DEBUG"):
+        for _ in range(4):
+            await prompter("Password: ", False)
+    assert "TOP-SECRET" not in repr(prompter)
+    assert "TOP-SECRET" not in caplog.text
