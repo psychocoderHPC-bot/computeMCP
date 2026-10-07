@@ -226,3 +226,35 @@ async def test_factor_prompter_never_leaks_secret_in_repr(caplog):
             await prompter("Password: ", False)
     assert "TOP-SECRET" not in repr(prompter)
     assert "TOP-SECRET" not in caplog.text
+
+
+async def test_empty_route_user_uses_asyncssh_sentinel(monkeypatch):
+    """An empty user must be passed as (), not None.
+
+    asyncssh's "unset" sentinel is ``()`` (fall back to the SSH config alias /
+    local account); passing ``None`` raises TypeError inside saslprep.
+    """
+    from compute_mcp.ssh_backend import dial_route
+
+    seen = {}
+
+    async def fake_connect(host, **connect_kwargs):
+        seen.update(connect_kwargs)
+        return _FakeSSHClient()
+
+    monkeypatch.setattr("compute_mcp.ssh_backend.asyncssh.connect", fake_connect)
+    await dial_route(
+        name="route",
+        host="127.0.0.1",
+        port=22,
+        username=(),
+        client_keys=None,
+        passphrase=None,
+        prompter=None,
+        host_key_sha256=None,
+        known_hosts=None,
+        host_key_algorithms=(),
+        host_key_check="on",
+    )
+    assert seen["username"] == ()
+    assert seen["username"] is not None

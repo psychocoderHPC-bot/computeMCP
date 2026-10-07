@@ -326,7 +326,9 @@ async def _dial_hop(
     """Dial one route hop, optionally through an already-open jump connection."""
     host = info["hostname"]
     port = info["port"]
-    username = info["user"] or fallback_user or None
+    # asyncssh's "unset" sentinel is (), not None: passing None crashes in
+    # saslprep.  An empty user lets the SSH config alias / local account decide.
+    username = info["user"] or fallback_user or ()
     keys = list(client_keys) if client_keys else None
     if tunnel is None:
         # First hop: use the dedicated route primitive (pin + prompter aware).

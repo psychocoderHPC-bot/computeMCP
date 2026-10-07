@@ -168,7 +168,7 @@ async def dial_route(
     name: str,
     host: str,
     port: int,
-    username: str,
+    username: str | tuple,
     client_keys: list[str] | tuple[str, ...] | None,
     passphrase: str | None,
     prompter: _Prompter | None,
@@ -341,7 +341,7 @@ class SSHBackend:
             return await asyncssh.connect(
                 host,
                 port=port,
-                username=target.user or None,
+                username=target.user or (),
                 client_keys=client_keys,
                 passphrase=passphrase,
                 known_hosts=known_hosts,

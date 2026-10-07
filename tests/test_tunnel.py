@@ -825,3 +825,33 @@ def test_format_provision_env_rejects_nul():
         format_provision_env({"COMPUTEMCP_X": "a\x00b"})
     with pytest.raises(TunnelError, match="NUL"):
         format_provision_env({"COMPUTEMCP_X\x00": "a"})
+
+
+async def test_dial_hop_empty_user_uses_asyncssh_sentinel(monkeypatch):
+    """An empty target user must reach asyncssh as (), never None.
+
+    _dial_hop resolves the username from the SSH config alias then the target
+    fallback; when both are empty it must pass asyncssh's () sentinel so the
+    local account is used, because None raises inside saslprep.
+    """
+    from compute_mcp import tunnel as tunnel_module
+    from compute_mcp.config import SSHConfig
+
+    seen = {}
+
+    async def fake_dial_route(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(tunnel_module, "dial_route", fake_dial_route)
+    await tunnel_module._dial_hop(
+        {"hostname": "127.0.0.1", "port": 22, "user": ""},
+        tunnel=None,
+        client_keys=[],
+        prompter=None,
+        pin=None,
+        ssh=SSHConfig(),
+        name="route",
+        fallback_user="",
+    )
+    assert seen["username"] == ()

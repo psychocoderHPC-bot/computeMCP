@@ -141,8 +141,8 @@ Create a dedicated gateway-to-container key (never the user's normal key):
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/computemcp_container -C computeMCP-gateway
-# install only the .pub half in the remote development containers, as the
-# `authorized_keys` of the target `user` (default "agent"):
+# install the .pub half in the remote development container as the
+# `authorized_keys` of the container login user (the bundle uses "agent"):
 ssh-copy-id -i ~/.ssh/computemcp_container.pub agent@<container-host>
 ```
 
@@ -281,7 +281,9 @@ Notes and invariants:
 - **Driver policy:** the NVIDIA kernel driver lives on the host and MUST NOT be
   installed inside the container. Verify with `docker exec computeMCP-container nvidia-smi`.
 - The `agent` user, `sudo` without password, and key-only auth (no passwords, no
-  root login) match the gateway's default target (`user = "agent"`).
+  root login) match the container login the gateway dials (the bundle sets the
+  container user to `agent`; the gateway `user` field stays empty and lets the
+  SSH config decide).
 - **Single `agent` user, no duplicate uid.** The entrypoint reuses (renames) the
   base account that already owns `AGENT_UID` instead of `useradd -o`-ing a second
   one, so the SSH login and `whoami` both resolve to `agent` rather than the stock
