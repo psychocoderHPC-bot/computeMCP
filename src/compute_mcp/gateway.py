@@ -29,6 +29,7 @@ from .allocation import (
     render_args,
     validate_conflicts,
 )
+from .bundle import BundleError, public_key_for
 from .config import (
     ConfigError,
     GatewayConfig,
@@ -113,6 +114,16 @@ def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> d
     env["COMPUTEMCP_SANDBOX"] = (
         "true" if container is not None and container.sandbox else "false"
     )
+    # A deployed bundle target gets the container's authorized public key derived
+    # from the target's SSH client key, so no per-site key placement is needed.
+    # An explicit provision_command target keeps the previous environment.
+    if target.bundle is not None:
+        try:
+            public_key = public_key_for(target)
+        except BundleError as exc:
+            raise ConfigError(str(exc)) from exc
+        if public_key:
+            env["COMPUTEMCP_SSH_PUBLIC_KEY"] = public_key
     # A shell string cannot carry NUL or carriage return; refuse both here
     # (HTTP 400 at the edge) rather than let them reach the trusted provision
     # command (a CR in a value could smuggle an extra shell line).  LF stays
@@ -326,6 +337,7 @@ class Gateway:
             or target.allocation is not None
             or target.slurm is not None
             or target.container is not None
+            or target.bundle is not None
         )
 
     def _resolve_allocation(

@@ -2432,6 +2432,59 @@ def _allocation_gateway(**target_overrides):
     return gw, target
 
 
+def test_build_provision_env_includes_derived_public_key_for_bundle(tmp_path):
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.config import BundleConfig, ContainerConfig
+    from compute_mcp.config import TransportConfig as TR
+    from compute_mcp.gateway import build_provision_env
+
+    key = tmp_path / "id_ed25519"
+    key.write_text("PRIVATE\n")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA test@host\n")
+    target = _allocation_target(
+        client_key=str(key),
+        transport=TR(kind="tunnel", ssh_targets=("hal",), remote_port=2222),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_SSH_PUBLIC_KEY"] == "ssh-ed25519 AAAA test@host"
+
+
+def test_build_provision_env_omits_public_key_without_bundle(tmp_path):
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    key = tmp_path / "id_ed25519"
+    key.write_text("PRIVATE\n")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA test@host\n")
+    target = _allocation_target(client_key=str(key))
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert "COMPUTEMCP_SSH_PUBLIC_KEY" not in env
+
+
+def test_env_configured_includes_bundle_only_target():
+    from compute_mcp.config import BundleConfig, ContainerConfig
+    from compute_mcp.config import TargetConfig as TC
+    from compute_mcp.config import TransportConfig as TR
+
+    target = TC(
+        name="b",
+        user="agent",
+        transport=TR(kind="tunnel", ssh_targets=("b",)),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+        container=ContainerConfig(runtime="apptainer", storage_root="/scratch/b"),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    assert Gateway._env_configured(target) is True
+
+
 def test_build_provision_env_exact_contract():
     from compute_mcp.allocation import compute_plan, render_args
     from compute_mcp.gateway import build_provision_env

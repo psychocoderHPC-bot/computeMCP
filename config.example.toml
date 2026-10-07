@@ -253,11 +253,23 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # ---------------------------------------------------------------------------
 # Slurm target: Apptainer container inside the allocation
 #
-# A Slurm-allocation target that uses the shipped provisioning bundle
-# (scripts/computemcp-slurm/).  The gateway computes the resource plan on the
-# host, renders the per-stage Slurm arguments, and exports them as
-# COMPUTEMCP_SBATCH_ARGS / COMPUTEMCP_SRUN_ARGS (and the plan/container
-# variables) around the provision_command.
+# A Slurm-allocation target that uses the shipped provisioning bundle.  The
+# gateway computes the resource plan on the host, renders the per-stage Slurm
+# arguments, and exports them as COMPUTEMCP_SBATCH_ARGS / COMPUTEMCP_SRUN_ARGS
+# (and the plan/container variables) around the provisioning command.
+#
+# With a [targets.X.bundle] block the gateway deploys the bundle itself.  It
+# opens the route connection, uploads the four helper files into deploy-dir over
+# SFTP only when the remote content marker differs, derives the container's
+# authorized public key from client_key, and runs the deployed helper.  The
+# copy is versioned: after a gateway upgrade the changed bundle is re-deployed
+# on the next connect.  The deploy directory must be on storage visible to the
+# login AND compute nodes (the batch step runs the container script there), so
+# it defaults to <container.storage-root>/bundle; /tmp is not shared on most
+# clusters and is a poor choice.
+#
+# Without a [bundle] block, set provision_command/close_command yourself and
+# place the bundle on the target by hand, as before.
 #
 # The bundle is config-driven: it builds the sandbox if missing, submits a
 # single-node allocation, starts the container, and runs a relay from the
@@ -277,10 +289,17 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_algorithms = ["ssh-ed25519"]
 # sharing = "exclusive"                 # a whole Slurm allocation is ours
 # auto_connect = true
-# provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
-# close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
 # # The operator CLI wait for connect/refresh is provision_timeout + margin.
 # provision_timeout = 960.0
+#
+# # Let the gateway deploy and run the shipped bundle.  deploy-dir is optional
+# # and defaults to <container.storage-root>/bundle.  auto-deploy = true
+# # (default) uploads when the content marker differs; set it to false to pin
+# # the copy already deployed on the login node, even after a gateway upgrade.
+# [targets.rosi.bundle]
+# source = "computemcp-slurm"
+# # deploy-dir = "/scratch/USER/computemcp/bundle"
+# # auto-deploy = true
 #
 # # Allocatable resources of one compute node (descriptions, not constraints;
 # # all fields are optional).  cpus are Slurm CPUs under the site/SMT policy,
@@ -373,9 +392,11 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 # host_key_algorithms = ["ssh-ed25519"]
 # auto_connect = false
-# provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
-# close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
 # provision_timeout = 600.0
+#
+# [targets.cpuhost.bundle]
+# source = "computemcp-slurm"
+# # deploy-dir = "/scratch/USER/computemcp/bundle"
 #
 # [targets.cpuhost.node]
 # cpus = 16

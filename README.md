@@ -37,7 +37,7 @@ src/compute_mcp/
   mcp_server.py   MCP server (stdio) exposing computeMCP_* tools
   control.py      computeMCP-gatewayctl operator CLI
 tests/            unit tests (see `pytest -q`)
-scripts/computemcp-slurm/  Slurm provisioning bundle (see its README)
+scripts/computemcp-slurm/  Slurm provisioning bundle (packaged under src, symlinked; see its README)
 config.example.toml
 systemd/computeMCP-gateway.service
 ```
@@ -775,6 +775,26 @@ Describes the container runtime for the provisioning bundle.
 | `host-home` | string | Host directory carrying `.ssh/authorized_keys` that the container trusts |
 | `sandbox` | boolean | Informational flag; the helper reads the actual sandbox path |
 
+### `[targets.X.bundle]`
+
+Tells the gateway to deploy the shipped provisioning bundle over the route
+connection and run it from there. No hand-placed copy is needed, and the
+container's authorized public key is derived from `client_key`.
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `source` | string | Bundled identifier. Currently `computemcp-slurm` |
+| `deploy-dir` | string | Remote absolute directory on shared storage. Defaults to `<container.storage-root>/bundle` |
+| `auto-deploy` | boolean | Default `true`: upload when the remote content marker differs. `false` pins the already-deployed copy, even after a gateway upgrade |
+
+The deploy directory must be visible to the login node (which runs
+`computemcp-provision.sh` and builds the container) and to the compute node
+(which runs `computemcp-job.sh` and starts the container). On most clusters
+`/tmp` is per-node and not shared, so the default lives under `storage-root`.
+The gateway writes files atomically and never touches `authorized_keys`,
+allocation state, or a running job. Set `provision_command`/`close_command`
+explicitly to manage the bundle by hand instead.
+
 ### Worked example: GPU target with Apptainer (ROSI illustration)
 
 This template mirrors the design-document ROSI illustration: one GPU per
@@ -794,9 +814,17 @@ host_key_algorithms = ["ssh-ed25519"]
 host_key_check = "on"
 auto_connect = true
 sharing = "exclusive"
-provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
-close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
 provision_timeout = 960.0
+
+# Let the gateway deploy and run the shipped bundle over the route connection.
+# The upload is skipped when the remote content marker matches; after a gateway
+# upgrade the changed bundle is re-deployed on the next connect.  deploy-dir
+# defaults to <container.storage-root>/bundle and must be on storage visible to
+# login and compute nodes.
+[targets.rosi.bundle]
+source = "computemcp-slurm"
+# deploy-dir = "/scratch/USER/computemcp/bundle"
+# auto-deploy = true          # false pins the copy already on the login node
 
 # Node capacities.  The numbers mirror the reviewed ROSI PIConGPU template,
 # not current verified cluster hardware:
@@ -880,9 +908,10 @@ host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 host_key_algorithms = ["ssh-ed25519"]
 auto_connect = false
 sharing = "unknown"
-provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
-close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
 provision_timeout = 600.0
+
+[targets.cpuhost.bundle]
+source = "computemcp-slurm"
 
 # Node capacities: no GPUs described.
 [targets.cpuhost.node]

@@ -28,6 +28,16 @@ computeMCP-handshake = "compute_mcp.handshake:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The deployment bundles ship as package data so the gateway can upload the
+# exact revision it was built from.  Without this, an installed wheel would
+# have no bundle directory and auto-deploy would fail.
+[tool.setuptools.package-data]
+"compute_mcp.bundles" = [
+    "computemcp-slurm/*.sh",
+    "computemcp-slurm/*.py",
+    "computemcp-slurm/README.md",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

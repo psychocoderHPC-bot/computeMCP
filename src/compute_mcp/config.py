@@ -96,6 +96,11 @@ MAPPING_VOCABULARY: dict[str, frozenset[str]] = {
     "exclusive": frozenset({"exclusive"}),
 }
 
+# Bundle identifiers shipped inside the ``compute_mcp.bundles`` package.  The
+# gateway deploys the exact revision it was built from; a target names one of
+# these instead of pointing provision_command at a hand-placed copy.
+KNOWN_BUNDLES = ("computemcp-slurm",)
+
 
 @dataclass(frozen=True)
 class NodeConfig:
@@ -233,6 +238,37 @@ class ContainerConfig:
             if invalid:
                 raise ConfigError("container.gpus entries must be non-empty strings")
             object.__setattr__(self, "gpus", vendors)
+
+
+@dataclass(frozen=True)
+class BundleConfig:
+    """Deployable helper bundle for a target.
+
+    ``source`` names a bundle shipped in the ``compute_mcp.bundles`` package.
+    ``deploy_dir`` is the remote directory on storage visible to login and
+    compute nodes; the gateway derives a default from the container
+    ``storage_root`` when it is unset.  ``auto_deploy`` controls whether the
+    gateway uploads the bundle when the remote hash marker differs; setting it
+    to false pins whatever copy is already deployed.
+    """
+
+    source: str
+    deploy_dir: str | None = None
+    auto_deploy: bool = True
+
+    def __post_init__(self) -> None:
+        if self.source not in KNOWN_BUNDLES:
+            raise ConfigError(
+                f"bundle.source must be one of {', '.join(KNOWN_BUNDLES)}, "
+                f"got {self.source!r}"
+            )
+        if self.deploy_dir is not None:
+            if not isinstance(self.deploy_dir, str) or not self.deploy_dir.strip():
+                raise ConfigError("bundle.deploy_dir must be a non-empty string")
+            if not self.deploy_dir.startswith("/"):
+                raise ConfigError("bundle.deploy_dir must be an absolute path")
+        if not isinstance(self.auto_deploy, bool):
+            raise ConfigError("bundle.auto_deploy must be true or false")
 
 
 def _validate_slurm_mapping(mapping: dict, stage: str, options: dict, target: str) -> None:
@@ -431,6 +467,25 @@ def _load_container_config(name: str, value: dict | None) -> ContainerConfig | N
     )
 
 
+def _load_bundle_config(name: str, value: dict | None) -> BundleConfig | None:
+    if value is None:
+        return None
+    key = f"[targets.{name}.bundle]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a table")
+    unknown = sorted(set(value) - {"source", "deploy-dir", "auto-deploy"})
+    if unknown:
+        raise ConfigError(f"{key} has unknown key(s): {', '.join(unknown)}")
+    source = value.get("source")
+    if source is None:
+        raise ConfigError(f"{key} requires 'source'")
+    return BundleConfig(
+        source=source,
+        deploy_dir=value.get("deploy-dir"),
+        auto_deploy=value.get("auto-deploy", True),
+    )
+
+
 @dataclass(frozen=True)
 class TargetConfig:
     name: str
@@ -506,6 +561,7 @@ class TargetConfig:
     allocation: AllocationConfig | None = None
     slurm: SlurmConfig | None = None
     container: ContainerConfig | None = None
+    bundle: BundleConfig | None = None
 
     def __post_init__(self) -> None:
         if self.provision_command and self.transport.kind != "tunnel":
@@ -520,6 +576,17 @@ class TargetConfig:
             raise ConfigError(
                 f"target {self.name!r} connect_command requires tunnel transport"
             )
+        if self.bundle is not None and self.transport.kind != "tunnel":
+            raise ConfigError(
+                f"target {self.name!r} bundle requires tunnel transport"
+            )
+        if self.bundle is not None:
+            if not self.bundle.deploy_dir:
+                if self.container is None or not self.container.storage_root:
+                    raise ConfigError(
+                        f"target {self.name!r} bundle needs 'deploy-dir' or a "
+                        "container 'storage-root' to derive it from"
+                    )
         if self.connect_command_mode not in ("on_failure", "always"):
             raise ConfigError(
                 f"target {self.name!r} connect_command_mode must be "
@@ -751,6 +818,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         allocation=_load_allocation_config(name, value.get("allocation")),
         slurm=_load_slurm_config(name, value.get("slurm")),
         container=_load_container_config(name, value.get("container")),
+        bundle=_load_bundle_config(name, value.get("bundle")),
     )
 
 

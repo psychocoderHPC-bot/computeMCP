@@ -504,10 +504,110 @@ async def test_provision_on_route_sets_endpoint(monkeypatch):
         mgr.release(tunnel)
 
 
+async def test_bundle_target_deploys_and_runs_derived_argv(monkeypatch):
+    """A bundle target deploys over the route, then runs the deployed helper."""
+    import dataclasses
+
+    from compute_mcp import bundle as bundle_module
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31560, internal_port_max=31570))
+    target = make_target("rosi", ["rosi"])
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("rosi",), remote_port=2222
+        ),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+
+    commands: list[str] = []
+    deployed: list[str] = []
+
+    async def fake_ensure(conn, tgt, **kwargs):
+        deployed.append(bundle_module.resolve_deploy_dir(tgt))
+        return deployed[-1]
+
+    monkeypatch.setattr(bundle_module, "ensure_deployed", fake_ensure)
+
+    class _SessionConn(_FakeConn):
+        async def run(self, command, **kwargs):
+            commands.append(command)
+            return _FakeRunResult(0, b"cn9:4321\n", b"")
+
+    conn = _SessionConn(("127.0.0.1", 22))
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target)
+    try:
+        assert deployed == ["/scratch/agent/computemcp/bundle"]
+        provision = next(c for c in commands if "computemcp-provision.sh" in c)
+        assert provision.endswith(
+            "/scratch/agent/computemcp/bundle/computemcp-provision.sh provision"
+        )
+        assert tunnel.provisioned_endpoint == ("cn9", 4321)
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
+async def test_close_command_derives_bundle_stop_when_unset(monkeypatch):
+    """A bundle target without close_command releases the allocation via the bundle."""
+    import dataclasses
+
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31580, internal_port_max=31590))
+    target = make_target("rosi", ["rosi"])
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("rosi",), remote_port=2222
+        ),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+
+    seen: list[str] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    await mgr.run_close_command(target, "rosi", connection=_Conn())
+    assert seen and seen[0].endswith(
+        "/scratch/agent/computemcp/bundle/computemcp-provision.sh stop"
+    )
+
+
 # ---------------------------------------------------------------------------
 # run_connect_command failure paths (advisory, never fatal)
 # ---------------------------------------------------------------------------
-
 async def test_run_connect_command_nonzero_exit_is_logged_not_raised(caplog):
     mgr = TunnelManager(SSHConfig(internal_port_min=31600, internal_port_max=31610))
     import dataclasses

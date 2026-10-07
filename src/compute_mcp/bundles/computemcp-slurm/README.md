@@ -15,8 +15,21 @@ the container, submits one single-node allocation, starts a relay, and prints
 | `computemcp-job.sh` | Batch script that runs on the compute node and keeps the allocation alive |
 | `computemcp-relay.py` | Loopback relay that carries SSH over `srun` steps |
 
-Place the four code files side by side on storage visible to login and compute
-nodes.  No site name, account, partition, image, or path is hardcoded.
+The gateway ships this bundle as package data and can deploy it for you: a
+`[targets.X.bundle]` block in the gateway config makes the gateway upload the
+files over the route connection into `deploy-dir`, then run
+`computemcp-provision.sh` from there.  The upload happens only when the remote
+content marker differs from the gateway's bundle hash, so a repeat connect moves
+no bytes and a gateway upgrade re-deploys the new revision on the next connect.
+Set `auto-deploy = false` to pin the copy already on the login node.
+
+`deploy-dir` is optional and defaults to `<container.storage-root>/bundle`.  It
+must be on storage visible to the login node and to the compute nodes: the batch
+step runs `computemcp-job.sh` and `computemcp-container.sh` there, so a per-node
+`/tmp` breaks multi-node and most batch setups.  Place the four code files side
+by side only when you manage deployment by hand (the manual
+`provision_command`/`close_command` path).  No site name, account, partition,
+image, or path is hardcoded either way.
 
 ## Login-node requirements
 
@@ -32,9 +45,13 @@ nodes need the same runtime and `python3`.
 [targets.example]
 ssh_targets = ["example-login"]
 user = "agent"
-provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
-close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
 provision_timeout = 960.0
+
+# Let the gateway deploy and run this bundle; no manual copy or command.
+[targets.example.bundle]
+source = "computemcp-slurm"
+# deploy-dir = "/scratch/agent/computemcp/bundle"   # default <storage-root>/bundle
+# auto-deploy = true                                # false pins the deployed copy
 
 [targets.example.node]
 cpus = 24
@@ -62,10 +79,24 @@ host-home = "/scratch/agent/computemcp/home"
 sandbox = true
 ```
 
-`provision_command` and `close_command` must point at the same bundle.  Replace
-the placeholder target, partition, and paths with site values.
+`COMPUTEMCP_SSH_PUBLIC_KEY` is derived by the gateway from the target's
+`client_key` (the `.pub` half, or `ssh-keygen -y`); the private key stays on the
+gateway host.  An explicit `provision_command` target keeps the older behavior:
+the operator places the key, or the helper reuses an existing
+`authorized_keys`.
+
+`provision_command` and `close_command` are only needed for manual deployment; a
+`[bundle]` block replaces them, and the gateway derives the command from
+`deploy-dir`.  Replace the placeholder target, partition, and paths with site
+values.
 
 ### Gateway keys to behavior
+
+| `[targets.X.bundle]` key | Behavior |
+| --- | --- |
+| `source` | Which shipped bundle to deploy. Currently `computemcp-slurm` |
+| `deploy-dir` | Remote directory; defaults to `<storage-root>/bundle`. Overwritten only when the content marker differs |
+| `auto-deploy` | `true` (default) re-deploys on a hash change; `false` pins the deployed copy |
 
 | `[targets.X.container]` key | Behavior |
 | --- | --- |
@@ -115,9 +146,11 @@ helper only configures it.
 
 The SSH public key comes from `COMPUTEMCP_SSH_PUBLIC_KEY`, then
 `COMPUTEMCP_SSH_PUBLIC_KEY_FILE`, then an existing
-`$COMPUTEMCP_HOST_HOME/.ssh/authorized_keys`.  The gateway should inject one of
-the first two.  Public-key-only access, per-user UID checks, and symlink-safe
-config writes are preserved from the reference scripts.
+`$COMPUTEMCP_HOST_HOME/.ssh/authorized_keys`.  A `[bundle]` target gets
+`COMPUTEMCP_SSH_PUBLIC_KEY` derived from the gateway `client_key`, so no manual
+placement is needed; an explicit `provision_command` target relies on the other
+two.  Public-key-only access, per-user UID checks, and symlink-safe config
+writes are preserved from the reference scripts.
 
 ## SBATCH and SRUN argument transport
 

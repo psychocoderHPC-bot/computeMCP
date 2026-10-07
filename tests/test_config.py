@@ -996,3 +996,83 @@ def test_back_compat_config_without_new_tables_loads():
     cfg = parse_config(raw)
     assert cfg.targets["x"].node is None
     assert cfg.include_paths == ()
+
+
+def test_bundle_block_defaults():
+    cfg = parse_config(
+        base_raw(
+            container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+            bundle={"source": "computemcp-slurm"},
+        )
+    )
+    bundle = cfg.targets["hal"].bundle
+    assert bundle.source == "computemcp-slurm"
+    assert bundle.deploy_dir is None
+    assert bundle.auto_deploy is True
+
+
+def test_bundle_block_parsed():
+    cfg = parse_config(
+        base_raw(
+            bundle={
+                "source": "computemcp-slurm",
+                "deploy-dir": "/scratch/agent/bundle",
+                "auto-deploy": False,
+            }
+        )
+    )
+    bundle = cfg.targets["hal"].bundle
+    assert bundle.deploy_dir == "/scratch/agent/bundle"
+    assert bundle.auto_deploy is False
+
+
+def test_bundle_missing_is_none():
+    assert parse_config(base_raw()).targets["hal"].bundle is None
+
+
+def test_bundle_requires_source():
+    with pytest.raises(ConfigError, match="requires 'source'"):
+        parse_config(base_raw(bundle={"deploy-dir": "/scratch/x"}))
+
+
+def test_bundle_unknown_source_rejected():
+    with pytest.raises(ConfigError, match="bundle.source"):
+        parse_config(base_raw(bundle={"source": "nope"}))
+
+
+def test_bundle_deploy_dir_must_be_absolute():
+    with pytest.raises(ConfigError, match="absolute"):
+        parse_config(base_raw(bundle={"source": "computemcp-slurm", "deploy-dir": "rel"}))
+
+
+def test_bundle_needs_deploy_dir_or_storage_root():
+    with pytest.raises(ConfigError, match="deploy-dir"):
+        parse_config(base_raw(bundle={"source": "computemcp-slurm"}))
+
+
+def test_bundle_auto_deploy_must_be_bool():
+    with pytest.raises(ConfigError, match="auto_deploy"):
+        parse_config(
+            base_raw(bundle={"source": "computemcp-slurm", "auto-deploy": "nope"})
+        )
+
+
+def test_bundle_unknown_key_rejected():
+    with pytest.raises(ConfigError, match="unknown key"):
+        parse_config(base_raw(bundle={"source": "computemcp-slurm", "extra": 1}))
+
+
+def test_bundle_requires_tunnel_transport():
+    raw = {
+        "server": {"listen": "127.0.0.1", "port": 2222},
+        "clients": {"alpaka": {"token": "secret", "targets": ["h"]}},
+        "targets": {
+            "h": {
+                "transport": "direct",
+                "user": "agent",
+                "bundle": {"source": "computemcp-slurm"},
+            }
+        },
+    }
+    with pytest.raises(ConfigError, match="bundle requires tunnel"):
+        parse_config(raw)

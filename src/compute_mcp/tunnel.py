@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 
 import asyncssh
 
+from . import bundle as bundle_module
 from .config import SSHConfig, TargetConfig, TransportConfig
 from .ssh_backend import (
     SSHError,
@@ -534,13 +535,28 @@ class TunnelManager:
         provisioned: tuple[str, int] | None = None
         dest_host = transport.remote_host
         dest_port = transport.remote_port
-        if provision and target.provision_command:
-            argv = " ".join(shlex.quote(p) for p in target.provision_command)
+        if provision and (target.provision_command or target.bundle):
+            if target.bundle:
+                # Deploy the shipped bundle over the live route, then run it
+                # from the deploy directory.  The upload is skipped when the
+                # remote content marker matches; explicit provision_command or
+                # close_command still take precedence over the bundle.
+                try:
+                    await bundle_module.ensure_deployed(conn, target)
+                except (bundle_module.BundleError, asyncssh.Error, OSError) as exc:
+                    for opened_conn in reversed(opened):
+                        await _close_connection(opened_conn)
+                    raise TunnelError(
+                        f"target {target.name!r} bundle deploy on route "
+                        f"{route!r} failed: {exc}"
+                    ) from exc
+            argv_tuple = bundle_module.provision_argv(target, "provision")
+            argv = " ".join(shlex.quote(p) for p in argv_tuple)
             prefix = format_provision_env(provision_env)
             command = f"{prefix} {argv}" if prefix else argv
             log.info(
                 "target %s: provisioning on route %s: %s",
-                target.name, route, " ".join(target.provision_command),
+                target.name, route, " ".join(argv_tuple),
             )
             try:
                 result = await conn.run(
@@ -709,7 +725,7 @@ class TunnelManager:
         """
         await self._run_advisory_command(
             "close_command",
-            target.close_command,
+            bundle_module.provision_argv(target, "stop") or target.close_command,
             target.close_command_timeout,
             target,
             route,
