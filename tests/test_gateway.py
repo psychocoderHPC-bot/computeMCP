@@ -2268,13 +2268,14 @@ def _close_gateway(close_command=("scancel", "--name", "terok-dev")):
 def _record_close(gw, monkeypatch, calls=None, *, boom=False):
     calls = calls if calls is not None else []
 
-    async def fake_run_close_command(target, route, connection=None):
+    async def fake_run_close_command(target, route, connection=None, **kwargs):
         calls.append(
             {
                 "target": target.name,
                 "route": route,
                 "connection": connection,
                 "tunnel_alive": gw.runtimes[target.name].tunnel is not None,
+                "provision_env": kwargs.get("provision_env"),
             }
         )
         if boom:
@@ -2308,6 +2309,8 @@ async def test_stop_target_runs_close_command_before_teardown(monkeypatch):
     assert calls[0]["connection"] is conn
     # It ran while the route connection was still alive, before teardown.
     assert calls[0]["tunnel_alive"] is True
+    # A non-bundle close_command carries no derived provision env.
+    assert calls[0]["provision_env"] is None
     assert gw.runtimes["hal"].tunnel is None
     assert live.stopped is True
 
@@ -2379,6 +2382,13 @@ async def test_stop_target_runs_bundle_stop_when_close_command_unset(monkeypatch
     assert calls[0]["route"] == "hal"
     assert calls[0]["tunnel_alive"] is True
     assert gw.runtimes["hal"].tunnel is None
+    # The bundle close must carry the COMPUTEMCP_* contract, not an empty env:
+    # without it the helper exits "must be apptainer or docker".
+    env = calls[0]["provision_env"]
+    assert env is not None
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == "apptainer"
+    assert env["COMPUTEMCP_STORAGE_ROOT"] == "/scratch/agent/computemcp"
+    assert env["COMPUTEMCP_SYSTEM"] == "hal"
 
 
 async def test_gateway_stop_runs_close_command_for_connected_target(monkeypatch):

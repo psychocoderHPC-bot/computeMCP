@@ -637,6 +637,7 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         connection: asyncssh.SSHClientConnection | None,
+        provision_env: dict[str, str] | None = None,
     ) -> None:
         """Run a trusted advisory command on the remote route host.
 
@@ -644,6 +645,10 @@ class TunnelManager:
         machine that hosts the development container) so the gateway can
         forward stdout/stderr.  Exit status and output are logged but never
         fatal: the caller decides what to do next.
+
+        ``provision_env`` mirrors the provision path: for a bundle target the
+        derived ``stop`` argv needs the same ``COMPUTEMCP_*`` environment, so it
+        is rendered as shell-quoted exports and prefixed to the command.
 
         Callers must pass the live ``connection`` (the route connection stored
         on the tunnel).  When it is missing the call is a logged no-op.
@@ -654,7 +659,9 @@ class TunnelManager:
                 target.name, label,
             )
             return
-        command = " ".join(shlex.quote(p) for p in argv)
+        argv_text = " ".join(shlex.quote(p) for p in argv)
+        prefix = format_provision_env(provision_env)
+        command = f"{prefix} {argv_text}" if prefix else argv_text
         log.info(
             "target %s: running %s via %s: %s",
             target.name, label, route, " ".join(argv),
@@ -692,6 +699,7 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         connection: asyncssh.SSHClientConnection | None = None,
+        provision_env: dict[str, str] | None = None,
     ) -> None:
         """Run the target's trusted ``connect_command`` on the route host.
 
@@ -700,6 +708,9 @@ class TunnelManager:
         forward stdout/stderr.  It is used to bring a stopped container back up.
         Exit status and output are logged but never fatal: the caller re-tries
         the connection to decide whether recovery worked.
+
+        ``provision_env`` is forwarded for a bundle-backed recovery command so it
+        sees the same ``COMPUTEMCP_*`` environment as the provision path.
 
         Signature changed for the route-first model: callers must pass the live
         ``connection`` (the route connection stored on the tunnel).  When it is
@@ -712,6 +723,7 @@ class TunnelManager:
             target,
             route,
             connection,
+            provision_env,
         )
 
     async def run_close_command(
@@ -719,6 +731,7 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         connection: asyncssh.SSHClientConnection | None = None,
+        provision_env: dict[str, str] | None = None,
     ) -> None:
         """Run the target's trusted ``close_command`` on the route host.
 
@@ -727,6 +740,10 @@ class TunnelManager:
         torn down.  Exit status and output are advisory: a non-zero exit or
         timeout is logged and teardown still proceeds.  When there is no live
         ``connection`` the call is a logged no-op.
+
+        ``provision_env`` carries the ``COMPUTEMCP_*`` contract for a derived
+        bundle ``stop``; without it the helper would exit because an empty
+        container-runtime variable cannot be resolved.
         """
         argv = target.close_command
         if not argv and target.bundle is not None and connection is not None:
@@ -752,6 +769,7 @@ class TunnelManager:
             target,
             route,
             connection,
+            provision_env,
         )
 
     async def connect(

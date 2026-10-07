@@ -367,6 +367,39 @@ class Gateway:
         provision_env = build_provision_env(target, plan, sbatch, srun)
         return plan, provision_env
 
+    def _target_provision_env(self, target: TargetConfig) -> dict[str, str]:
+        """The ``COMPUTEMCP_*`` contract for a target, best-effort.
+
+        Shared by the connect and close paths so a bundle target gets the same
+        environment in both and cannot drift.  For a target whose allocation
+        cannot be resolved (for example a bundle with no node/allocation block,
+        or a plan error) a minimal dict with the system and container fields is
+        returned rather than raising: close/connect are advisory and must not
+        crash teardown.
+        """
+        try:
+            _, provision_env = self._resolve_allocation(target, None)
+            return provision_env
+        except (ConfigError, ValueError):
+            pass
+        env: dict[str, str] = {"COMPUTEMCP_SYSTEM": target.name}
+        container = target.container
+        env["COMPUTEMCP_CONTAINER_RUNTIME"] = (
+            container.runtime if container else ""
+        )
+        env["COMPUTEMCP_STORAGE_ROOT"] = (
+            container.storage_root or "" if container else ""
+        )
+        env["COMPUTEMCP_IMAGE"] = container.image or "" if container else ""
+        env["COMPUTEMCP_GPU_VENDORS"] = ",".join(container.gpus) if container else ""
+        env["COMPUTEMCP_HOST_HOME"] = (
+            container.host_home or "" if container else ""
+        )
+        env["COMPUTEMCP_SANDBOX"] = (
+            "true" if container is not None and container.sandbox else "false"
+        )
+        return env
+
     # -- state machine -----------------------------------------------------
     async def ensure_connected(self, name: str) -> TargetRuntime:
         target = self._target(name)
@@ -640,8 +673,19 @@ class Gateway:
         route = runtime.active_route or (
             target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
         )
+        # The derived bundle `stop` needs the same COMPUTEMCP_* contract as the
+        # provision path; build it from the target (best-effort) so teardown
+        # never crashes on a missing allocation.
+        provision_env = (
+            self._target_provision_env(target) if target.bundle is not None else None
+        )
+        close_kwargs: dict[str, Any] = {}
+        if provision_env is not None:
+            close_kwargs["provision_env"] = provision_env
         try:
-            await self.tunnels.run_close_command(target, route, connection=connection)
+            await self.tunnels.run_close_command(
+                target, route, connection=connection, **close_kwargs
+            )
         except Exception as exc:  # noqa: BLE001 - advisory, never fatal
             log.warning("target %s: close_command failed: %s", name, exc)
 
@@ -835,6 +879,13 @@ class Gateway:
         host, port = self._endpoint(runtime)
         dedicated = force_dedicated or target.connect_mode == "dedicated"
 
+        # A bundle-backed recovery command needs the COMPUTEMCP_* contract too,
+        # so a stopped container can be brought back up.  Best-effort: never
+        # fail the connect path building the advisory environment.
+        connect_kwargs: dict[str, Any] = {}
+        if target.bundle is not None:
+            connect_kwargs["provision_env"] = self._target_provision_env(target)
+
         async def attempt():
             if dedicated:
                 return await self.backend.open_connection(target, host, port)
@@ -847,7 +898,9 @@ class Gateway:
                 target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
             )
             connection = runtime.tunnel.connection if runtime.tunnel else None
-            await self.tunnels.run_connect_command(target, route, connection=connection)
+            await self.tunnels.run_connect_command(
+                target, route, connection=connection, **connect_kwargs
+            )
 
         try:
             conn = await attempt()
@@ -865,7 +918,9 @@ class Gateway:
                     name, first,
                 )
                 connection = runtime.tunnel.connection if runtime.tunnel else None
-                await self.tunnels.run_connect_command(target, route, connection=connection)
+                await self.tunnels.run_connect_command(
+                    target, route, connection=connection, **connect_kwargs
+                )
                 # Drop any cached (dead) connection before retrying.
                 await self.backend.disconnect(name)
                 try:

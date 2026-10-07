@@ -34,7 +34,21 @@ case "$ACTION" in
 esac
 
 # --- Gateway environment and fallbacks -------------------------------------
-SYSTEM="${COMPUTEMCP_SYSTEM:-computemcp}"
+SYSTEM="${COMPUTEMCP_SYSTEM:-}"
+# When the gateway invokes stop/close/status with only COMPUTEMCP_STATE_DIR
+# (the earlier bug that exited 2), derive the system name from the state
+# directory's parent: "<storage>/<system>/state".  provision always requires an
+# explicit name below.
+if [ -n "${COMPUTEMCP_STATE_DIR:-}" ] && [ -z "$SYSTEM" ]; then
+    STATE_PARENT="$(dirname -- "$COMPUTEMCP_STATE_DIR")"
+    DERIVED_SYSTEM="$(basename -- "$STATE_PARENT")"
+    if [ -n "$DERIVED_SYSTEM" ] && [ "$DERIVED_SYSTEM" != / ] &&
+        [ "$DERIVED_SYSTEM" != . ] && [ "$DERIVED_SYSTEM" != .. ] &&
+        [[ "$DERIVED_SYSTEM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        SYSTEM="$DERIVED_SYSTEM"
+    fi
+fi
+SYSTEM="${SYSTEM:-computemcp}"
 if ! { [[ "$SYSTEM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [ "$SYSTEM" != . ] && [ "$SYSTEM" != .. ]; }; then
     echo "Invalid system name: $SYSTEM" >&2
     exit 2
@@ -212,6 +226,83 @@ MODE="$(cat "$STATE/mode" 2>/dev/null || true)"
 # appears on PATH later; freshly provisioned targets use current detection.
 [ -n "$MODE" ] || { [ "$HAVE_SLURM" = 1 ] && MODE=slurm || MODE=direct; }
 
+# --- Runtime derivation for stop/close/status -------------------------------
+# The gateway may invoke stop/close without the COMPUTEMCP_* environment (the
+# earlier "must be apptainer or docker" failure).  For these actions only,
+# derive the runtime from the value recorded at provision time, or from
+# whichever runtime is installed, so the container is still stopped.  The
+# provision action keeps its strict checks: an empty runtime there is an error.
+if [ "$ACTION" = stop ] || [ "$ACTION" = close ] || [ "$ACTION" = status ]; then
+    if [ -z "$RUNTIME" ] && [ -s "$STATE/container.runtime" ]; then
+        RECORDED_RUNTIME="$(head -n 1 "$STATE/container.runtime" || true)"
+        case "$RECORDED_RUNTIME" in
+            apptainer|docker) RUNTIME="$RECORDED_RUNTIME" ;;
+        esac
+    fi
+    if [ -z "$RUNTIME" ]; then
+        if command -v docker >/dev/null 2>&1; then
+            RUNTIME=docker
+        elif command -v apptainer >/dev/null 2>&1; then
+            RUNTIME=apptainer
+        fi
+    fi
+    export COMPUTEMCP_CONTAINER_RUNTIME="$RUNTIME"
+    # computemcp-container.sh derives its own STATE from
+    # STORAGE_ROOT/SYSTEM, not from COMPUTEMCP_STATE_DIR; re-export the values
+    # implied by the state dir so the container script targets the same paths.
+    if [ -n "${COMPUTEMCP_STATE_DIR:-}" ]; then
+        DERIVED_SYSTEM_DIR="$(dirname -- "$COMPUTEMCP_STATE_DIR")"
+        DERIVED_ROOT="$(dirname -- "$DERIVED_SYSTEM_DIR")"
+        export COMPUTEMCP_SYSTEM="$SYSTEM"
+        export COMPUTEMCP_STORAGE_ROOT="$DERIVED_ROOT"
+        export COMPUTEMCP_STATE_DIR="$STATE"
+        export COMPUTEMCP_SANDBOX_DIR="$SANDBOX"
+        export COMPUTEMCP_HOST_HOME="$HOST_HOME"
+        export COMPUTEMCP_CONTAINER_PORT="$CONTAINER_PORT"
+    fi
+fi
+
+# --- Resolve the container's real loopback endpoint -------------------------
+# Direct mode publishes the container on a real host port.  Docker assigns an
+# ephemeral host port for ``--publish 127.0.0.1::<port>``, so the container
+# port is NOT the endpoint; the container script records the mapping in
+# ``$STATE/container.endpoint`` on start.  Prefer that file, then ask the
+# runtime, and finally fall back to the sandbox's fixed loopback binding.
+is_valid_endpoint() {
+    local VALUE="$1" ENDPOINT_PORT="${1##*:}"
+    [[ "$VALUE" =~ ^127\.0\.0\.1:[0-9]{1,5}$ ]] || return 1
+    [[ "$ENDPOINT_PORT" =~ ^[0-9]+$ ]] || return 1
+    (( ENDPOINT_PORT >= 1 && ENDPOINT_PORT <= 65535 ))
+}
+
+resolve_container_endpoint() {
+    local VALUE="" LINE=""
+    if [ -s "$STATE/container.endpoint" ]; then
+        VALUE="$(head -n 1 "$STATE/container.endpoint" || true)"
+        if is_valid_endpoint "$VALUE"; then
+            printf '%s\n' "$VALUE"
+            return 0
+        fi
+    fi
+    case "$RUNTIME" in
+        docker)
+            if command -v docker >/dev/null 2>&1; then
+                while IFS= read -r LINE; do
+                    if is_valid_endpoint "$LINE"; then
+                        printf '%s\n' "$LINE"
+                        return 0
+                    fi
+                done < <(docker container port "$NAME" "$CONTAINER_PORT/tcp" 2>/dev/null || true)
+            fi
+            ;;
+        apptainer)
+            printf '127.0.0.1:%s\n' "$CONTAINER_PORT"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 SQUEUE_ARGS=(--noheader --user "$(id -un)" --format '%i|%T')
 [ -z "$CLUSTER" ] || SQUEUE_ARGS+=(--clusters="$CLUSTER")
 job_state() {
@@ -254,9 +345,11 @@ fi
 
 if [ "$ACTION" = status ]; then
     if [ "$MODE" = direct ]; then
-        printf 'mode: direct\nstate: %s\nendpoint: 127.0.0.1:%s\n' \
+        ENDPOINT="$(resolve_container_endpoint || true)"
+        [ -n "$ENDPOINT" ] || ENDPOINT="127.0.0.1:$CONTAINER_PORT"
+        printf 'mode: direct\nstate: %s\nendpoint: %s\n' \
             "$([ -s "$STATE/container.endpoint" ] && echo running || echo stopped)" \
-            "$CONTAINER_PORT"
+            "$ENDPOINT"
         exit 0
     fi
     printf 'jobid: %s\ncluster: %s\nstate: %s\n' \
@@ -339,7 +432,15 @@ direct_provision() {
         echo "Starting container $NAME on the remote node." >&2
         bash "$CONTAINER_SCRIPT" start
     fi
-    printf 'ENDPOINT 127.0.0.1:%s\n' "$CONTAINER_PORT"
+    # Record the runtime so a later stop/status invoked without the gateway
+    # environment still knows which runtime to use.
+    printf '%s\n' "$RUNTIME" > "$STATE/container.runtime"
+    local ENDPOINT
+    ENDPOINT="$(resolve_container_endpoint)" || {
+        echo "Could not determine the container endpoint for $NAME." >&2
+        exit 1
+    }
+    printf 'ENDPOINT %s\n' "$ENDPOINT"
 }
 
 # --- Per-job SRUN settings file --------------------------------------------

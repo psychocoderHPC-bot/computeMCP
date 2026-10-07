@@ -605,6 +605,83 @@ async def test_close_command_derives_bundle_stop_when_unset(monkeypatch):
     )
 
 
+async def test_close_command_bundle_prefixes_provision_env():
+    """A derived bundle stop carries the COMPUTEMCP_* exports.
+
+    Regression: the gateway ran the helper ``stop`` with no environment, so the
+    helper exited 2 ("must be apptainer or docker") and the container leaked.
+    The close command must be prefixed with the same shell-quoted exports the
+    provision path emits.
+    """
+    import dataclasses
+
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31580, internal_port_max=31590))
+    target = make_target("rosi", ["rosi"])
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("rosi",), remote_port=2222
+        ),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+
+    seen: list[str] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    env = {
+        "COMPUTEMCP_SYSTEM": "rosi",
+        "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+        "COMPUTEMCP_STORAGE_ROOT": "/scratch/agent/computemcp",
+        "COMPUTEMCP_STATE_DIR": "/scratch/agent/computemcp/rosi/state",
+        "COMPUTEMCP_CONTAINER_PORT": "2222",
+        "COMPUTEMCP_SANDBOX": "true",
+        "COMPUTEMCP_HOST_HOME": "",
+        "COMPUTEMCP_IMAGE": "",
+        "COMPUTEMCP_GPU_VENDORS": "",
+        "COMPUTEMCP_PROVISION_ENV": "",
+    }
+    await mgr.run_close_command(
+        target, "rosi", connection=_Conn(), provision_env=env
+    )
+    assert len(seen) == 1
+    command = seen[0]
+    assert "export COMPUTEMCP_CONTAINER_RUNTIME=apptainer;" in command
+    assert "export COMPUTEMCP_STATE_DIR=/scratch/agent/computemcp/rosi/state;" in command
+    assert "export COMPUTEMCP_SYSTEM=rosi;" in command
+    # The exports precede the helper argv.
+    assert command.endswith(
+        "bash /scratch/agent/computemcp/bundle/computemcp-provision.sh stop"
+    )
+
+
+async def test_run_close_command_without_provision_env_unchanged():
+    """An explicit close_command with no env keeps the previous exact shape."""
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31600, internal_port_max=31610))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), close_command=("scancel", "--name", "x")
+    )
+    seen: list[str] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    await mgr.run_close_command(target, "hal", connection=_Conn())
+    assert seen == ["scancel --name x"]
+
+
 # ---------------------------------------------------------------------------
 # run_connect_command failure paths (advisory, never fatal)
 # ---------------------------------------------------------------------------

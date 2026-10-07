@@ -113,7 +113,30 @@ def _docker_counts(log: Path) -> dict:
         "build": text.count("docker build --build-arg"),
         "create": text.count("\ndocker create"),
         "start": text.count("docker start"),
+        # "docker stop <name>" as logged by the stub; the distinct trailing
+        # space keeps it from counting "docker start".
+        "stop": sum(
+            1
+            for line in text.splitlines()
+            if line.startswith("docker stop ") or line.startswith("docker stop\t")
+        ),
     }
+
+
+def _published_port(container_port: int) -> int:
+    """A host port distinct from ``container_port`` for the docker stub.
+
+    Real ``--publish 127.0.0.1::<port>`` makes Docker pick an arbitrary
+    ephemeral host port, so the host endpoint must never be assumed equal to
+    the container port.  The test reserves a free port and pins it through
+    ``DOCKER_STUB_PUBLISHED_PORT``; the docker stub's own default is a fixed
+    40000+ mapping (``published_port`` in the stub).
+    """
+    for _ in range(50):
+        port = _free_port()
+        if port != container_port:
+            return port
+    raise AssertionError("could not find a free published port")
 
 
 def _shell_quote(text: str) -> str:
@@ -218,6 +241,19 @@ shift || true
 
 img_marker() { printf '%s/image-%s' "$STATE_DIR" "$(printf '%s' "$1" | tr '/:' '__')"; }
 ctr_dir() { printf '%s/ctr-%s' "$STATE_DIR" "$1"; }
+# Docker maps the container port to an EPHEMERAL host port for
+# ``--publish 127.0.0.1::<container-port>``; model that here.  Tests that
+# exercise the distinct published endpoint pin it with
+# DOCKER_STUB_PUBLISHED_PORT.  Without a pin the stub keeps the historical
+# behavior (published == container port), so Slurm-mode tests that rely on a
+# container-port banner are unchanged.
+published_port() {
+    if [ -n "${DOCKER_STUB_PUBLISHED_PORT:-}" ]; then
+        printf '%s' "$DOCKER_STUB_PUBLISHED_PORT"
+        return
+    fi
+    printf '%s' "${1:-${COMPUTEMCP_CONTAINER_PORT:-2222}}"
+}
 
 case "$CMD" in
     info) exit 0 ;;
@@ -263,7 +299,10 @@ case "$CMD" in
             port)
                 NAME="$1"
                 [ -f "$(ctr_dir "$NAME")/running" ] || exit 1
-                printf '127.0.0.1:%s\n' "${COMPUTEMCP_CONTAINER_PORT:-2222}"
+                # Docker assigns an ephemeral HOST port for
+                # ``--publish 127.0.0.1::<container-port>``; the real mapping is
+                # not the container port.
+                printf '127.0.0.1:%s\n' "$(published_port)"
                 exit 0
                 ;;
             *) exit 0 ;;
@@ -288,11 +327,17 @@ case "$CMD" in
     start)
         NAME="$1"
         PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
+        PUBLISHED="$(published_port "$PORT")"
         DIR="$(ctr_dir "$NAME")"
         mkdir -p "$DIR"
         if [ ! -f "$DIR/running" ]; then
+            # The container SSH endpoint is reachable inside on the container
+            # port and on the host through the published port; the stub serves
+            # the banner on both so either check succeeds.
             nohup python3 "$BANNER_BIN" "$PORT" >"$DIR/banner.out" 2>&1 </dev/null 9>&- &
             echo "$!" > "$DIR/banner.pid"
+            nohup python3 "$BANNER_BIN" "$PUBLISHED" >"$DIR/banner-published.out" 2>&1 </dev/null 9>&- &
+            echo "$!" > "$DIR/banner-published.pid"
             touch "$DIR/running"
         fi
         exit 0
@@ -300,9 +345,11 @@ case "$CMD" in
     stop)
         NAME="$1"
         DIR="$(ctr_dir "$NAME")"
-        if [ -f "$DIR/banner.pid" ]; then
-            kill "$(cat "$DIR/banner.pid")" 2>/dev/null || true
-        fi
+        for PIDFILE in "$DIR/banner.pid" "$DIR/banner-published.pid"; do
+            if [ -f "$PIDFILE" ]; then
+                kill "$(cat "$PIDFILE")" 2>/dev/null || true
+            fi
+        done
         rm -f "$DIR/running"
         exit 0
         ;;
@@ -618,11 +665,13 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
     Regression core of the feature: first provision must build
     (``docker build --build-arg`` exactly once), create the container and
     start it (``docker start`` exactly once, which in the stub brings up a
-    real loopback banner server) and emit the container's OWN loopback port.
-    The second provision against the same storage root must NOT build or
-    start again: the container is running, so it is reused and the same
-    endpoint line is emitted.  This is the "setup if needed / start if not
-    running / connect" contract of direct_provision.
+    real loopback banner server) and emit the container's PUBLISHED host port.
+    Docker publishes an ephemeral host port (the stub maps the container port
+    to a distinct 40000+ port), so the endpoint must be the mapping, not the
+    container port.  The second provision against the same storage root must
+    NOT build or start again: the container is running, so it is reused and
+    the same endpoint line is emitted.  This is the "setup if needed / start
+    if not running / connect" contract of direct_provision.
     """
     container_port = _free_port()
     workdir = tmp_path / "direct"
@@ -630,6 +679,8 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
     storage = workdir / "storage"
 
     env = _base_env("directtest", storage, container_port)
+    published_port = _published_port(container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published_port)
     env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
     env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
     env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
@@ -651,14 +702,17 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
         _cleanup()
 
     try:
+        assert published_port != container_port, (
+            "test must exercise a host port distinct from the container port"
+        )
         assert first.returncode == 0, (
             f"first provision exited {first.returncode}\n"
             f"stdout:\n{first.stdout}\nstderr:\n{first.stderr}"
         )
-        # Direct mode always emits the container's own loopback endpoint.
+        # Direct mode emits Docker's published host port, never the container port.
         assert (
             first.stdout.splitlines()[-1].strip()
-            == f"ENDPOINT 127.0.0.1:{container_port}"
+            == f"ENDPOINT 127.0.0.1:{published_port}"
         ), first.stdout
         # Direct mode must never touch the scheduler.  The slurm log is
         # empty (sbatch/srun were not resolved; the stubs are not on PATH
@@ -667,12 +721,12 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
             f"direct mode invoked a Slurm tool:\n{slurm_log.read_text()}"
         )
         # First time: exactly one build, one create, one start.
-        assert _docker_counts(docker_log) == {"build": 1, "create": 1, "start": 1}, (
-            _docker_counts(docker_log)
-        )
-        # The "running" container must really serve the container port;
+        assert _docker_counts(docker_log) == {
+            "build": 1, "create": 1, "start": 1, "stop": 0,
+        }, _docker_counts(docker_log)
+        # The published host port must really serve the SSH endpoint;
         # that is what the gateway will forward to.
-        assert _wait_port(container_port, timeout=15)
+        assert _wait_port(published_port, timeout=15)
 
         second = subprocess.run(
             ["bash", str(PROVISION), "provision"],
@@ -686,13 +740,13 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
         # Same endpoint line, printed again (reuse, not re-provision).
         assert (
             second.stdout.splitlines()[-1].strip()
-            == f"ENDPOINT 127.0.0.1:{container_port}"
+            == f"ENDPOINT 127.0.0.1:{published_port}"
         ), second.stdout
         # The build/start/reuse invariant: NOTHING rebuilt or restarted on
         # the second run while the container stayed alive.
-        assert _docker_counts(docker_log) == {"build": 1, "create": 1, "start": 1}, (
-            _docker_counts(docker_log)
-        )
+        assert _docker_counts(docker_log) == {
+            "build": 1, "create": 1, "start": 1, "stop": 0,
+        }, _docker_counts(docker_log)
         assert "Reusing running container" in second.stderr
         # The tracked mode is direct and status reports a live endpoint.
         assert (
@@ -706,8 +760,130 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
             cwd=workdir,
         )
         assert status.returncode == 0
-        assert f"endpoint: 127.0.0.1:{container_port}" in status.stdout
+        assert f"endpoint: 127.0.0.1:{published_port}" in status.stdout
         assert "state: running" in status.stdout
+    finally:
+        teardown()
+
+
+def test_direct_mode_status_reports_published_endpoint(tmp_path, stubs):
+    """The ``status`` action reports Docker's published host port.
+
+    It must read the recorded ``container.endpoint`` (the real mapping), not
+    hardcode the container port, because Docker publishes an ephemeral host
+    port for ``--publish 127.0.0.1::<container-port>``.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "status"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    published_port = _published_port(container_port)
+
+    env = _base_env("statustest", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published_port)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["PATH"] = stubs.direct.shell_path
+
+    def teardown():
+        _cleanup()
+
+    try:
+        provision = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=workdir,
+        )
+        assert provision.returncode == 0, provision.stderr
+        # The endpoint file holds the real published mapping.
+        endpoint_file = storage / "statustest" / "state" / "container.endpoint"
+        assert endpoint_file.read_text().strip() == (
+            f"127.0.0.1:{published_port}"
+        ), endpoint_file.read_text()
+        status = subprocess.run(
+            ["bash", str(PROVISION), "status"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=workdir,
+        )
+        assert status.returncode == 0, status.stderr
+        assert f"endpoint: 127.0.0.1:{published_port}" in status.stdout, status.stdout
+        assert f"endpoint: 127.0.0.1:{container_port}" not in status.stdout
+        assert "state: running" in status.stdout
+    finally:
+        teardown()
+
+
+def test_direct_stop_without_container_runtime_env(tmp_path, stubs):
+    """``stop`` with only COMPUTEMCP_STATE_DIR must still stop the container.
+
+    Regression: the gateway invoked ``stop`` with no COMPUTEMCP_* environment,
+    so the helper exited 2 with "must be apptainer or docker" and the remote
+    container was never stopped.  With the runtime recorded in
+    ``$STATE/container.runtime`` at provision time, ``stop`` derives it and
+    stops the container without any runtime variable.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "stopenv"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / "stopruntime" / "state"
+    published_port = _published_port(container_port)
+
+    provision_env = _base_env("stopruntime", storage, container_port)
+    provision_env["DOCKER_STUB_PUBLISHED_PORT"] = str(published_port)
+    provision_env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    provision_env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    provision_env["PATH"] = stubs.direct.shell_path
+
+    def teardown():
+        _cleanup()
+
+    try:
+        provision = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=provision_env,
+            cwd=workdir,
+        )
+        assert provision.returncode == 0, provision.stderr
+        assert (state_dir / "container.runtime").read_text().strip() == "docker"
+
+        # The gateway-style stop environment: state dir only, no COMPUTEMCP_*
+        # runtime/port/system.  PATH still reaches the docker stub.
+        stop_env = {
+            "PATH": stubs.direct.shell_path,
+            "HOME": os.environ.get("HOME", str(workdir)),
+            "COMPUTEMCP_STATE_DIR": str(state_dir),
+            "BANNER_SERVER": str(stubs_banner_path()),
+            "DOCKER_STUB_LOG": str(workdir / "docker-stop.log"),
+            "DOCKER_STUB_STATE": str(workdir / "dockerstate"),
+        }
+        stop = subprocess.run(
+            ["bash", str(PROVISION), "stop"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=stop_env,
+            cwd=workdir,
+        )
+        assert "must be apptainer or docker" not in stop.stderr, stop.stderr
+        assert stop.returncode == 0, (
+            f"stop exited {stop.returncode}\nstdout:{stop.stdout}\nstderr:{stop.stderr}"
+        )
+        # The container was actually stopped through the docker runtime.
+        stop_log = workdir / "docker-stop.log"
+        assert stop_log.exists(), "docker stub did not run for stop"
+        assert "docker stop computemcp-stopruntime" in stop_log.read_text()
+        # And it no longer serves the endpoint.
+        assert not _wait_port(published_port, timeout=3)
     finally:
         teardown()
 
@@ -727,6 +903,8 @@ def test_direct_mode_hook_marker_applied_on_login(tmp_path, stubs):
     marker = workdir / "hook-login-marker"
 
     env = _base_env("hookok", storage, container_port)
+    published_port = _published_port(container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published_port)
     env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
     env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
     env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
@@ -752,7 +930,7 @@ def test_direct_mode_hook_marker_applied_on_login(tmp_path, stubs):
         assert marker.exists(), "login-node hook line did not run"
         assert (
             result.stdout.splitlines()[-1].strip()
-            == f"ENDPOINT 127.0.0.1:{container_port}"
+            == f"ENDPOINT 127.0.0.1:{published_port}"
         ), result.stdout
     finally:
         teardown()
