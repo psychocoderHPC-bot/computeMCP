@@ -10,7 +10,9 @@ Wants=network-online.target
 Type=simple
 # --config is omitted on purpose: the gateway defaults to
 # %h/.config/computeMCP-gateway/config.toml (and its sibling tokens.toml).
-ExecStart=%h/.local/bin/computeMCP-gateway --no-console
+# Call the venv binary directly: systemd does not run a shell, so the venv is
+# not "activated" and there is no ~/.local/bin symlink to rely on.
+ExecStart=%h/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway --no-console
 # `systemctl --user reload computeMCP-gateway` re-reads the config and
 # token file without dropping live tunnels.
 ExecReload=/bin/kill -HUP $MAINPID

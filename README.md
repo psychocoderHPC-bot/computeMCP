@@ -22,17 +22,22 @@ name a configured target; an arbitrary SSH hostname is never accepted.
 
 ## Quick start
 
-Three commands bring a fresh host to a working gateway. Run them as the normal
-(user, non-root) host account that will own the gateway.
+A short set of commands brings a fresh host to a working gateway. Run them as
+the normal (user, non-root) host account that will own the gateway.
 
 ```bash
 python3 -m venv ~/.local/share/computeMCP-gateway/venv
 ~/.local/share/computeMCP-gateway/venv/bin/pip install .
-ln -s ~/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway ~/.local/bin/computeMCP-gateway
 
+source ~/.local/share/computeMCP-gateway/venv/bin/activate
 computeMCP-gateway --bootstrap        # interactive: questions below
 computeMCP-gateway                    # start; config + tokens already written
 ```
+
+Activating the venv puts `computeMCP-gateway`, `computeMCP-gatewayctl` and
+`computeMCP-handshake` on `PATH`; no `ln -s` into `~/.local/bin` is needed. If
+you prefer not to activate, call the venv paths directly
+(`~/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway`).
 
 `--bootstrap` asks for the server address, one client (your Terok project) and
 optionally a first target, writes `~/.config/computeMCP-gateway/config.toml` and
@@ -53,7 +58,8 @@ DIR` (or `--config FILE`); `--force` overwrites an existing config.
 3. **Check it is healthy**: `computeMCP-gatewayctl status`. Targets listed
    `connected` are usable; `disconnected` usually means the container is down
    (`connect_command`) or the allocation is not provisioned yet.
-4. **In each Terok task**: run the handshake once and approve it (see
+4. **In each Terok task**: run the handshake inside the task, then approve the
+   request **on the host** (see
    [Set up the MCP inside a Terok task](#set-up-the-mcp-inside-a-terok-task)).
 
 The gateway validates `config.toml` on start and on reload, so a bad edit fails
@@ -88,7 +94,7 @@ systemd/compute-mcp-gateway.service
 python3 -m venv ~/.local/share/computeMCP-gateway/venv
 ~/.local/share/computeMCP-gateway/venv/bin/pip install -U pip
 ~/.local/share/computeMCP-gateway/venv/bin/pip install .
-ln -s ~/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway ~/.local/bin/computeMCP-gateway
+source ~/.local/share/computeMCP-gateway/venv/bin/activate
 mkdir -p ~/.config/computeMCP-gateway
 cp config.example.toml ~/.config/computeMCP-gateway/config.toml
 ```
@@ -570,9 +576,11 @@ key and never committed to a repository.
 ### Interactive enrollment with `computeMCP-handshake`
 
 Instead of pre-generating a token and copying it around, a container can ask for
-one. Run `computeMCP-handshake` **inside the Terok container**; it queues a request,
-waits while you approve it on the gateway console, receives the token, and wires
-it into the container. This is step 3 of
+one. Run `computeMCP-handshake` **inside the Terok container**; it queues a request
+and waits. **The approval is an operator action on the host, never inside the
+container**: you run `computeMCP-gatewayctl approve <request-id>` (or the console
+`approve <request-id>`) on the gateway host. Only then does the gateway hand the
+token to the waiting container. This is step 3 of
 [Set up the MCP inside a Terok task](#set-up-the-mcp-inside-a-terok-task).
 
 ```bash
@@ -585,15 +593,15 @@ computeMCP-handshake picongpu-bot-dev2 --port 2222 --system hal,fwk394
 Flow:
 
 ```
-container                                     gateway (host)
-computeMCP-handshake <client> --port 2222          console:
-   │  POST /v1/enroll  {client_id,targets}       gateway> enrollments
-   ├──────────────────────────────────────────►  REQUEST ... CLIENT ... TARGETS
-   │  (request queued, pending operator)         gateway> approve <request-id>
-   │  GET /v1/enroll/<id>  (poll)              → mint token, append
-   │◄──────── {status: approved, token} ──────    [clients.<id>] + tokens.toml,
-   └ writes COMPUTEMCP_* to ~/.bashrc          reload
-     and prints the MCP env snippet
+inside the Terok container                gateway host (operator)
+------------------------------------      ----------------------------------
+computeMCP-handshake <client> --port 2222 computeMCP-gatewayctl enrollments
+  |  POST /v1/enroll {client_id,targets}   computeMCP-gatewayctl approve <id>
+  |  (request queued, pending operator)      -> mint token, append
+  |  GET  /v1/enroll/<id>  (poll)              [clients.<id>] + tokens.toml,
+  |<------ {status: approved, token} ---       reload
+  |  writes COMPUTEMCP_* to ~/.bashrc
+  |  and prints the MCP env snippet
 ```
 
 The `/v1/enroll` request is **unauthenticated but grants nothing** — it only
@@ -649,39 +657,50 @@ shield:
 
 ## Set up the MCP inside a Terok task
 
-Do these steps once per Terok task, after the gateway is running. They install
-the MCP bridge, let the task ask the gateway for its token, and record that
-token where the agent can read it.
+Do these steps once per Terok task, after the gateway is running. The task
+installs the MCP bridge and asks the gateway for a token; **the approval itself
+happens on the host, never inside the container** (see step 3).
 
-1. **Install the MCP bridge in the task** (not on the host):
+1. **Install the MCP bridge in the task** (not on the host), then activate the
+   venv as usual:
 
    ```bash
    python3 -m venv /home/dev/.local/share/computeMCP/venv
    /home/dev/.local/share/computeMCP/venv/bin/pip install <this-package>
-   ln -s /home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp /home/dev/.local/bin/computeMCP-mcp
+   source /home/dev/.local/share/computeMCP/venv/bin/activate
    ```
+
+   Activating puts `computeMCP-mcp` and `computeMCP-handshake` on `PATH`; no
+   `ln -s` into `~/.local/bin` is needed. The MCP entry below can also call the
+   venv binary directly
+   (`/home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp`).
 
 2. **Allow the gateway through the Terok Shield** (default-deny). See
    [Allow the gateway in the Terok Shield](#allow-the-gateway-in-the-terok-shield);
    without this the handshake cannot connect.
 
-3. **Request access with the handshake.** This is the one command the task
-   needs:
+3. **Request access from inside the task, then approve it on the host.** This is
+   the key split: the request is made *inside* the container, the approval is an
+   operator action *on the host*.
 
    ```bash
+   # inside the Terok task:
    computeMCP-handshake <client-id> --port 2222 --system hal,fwk394
    # --system is the target allow-list; omit for none, or pass '*' for all.
    ```
 
-   The task prints a request id and waits. On the host, approve it:
+   The task prints a request id and waits. Switch to the **host** and approve it
+   there (a shell with the gateway venv activated, or the console of a running
+   `computeMCP-gateway`):
 
    ```bash
-   computeMCP-gatewayctl enrollments
-   computeMCP-gatewayctl approve <request-id>
+   computeMCP-gatewayctl enrollments            # on the host
+   computeMCP-gatewayctl approve <request-id>   # on the host
    ```
 
    On approval the gateway appends `[clients.<client-id>]`, writes the token
-   hash, reloads, and hands the plaintext token to the task once.
+   hash, reloads, and hands the plaintext token back to the waiting task once.
+   Without this host-side approval nothing is granted.
 
 4. **Point the MCP at the gateway.** The handshake writes `COMPUTEMCP_GATEWAY`
    and `COMPUTEMCP_TOKEN` to the task (default: a marked block in `~/.bashrc`;
@@ -694,7 +713,7 @@ token where the agent can read it.
      "mcp": {
        "compute": {
          "type": "local",
-         "command": ["/home/dev/.local/bin/computeMCP-mcp"],
+         "command": ["/home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp"],
          "enabled": true,
          "environment": {
            "COMPUTEMCP_GATEWAY": "http://host.containers.internal:2222",
