@@ -2016,6 +2016,28 @@ def build_parser() -> argparse.ArgumentParser:
         "~/.config/computeMCP-gateway/tokens.toml), print the plaintext "
         "tokens once, and exit",
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="interactively create the initial gateway configuration (server, "
+        "auth, a hashed client token and optionally a target) and exit",
+    )
+    parser.add_argument(
+        "--config-dir",
+        metavar="DIR",
+        help="directory for --bootstrap (default: the directory of --config)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="with --bootstrap, overwrite an existing configuration file",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="refuse interactive prompts (for scripts); --bootstrap then fails "
+        "instead of waiting for input",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -2154,6 +2176,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.generate_tokens:
             return generate_tokens(args.config, args.generate_tokens, args.token_file)
+        if args.bootstrap:
+            from .setup import Wizard, WizardAbort, run_bootstrap
+
+            config_arg = args.config or default_config_path()
+            if args.config_dir:
+                target_path = Path(args.config_dir) / Path(default_config_path()).name
+            else:
+                target_path = Path(config_arg)
+            wizard = Wizard(terminal=False if args.non_interactive else None)
+            try:
+                return run_bootstrap(target_path, force=args.force, wizard=wizard)
+            except WizardAbort as exc:
+                print(f"bootstrap: {exc}", file=sys.stderr)
+                return 2
         return asyncio.run(_amain(args))
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)

@@ -371,3 +371,54 @@ async def test_target_connect_subcommand_timeout_reaches_request(monkeypatch):
     )
     assert timeouts == [7.0]
 
+
+
+# -- --add-target dispatch (no gateway connection) ---------------------------
+
+def test_parser_accepts_add_target():
+    parser = build_parser()
+    args = parser.parse_args(["--config", "x.toml", "--add-target"])
+    assert args.add_target is True
+    assert args.command is None
+
+
+def test_add_target_dispatches_to_setup_without_gateway(monkeypatch):
+    import compute_mcp.control as control_mod
+    import compute_mcp.setup as setup_mod
+
+    seen = {}
+
+    def fake_add_target(config_path, *, wizard=None):
+        seen["config"] = str(config_path)
+        seen["wizard"] = wizard
+        return 0
+
+    def explode(*a, **k):  # aiohttp must never be reached
+        raise AssertionError("gateway must not be contacted for --add-target")
+
+    monkeypatch.setattr(setup_mod, "run_add_target", fake_add_target)
+    monkeypatch.setattr(control_mod.aiohttp, "ClientSession", explode)
+
+    rc = control_mod.main(["--config", "x.toml", "--add-target"])
+    assert rc == 0
+    assert seen["config"] == "x.toml"
+    assert seen["wizard"] is not None
+
+
+def test_add_target_wizard_abort_returns_2(monkeypatch):
+    import compute_mcp.control as control_mod
+    import compute_mcp.setup as setup_mod
+
+    def fake_add_target(config_path, *, wizard=None):
+        raise setup_mod.WizardAbort("boom")
+
+    monkeypatch.setattr(setup_mod, "run_add_target", fake_add_target)
+    rc = control_mod.main(["--config", "x.toml", "--add-target"])
+    assert rc == 2
+
+
+def test_missing_command_is_usage_error():
+    import compute_mcp.control as control_mod
+
+    with pytest.raises(SystemExit):
+        control_mod.main(["--config", "x.toml"])

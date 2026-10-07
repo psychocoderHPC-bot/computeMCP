@@ -1,0 +1,761 @@
+# SPDX-FileCopyrightText: René Widera
+#
+# SPDX-License-Identifier: ISC
+"""Interactive setup wizard for the computeMCP gateway.
+
+``computeMCP-gateway --bootstrap`` creates the initial configuration (server,
+auth, one client, and optionally one or more targets) and writes a hashed client
+token. ``computeMCP-gatewayctl --add-target`` appends a target to an existing
+configuration.
+
+The wizard is deliberately dependency-free: it writes the same TOML the loader
+validates, re-reads and validates it before declaring success, and rolls back an
+append that would not load.  Every question prints a short description, and
+fixed-answer questions list their options.  Prompt I/O is injectable so tests can
+drive the flow without a terminal.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .auth import hash_token, new_token
+from .config import (
+    ALLOCATION_MODES,
+    MULTI_NODE_MODES,
+    ConfigError,
+    _atomic_write,
+    append_token_hash,
+    default_token_path,
+    load_config,
+    validate_target_name,
+)
+
+GPU_VENDORS = ("nvidia", "amd", "intel")
+CONTAINER_RUNTIMES = ("apptainer", "docker")
+TRANSPORTS = ("tunnel", "direct")
+
+
+class WizardAbort(SystemExit):
+    """Raised when the operator interrupts the wizard."""
+
+
+@dataclass
+class TargetAnswers:
+    """Collected answers for one ``[targets.X]`` block."""
+
+    name: str
+    transport: str = "tunnel"
+    ssh_targets: tuple[str, ...] = ()
+    direct_host: str | None = None
+    direct_port: int = 2222
+    user: str = "agent"
+    client_key: str = ""
+    host_key_sha256: str | None = None
+    proxy_jump: str | None = None
+    interactive_auth: bool = False
+    auto_connect: bool = True
+    container_runtime: str | None = None
+    container_storage_root: str | None = None
+    container_image: str | None = None
+    container_gpus: tuple[str, ...] = ()
+    container_host_home: str | None = None
+    bundle: bool = False
+    bundle_deploy_dir: str | None = None
+    node_cpus: int | None = None
+    node_gpus: int | None = None
+    node_memory: str | None = None
+    allocation_single: str | None = None
+    allocation_multi: str | None = None
+    allocation_max_nodes: int | None = None
+    sbatch_partition: str | None = None
+    sbatch_time: str | None = None
+    srun_cpu_bind: str | None = None
+    extra: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Prompt layer
+# ---------------------------------------------------------------------------
+class Wizard:
+    """Prompt helper with injectable I/O and per-question descriptions."""
+
+    def __init__(self, *, input_fn=input, print_fn=print, terminal: bool | None = None):
+        self._input = input_fn
+        self._print = print_fn
+        self.terminal = sys.stdin.isatty() if terminal is None else terminal
+
+    def _require_terminal(self) -> None:
+        if not self.terminal:
+            raise WizardAbort(
+                "the setup wizard needs an interactive terminal; run it without "
+                "--non-interactive, or edit the configuration by hand"
+            )
+
+    def say(self, message: str = "") -> None:
+        self._print(message)
+
+    def section(self, title: str) -> None:
+        self._print("")
+        self._print(f"== {title} ==")
+
+    def ask(
+        self,
+        question: str,
+        *,
+        description: str | None = None,
+        default: str | None = None,
+        required: bool = True,
+        validator=None,
+        choices: tuple[str, ...] | None = None,
+    ) -> str:
+        self._require_terminal()
+        if description:
+            self._print(f"  {description}")
+        if choices:
+            self._print(f"  options: {', '.join(choices)}")
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        while True:
+            try:
+                raw = self._input(f"{question}{suffix}: ").strip()
+            except EOFError as exc:
+                raise WizardAbort("input closed; aborting setup") from exc
+            except KeyboardInterrupt as exc:
+                raise WizardAbort("setup aborted") from exc
+            value = raw or (default or "")
+            if not value:
+                if required:
+                    self._print("  a value is required")
+                    continue
+                return ""
+            if choices and value not in choices:
+                self._print(f"  choose one of: {', '.join(choices)}")
+                continue
+            if validator is not None:
+                message = validator(value)
+                if message:
+                    self._print(f"  {message}")
+                    continue
+            return value
+
+    def confirm(
+        self,
+        question: str,
+        *,
+        default: bool = True,
+        description: str | None = None,
+    ) -> bool:
+        if description:
+            self._print(f"  {description}")
+        answer = self.ask(
+            question,
+            default=("y" if default else "n"),
+            choices=("y", "n", "yes", "no"),
+            required=False,
+        )
+        answer = answer.lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        return default
+
+    def ask_int(
+        self,
+        question: str,
+        *,
+        description: str | None = None,
+        default: int | None = None,
+        minimum: int = 0,
+    ) -> int | None:
+        def check(value: str) -> str | None:
+            try:
+                number = int(value)
+            except ValueError:
+                return "enter a whole number"
+            if number < minimum:
+                return f"must be >= {minimum}"
+            return None
+
+        result = self.ask(
+            question,
+            description=description,
+            default=str(default) if default is not None else None,
+            required=default is not None,
+            validator=check,
+        )
+        return int(result) if result else None
+
+
+# ---------------------------------------------------------------------------
+# Validators
+# ---------------------------------------------------------------------------
+def _validate_port(value: str) -> str | None:
+    try:
+        port = int(value)
+    except ValueError:
+        return "enter a port number"
+    if not 1 <= port <= 65535:
+        return "port must be between 1 and 65535"
+    return None
+
+
+def _validate_target_name(value: str) -> str | None:
+    try:
+        validate_target_name(value)
+    except ConfigError as exc:
+        return str(exc)
+    return None
+
+
+def _validate_sha256(value: str) -> str | None:
+    if not value.startswith("SHA256:") or len(value) < 12:
+        return "expected a value like 'SHA256:...'"
+    return None
+
+
+def _validate_absolute_path(value: str) -> str | None:
+    if not value.startswith("/"):
+        return "enter an absolute path"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def _toml_str(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_array(values: tuple[str, ...]) -> str:
+    return "[" + ", ".join(_toml_str(v) for v in values) + "]"
+
+
+def render_target_block(answers: TargetAnswers) -> str:
+    """Render one target as a commented TOML block ending in a newline."""
+    lines: list[str] = ["", f"[targets.{answers.name}]"]
+    if answers.transport == "direct":
+        lines.append('transport = "direct"')
+        lines.append(f"remote_host = {_toml_str(answers.direct_host or '127.0.0.1')}")
+        lines.append(f"remote_port = {answers.direct_port}")
+    elif answers.ssh_targets:
+        lines.append(f"ssh_targets = {_toml_array(answers.ssh_targets)}")
+    lines.append(f"user = {_toml_str(answers.user)}")
+    if answers.client_key:
+        lines.append(f"client_key = {_toml_str(answers.client_key)}")
+    if answers.host_key_sha256:
+        lines.append(f"host_key_sha256 = {_toml_str(answers.host_key_sha256)}")
+    if answers.proxy_jump:
+        lines.append(f"proxy_jump = {_toml_str(answers.proxy_jump)}")
+    if answers.interactive_auth:
+        lines.append("interactive_auth = true")
+    if not answers.auto_connect:
+        lines.append("auto_connect = false")
+    if answers.bundle:
+        lines.append("")
+        lines.append(f"[targets.{answers.name}.bundle]")
+        lines.append('source = "computemcp-slurm"')
+        if answers.bundle_deploy_dir:
+            lines.append(f"deploy-dir = {_toml_str(answers.bundle_deploy_dir)}")
+    if answers.container_runtime:
+        lines.append("")
+        lines.append(f"[targets.{answers.name}.container]")
+        lines.append(f"runtime = {_toml_str(answers.container_runtime)}")
+        if answers.container_storage_root:
+            lines.append(f"storage-root = {_toml_str(answers.container_storage_root)}")
+        if answers.container_image:
+            lines.append(f"image = {_toml_str(answers.container_image)}")
+        if answers.container_gpus:
+            lines.append(f"gpus = {_toml_array(answers.container_gpus)}")
+        if answers.container_host_home:
+            lines.append(f"host-home = {_toml_str(answers.container_host_home)}")
+    if answers.node_cpus is not None or answers.node_gpus is not None or answers.node_memory:
+        lines.append("")
+        lines.append(f"[targets.{answers.name}.node]")
+        if answers.node_cpus is not None:
+            lines.append(f"cpus = {answers.node_cpus}")
+        if answers.node_gpus is not None:
+            lines.append(f"gpus = {answers.node_gpus}")
+        if answers.node_memory:
+            lines.append(f"memory = {_toml_str(answers.node_memory)}")
+    if (
+        answers.allocation_single
+        or answers.allocation_multi
+        or answers.allocation_max_nodes is not None
+    ):
+        lines.append("")
+        lines.append(f"[targets.{answers.name}.allocation]")
+        if answers.allocation_single:
+            lines.append(f"single-node = {_toml_str(answers.allocation_single)}")
+        if answers.allocation_multi:
+            lines.append(f"multi-node = {_toml_str(answers.allocation_multi)}")
+        if answers.allocation_max_nodes is not None:
+            lines.append(f"max-nodes = {answers.allocation_max_nodes}")
+    if answers.sbatch_partition or answers.sbatch_time:
+        lines.append("")
+        lines.append(f"[targets.{answers.name}.slurm.sbatch]")
+        if answers.sbatch_partition:
+            lines.append(f"partition = {_toml_str(answers.sbatch_partition)}")
+        if answers.sbatch_time:
+            lines.append(f"time = {_toml_str(answers.sbatch_time)}")
+        lines.append("ntasks-per-node = 1")
+    if answers.srun_cpu_bind:
+        lines.append("")
+        lines.append(f"[targets.{answers.name}.slurm.srun]")
+        lines.append("ntasks-per-node = 1")
+        lines.append(f"cpu-bind = {_toml_str(answers.srun_cpu_bind)}")
+    return "\n".join(lines) + "\n"
+
+
+def render_gateway_config(
+    *,
+    listen: str,
+    port: int,
+    allow_enrollment: bool,
+    client_id: str,
+    client_targets: tuple[str, ...],
+    client_label: str | None,
+    token_file: str | None,
+    targets: list[TargetAnswers],
+) -> str:
+    """Render the whole gateway configuration as commented TOML."""
+    lines = [
+        "# computeMCP gateway configuration.",
+        "#",
+        "# Generated by `computeMCP-gateway --bootstrap`.  Edit freely; the",
+        "# gateway validates the file on start and on reload.",
+        "",
+        "[server]",
+        f"listen = {_toml_str(listen)}",
+        f"port = {port}",
+        f"allow_enrollment = {'true' if allow_enrollment else 'false'}",
+        "",
+        "[ssh]",
+        "",
+        "[sessions]",
+        "",
+        "[auth]",
+    ]
+    if token_file:
+        lines.append(f"token_file = {_toml_str(token_file)}")
+    lines.append("")
+    lines.append("[clients." + client_id + "]")
+    lines.append(f"targets = {_toml_array(client_targets)}")
+    if client_label:
+        lines.append(f"label = {_toml_str(client_label)}")
+    for target in targets:
+        lines.append(render_target_block(target).strip("\n"))
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def render_tokens_file(entries: list[tuple[str, str]]) -> str:
+    lines = [
+        "# Generated by computeMCP setup; contains sha256 hashes only.",
+        "# Keep plaintext tokens out of this file.",
+        "",
+        "[tokens]",
+    ]
+    for client_id, token in entries:
+        lines.append(f"{_toml_str(client_id)} = {_toml_str(hash_token(token))}")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# SSH alias probing
+# ---------------------------------------------------------------------------
+def probe_ssh_alias(alias: str) -> dict | None:
+    """Best-effort ``ssh -G <alias>`` lookup; returns None on any failure."""
+    try:
+        result = subprocess.run(
+            ["ssh", "-G", alias],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    info: dict = {"identityfiles": []}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        value = value.strip()
+        if key == "user" and value:
+            info["user"] = value
+        elif key == "hostname" and value:
+            info["hostname"] = value
+        elif key == "port" and value:
+            info["port"] = value
+        elif key == "identityfile" and value:
+            info["identityfiles"].append(value)
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Target wizard
+# ---------------------------------------------------------------------------
+def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
+    """Ask every question for one target; optional block when applicable."""
+    existing_lower = {name.lower() for name in existing}
+
+    def unique_name(value: str) -> str | None:
+        message = _validate_target_name(value)
+        if message:
+            return message
+        if value.lower() in existing_lower:
+            return f"target {value!r} already exists"
+        return None
+
+    wizard.section("Target")
+    wizard.say(
+        "  A target is one remote system the gateway connects to.  The name is"
+    )
+    wizard.say("  only used inside computeMCP.")
+    name = wizard.ask(
+        "Target name", description="short label, e.g. hal or rosi", validator=unique_name
+    )
+
+    wizard.say("")
+    wizard.say("  The gateway reaches the target through an SSH alias from")
+    wizard.say("  ~/.ssh/config (recommended) or a direct address.")
+    transport = wizard.ask(
+        "Transport",
+        description="tunnel uses an SSH alias; direct dials host:port",
+        default="tunnel",
+        choices=TRANSPORTS,
+    )
+
+    answers = TargetAnswers(name=name, transport=transport)
+    if transport == "tunnel":
+        alias = wizard.ask(
+            "SSH alias",
+            description="Host name from ~/.ssh/config, e.g. hal",
+        )
+        answers.ssh_targets = (alias,)
+        probed = probe_ssh_alias(alias)
+        default_user = (probed or {}).get("user") or "agent"
+        answers.user = wizard.ask(
+            "Remote user",
+            description="login user for the container/route connection",
+            default=default_user,
+        )
+        default_key = str(Path.home() / ".ssh" / "computemcp_container")
+        answers.client_key = wizard.ask(
+            "Private key path",
+            description="dedicated gateway key; never your personal key",
+            default=default_key,
+        )
+    else:
+        host = wizard.ask("Remote host", description="IP or hostname")
+        port = wizard.ask_int(
+            "Remote port", description="container sshd port", default=2222, minimum=1
+        )
+        answers.ssh_targets = ()
+        answers.direct_host = host
+        answers.direct_port = port or 2222
+        answers.user = wizard.ask("Remote user", default="agent")
+
+    answers.host_key_sha256 = wizard.ask(
+        "Container host-key fingerprint",
+        description="pins the container sshd key; blank to verify later",
+        default=None,
+        required=False,
+        validator=_validate_sha256,
+    ) or None
+    if answers.host_key_sha256 is None:
+        wizard.say(
+            "  No fingerprint set.  Set host_key_check = \"off\" or add the"
+        )
+        wizard.say("  fingerprint before production use.")
+
+    if wizard.confirm(
+        "Does the login node require a second factor (password/OTP)?",
+        default=False,
+        description="2FA targets connect only on an explicit connect/refresh",
+    ):
+        answers.interactive_auth = True
+        answers.auto_connect = False
+
+    # -- container ---------------------------------------------------------
+    wizard.section("Container")
+    if wizard.confirm(
+        "Configure the development container?",
+        default=True,
+        description="runtime, storage, base image and GPU vendors",
+    ):
+        answers.container_runtime = wizard.ask(
+            "Container runtime",
+            description="how the container is built and started on the target",
+            default="apptainer",
+            choices=CONTAINER_RUNTIMES,
+        )
+        default_root = str(Path.home() / "computemcp")
+        answers.container_storage_root = wizard.ask(
+            "Storage root",
+            description="remote directory for sandbox, home and state; must be "
+            "visible to login and compute nodes",
+            default=default_root,
+            validator=_validate_absolute_path,
+        )
+        default_image = (
+            "docker://ubuntu:24.04"
+            if answers.container_runtime == "apptainer"
+            else "ubuntu:24.04"
+        )
+        answers.container_image = wizard.ask(
+            "Base image",
+            description="docker:// ref for Apptainer, plain ref for Docker",
+            default=default_image,
+        )
+        vendors = wizard.ask(
+            "GPU vendors",
+            description="comma list; blank for CPU-only",
+            default="",
+            required=False,
+        )
+        answers.container_gpus = tuple(
+            v.strip() for v in vendors.replace(" ", "").split(",") if v.strip()
+        )
+        unknown = [v for v in answers.container_gpus if v not in GPU_VENDORS]
+        if unknown:
+            wizard.say(f"  ignoring unknown vendors: {', '.join(unknown)}")
+            answers.container_gpus = tuple(
+                v for v in answers.container_gpus if v in GPU_VENDORS
+            )
+
+    if wizard.confirm(
+        "Does this target use the Slurm provisioning bundle?",
+        default=False,
+        description="the gateway deploys it and runs it on the login node",
+    ):
+        answers.bundle = True
+        if not answers.container_storage_root:
+            # A bundle needs a deploy directory; otherwise the loader rejects it.
+            answers.bundle_deploy_dir = wizard.ask(
+                "Bundle deploy directory",
+                description="remote directory on storage shared by login and "
+                "compute nodes",
+                default=str(Path.home() / "computemcp" / "bundle"),
+                validator=_validate_absolute_path,
+            )
+
+    # -- Slurm node/allocation (optional) ---------------------------------
+    if wizard.confirm(
+        "Describe the Slurm node capacities and allocation policy?",
+        default=bool(answers.bundle) or bool(answers.container_runtime),
+        description="needed for --set overrides and dry-run previews",
+    ):
+        answers.node_cpus = wizard.ask_int(
+            "CPUs per node", description="allocatable Slurm CPUs", default=None, minimum=1
+        )
+        answers.node_gpus = wizard.ask_int(
+            "GPUs per node", description="scheduler-visible GPU units", default=None, minimum=0
+        )
+        answers.node_memory = wizard.ask(
+            "Memory per node",
+            description="allocatable host memory with a unit, e.g. 378000M",
+            default=None,
+            required=False,
+        ) or None
+        answers.allocation_single = wizard.ask(
+            "Single-node allocation mode",
+            description="how one node is sized by default",
+            default="gpu-proportional" if (answers.node_gpus or 0) else "cpu-proportional",
+            choices=ALLOCATION_MODES,
+        )
+        answers.allocation_multi = wizard.ask(
+            "Multi-node allocation mode",
+            description="used when nodes > 1",
+            default="exclusive",
+            choices=MULTI_NODE_MODES,
+        )
+        answers.allocation_max_nodes = wizard.ask_int(
+            "Maximum nodes", description="upper bound for --set nodes=", default=1, minimum=1
+        )
+        answers.sbatch_partition = wizard.ask(
+            "Slurm partition",
+            description="partition name for sbatch",
+            default=None,
+            required=False,
+        ) or None
+        answers.sbatch_time = wizard.ask(
+            "Time limit",
+            description="wall time for sbatch, e.g. 02:00:00",
+            default="02:00:00",
+        )
+        answers.srun_cpu_bind = wizard.ask(
+            "srun cpu-bind",
+            description="step CPU binding; 'none' keeps scheduler defaults",
+            default="none",
+        )
+    return answers
+
+
+# ---------------------------------------------------------------------------
+# Flows
+# ---------------------------------------------------------------------------
+def _bootstrap_client_targets(wizard: Wizard, targets: list[TargetAnswers]) -> tuple[str, ...]:
+    names = [t.name for t in targets]
+    if not names:
+        return ()
+    wizard.section("Client access")
+    wizard.say("  A client is one Terok project allowed to use this gateway.")
+    answer = wizard.ask(
+        "Targets this client may access",
+        description="comma list of target names, or * for all",
+        default="*",
+    )
+    if answer.strip() == "*":
+        return ("*",)
+    requested = tuple(t.strip() for t in answer.split(",") if t.strip())
+    unknown = [t for t in requested if t not in names]
+    if unknown:
+        wizard.say(f"  unknown targets ignored: {', '.join(unknown)}")
+    return tuple(t for t in requested if t in names)
+
+
+def _run_targets(wizard: Wizard) -> list[TargetAnswers]:
+    targets: list[TargetAnswers] = []
+    wanted = wizard.confirm(
+        "Set up a target now?",
+        default=True,
+        description="you can add more later with "
+        "'computeMCP-gatewayctl --add-target'",
+    )
+    while wanted:
+        targets.append(collect_target(wizard, {t.name for t in targets}))
+        wanted = wizard.confirm(
+            "Add another target?", default=False, description="repeat the target questions"
+        )
+    return targets
+
+
+def run_bootstrap(
+    config_path: str | Path,
+    *,
+    force: bool = False,
+    wizard: Wizard | None = None,
+) -> int:
+    """Create a new gateway configuration interactively."""
+    wizard = wizard or Wizard()
+    path = Path(config_path)
+    token_path = path.parent / Path(default_token_path()).name
+
+    wizard.say("computeMCP gateway setup")
+    wizard.say("  This writes a configuration and a hashed client token.  Every")
+    wizard.say("  question has a default in brackets; press Enter to accept it.")
+    if path.exists() and not force:
+        raise WizardAbort(
+            f"{path} already exists; pass --force to overwrite or use "
+            "'computeMCP-gatewayctl --add-target' to add a target"
+        )
+
+    wizard.section("Server")
+    listen = wizard.ask(
+        "Listen address",
+        description="host interface for the gateway HTTP API",
+        default="127.0.0.1",
+    )
+    port = wizard.ask_int(
+        "Port", description="gateway HTTP port", default=2222, minimum=1
+    )
+    allow_enrollment = wizard.confirm(
+        "Allow interactive enrollment (handshake)?",
+        default=True,
+        description="lets a Terok task request access; approval is still manual",
+    )
+    client_id = wizard.ask(
+        "Client id",
+        description="the Terok project this token belongs to",
+        default=os.environ.get("USER") or "alpaka",
+        validator=_validate_target_name,
+    )
+    client_label = wizard.ask(
+        "Client label",
+        description="optional human-readable note",
+        default=None,
+        required=False,
+    ) or None
+
+    targets = _run_targets(wizard)
+    client_targets = _bootstrap_client_targets(wizard, targets)
+
+    token = new_token()
+    text = render_gateway_config(
+        listen=listen,
+        port=port,
+        allow_enrollment=allow_enrollment,
+        client_id=client_id,
+        client_targets=client_targets,
+        client_label=client_label,
+        token_file=str(token_path),
+        targets=targets,
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.parent.chmod(0o700)
+    # Write the token hash first: the config names token_file explicitly, and an
+    # explicit token file must exist when the config is validated below.
+    append_token_hash(token_path, client_id, token)
+    with contextlib.suppress(OSError):
+        token_path.chmod(0o600)
+    _atomic_write(path, text, mode=0o600)
+    # Validate what was written before declaring success.
+    try:
+        load_config(path, token_file=None)
+    except ConfigError as exc:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise WizardAbort(f"generated configuration did not validate: {exc}") from exc
+
+    wizard.section("Done")
+    wizard.say(f"  config: {path}")
+    wizard.say(f"  tokens: {token_path} (hashes only)")
+    wizard.say("")
+    wizard.say(f"  client {client_id!r} token (shown once, store it safely):")
+    wizard.say(f"    {token}")
+    wizard.say("")
+    wizard.say("  Next steps:")
+    wizard.say(f"    1. start the gateway:  computeMCP-gateway --config {path}")
+    wizard.say("    2. in each Terok task run the handshake, then approve it:")
+    wizard.say(f"         computeMCP-handshake {client_id} --port {port}")
+    wizard.say("         computeMCP-gatewayctl approve <request-id>")
+    wizard.say("    3. verify:  computeMCP-gatewayctl status")
+    return 0
+
+
+def run_add_target(config_path: str | Path, *, wizard: Wizard | None = None) -> int:
+    """Append one target to an existing configuration."""
+    wizard = wizard or Wizard()
+    path = Path(config_path)
+    if not path.exists():
+        raise WizardAbort(
+            f"{path} does not exist; run 'computeMCP-gateway --bootstrap' first"
+        )
+    config = load_config(path, token_file=None)
+    answers = collect_target(wizard, set(config.targets))
+    block = render_target_block(answers)
+
+    existing = path.read_text()
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    _atomic_write(path, existing + block, mode=0o600)
+    try:
+        load_config(path, token_file=None)
+    except ConfigError as exc:
+        _atomic_write(path, existing, mode=0o600)
+        raise WizardAbort(f"appending the target did not validate: {exc}") from exc
+
+    wizard.section("Done")
+    wizard.say(f"  added target {answers.name!r} to {path}")
+    wizard.say(f"  reload a running gateway:  computeMCP-gatewayctl reload")
+    return 0

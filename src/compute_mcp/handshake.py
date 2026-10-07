@@ -26,7 +26,7 @@ from pathlib import Path
 import aiohttp
 
 DEFAULT_HOST = "host.containers.internal"
-DEFAULT_PORT = 2223
+DEFAULT_PORT = 2222
 POLL_INTERVAL = 3.0
 BEGIN_MARK = "# >>> computeMCP >>"
 END_MARK = "# <<< computeMCP <<"

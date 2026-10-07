@@ -2863,3 +2863,75 @@ async def test_connect_with_overrides_on_connected_target_warns_and_keeps_alloca
     assert "target-refresh" in result.get("warning", "")
     assert rec == {"dials": 0, "teardowns": 0}
 
+
+
+# ============================================================================
+# --bootstrap dispatch (setup wizard, no server start)
+# ============================================================================
+
+def test_parser_accepts_bootstrap_flags():
+    from compute_mcp.gateway import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["--bootstrap", "--config-dir", "/tmp/cfg", "--force"])
+    assert args.bootstrap is True
+    assert args.config_dir == "/tmp/cfg"
+    assert args.force is True
+    args = parser.parse_args(["--bootstrap", "--non-interactive"])
+    assert args.non_interactive is True
+
+
+def test_bootstrap_dispatches_to_setup(monkeypatch, tmp_path):
+    import compute_mcp.gateway as gateway_mod
+    import compute_mcp.setup as setup_mod
+
+    seen = {}
+
+    def fake_run_bootstrap(config_path, *, force=False, wizard=None):
+        seen["path"] = str(config_path)
+        seen["force"] = force
+        seen["terminal"] = wizard.terminal if wizard is not None else None
+        return 0
+
+    def explode(*a, **k):  # the server must never start
+        raise AssertionError("gateway server must not start during --bootstrap")
+
+    monkeypatch.setattr(setup_mod, "run_bootstrap", fake_run_bootstrap)
+    monkeypatch.setattr(gateway_mod, "_amain", explode)
+
+    rc = gateway_mod.main(["--bootstrap", "--config-dir", str(tmp_path)])
+    assert rc == 0
+    assert seen["path"] == str(tmp_path / "config.toml")
+    assert seen["force"] is False
+    # Without --non-interactive the wizard's terminal state follows isatty().
+    assert seen["terminal"] in (True, False)
+
+
+def test_bootstrap_non_interactive_disables_terminal(monkeypatch, tmp_path):
+    import compute_mcp.gateway as gateway_mod
+    import compute_mcp.setup as setup_mod
+
+    seen = {}
+
+    def fake_run_bootstrap(config_path, *, force=False, wizard=None):
+        seen["terminal"] = wizard.terminal
+        return 0
+
+    monkeypatch.setattr(setup_mod, "run_bootstrap", fake_run_bootstrap)
+    rc = gateway_mod.main(
+        ["--bootstrap", "--config-dir", str(tmp_path), "--non-interactive"]
+    )
+    assert rc == 0
+    assert seen["terminal"] is False
+
+
+def test_bootstrap_abort_returns_2(monkeypatch, tmp_path):
+    import compute_mcp.gateway as gateway_mod
+    import compute_mcp.setup as setup_mod
+
+    def fake_run_bootstrap(config_path, *, force=False, wizard=None):
+        raise setup_mod.WizardAbort("stop")
+
+    monkeypatch.setattr(setup_mod, "run_bootstrap", fake_run_bootstrap)
+    rc = gateway_mod.main(["--bootstrap", "--config-dir", str(tmp_path)])
+    assert rc == 2

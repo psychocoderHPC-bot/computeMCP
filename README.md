@@ -20,6 +20,45 @@ computeMCP-gateway (on the Terok host)
 The gateway TOML is the single source of truth for targets. A client can only
 name a configured target; an arbitrary SSH hostname is never accepted.
 
+## Quick start
+
+Three commands bring a fresh host to a working gateway. Run them as the normal
+(user, non-root) host account that will own the gateway.
+
+```bash
+python3 -m venv ~/.local/share/computeMCP-gateway/venv
+~/.local/share/computeMCP-gateway/venv/bin/pip install .
+ln -s ~/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway ~/.local/bin/computeMCP-gateway
+
+computeMCP-gateway --bootstrap        # interactive: questions below
+computeMCP-gateway                    # start; config + tokens already written
+```
+
+`--bootstrap` asks for the server address, one client (your Terok project) and
+optionally a first target, writes `~/.config/computeMCP-gateway/config.toml` and
+`tokens.toml` (hashes only, mode 0600), and prints the client's plaintext token
+once. Add more systems later with
+`computeMCP-gatewayctl --add-target`. To write elsewhere, pass `--config-dir
+DIR` (or `--config FILE`); `--force` overwrites an existing config.
+
+### Every gateway start: what to do
+
+1. **Create the container key once** (skip if it exists):
+   `ssh-keygen -t ed25519 -f ~/.ssh/computemcp_container -C computeMCP-gateway`.
+   Install only the `.pub` half as `authorized_keys` of the target `user`
+   (default `agent`).
+2. **Start the gateway**: `computeMCP-gateway` (or
+   `systemctl --user start computeMCP-gateway` with the shipped unit). It reads
+   `config.toml` and `tokens.toml`.
+3. **Check it is healthy**: `computeMCP-gatewayctl status`. Targets listed
+   `connected` are usable; `disconnected` usually means the container is down
+   (`connect_command`) or the allocation is not provisioned yet.
+4. **In each Terok task**: run the handshake once and approve it (see
+   [Set up the MCP inside a Terok task](#set-up-the-mcp-inside-a-terok-task)).
+
+The gateway validates `config.toml` on start and on reload, so a bad edit fails
+loudly instead of silently serving a stale target.
+
 ## Layout
 
 ```
@@ -33,6 +72,7 @@ src/compute_mcp/
   files.py        SFTP file operations
   gateway.py      state machine, HTTP API, interactive console
   enrollment.py   unauthenticated request queue + operator approval
+  setup.py        interactive --bootstrap / --add-target configuration wizard
   handshake.py    computeMCP-handshake: request access from inside a container
   mcp_server.py   MCP server (stdio) exposing computeMCP_* tools
   control.py      computeMCP-gatewayctl operator CLI
@@ -52,6 +92,42 @@ ln -s ~/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway ~/.local/bin
 mkdir -p ~/.config/computeMCP-gateway
 cp config.example.toml ~/.config/computeMCP-gateway/config.toml
 ```
+
+`--bootstrap` (see [Quick start](#quick-start)) writes `config.toml` and
+`tokens.toml` for you; the manual `cp` above is the alternative when you prefer
+to start from the fully commented template.
+
+### Configure the gateway interactively
+
+`computeMCP-gateway --bootstrap` creates the initial configuration. Every
+question prints a short description; questions with a fixed set of answers list
+them, and a default appears in brackets (press Enter to accept it).
+
+| Question | Meaning |
+| --- | --- |
+| Listen address / Port | Where the gateway serves its HTTP API (default `127.0.0.1:2222`) |
+| Allow interactive enrollment | Enables `computeMCP-handshake`; approval stays manual |
+| Client id / label | The Terok project this token belongs to |
+| Set up a target | Whether to configure a remote system now |
+| Target name | Internal label, e.g. `hal` |
+| Transport | `tunnel` (SSH alias, recommended) or `direct` (host:port) |
+| SSH alias / Remote user / Private key | Route connection details; the key default is `~/.ssh/computemcp_container` |
+| Container host-key fingerprint | Optional `SHA256:...` pin of the container sshd key |
+| Second factor | Whether the login node needs a password/OTP |
+| Container runtime / storage / image / GPU vendors | Drives the provisioning bundle (see below) |
+| Slurm node capacities / allocation / sbatch | Optional; needed for `--set` overrides and dry-run |
+
+On success it writes `config.toml` (0600), writes `tokens.toml` (0600, sha256
+hashes only) and prints the client token once. Add another system later:
+
+```bash
+computeMCP-gatewayctl --add-target                 # default config path
+computeMCP-gatewayctl --config FILE --add-target   # explicit config
+```
+
+`--add-target` validates the existing file, appends one `[targets.X]` block,
+re-validates the whole file and rolls back if the result would not load. It does
+not need a running gateway.
 
 Create a dedicated gateway-to-container key (never the user's normal key):
 
@@ -375,8 +451,10 @@ every route reaches the same container sshd, so one fingerprint covers them all.
 
 ## Example configuration
 
-The full annotated file is [`config.example.toml`](config.example.toml); a
-minimal working `~/.config/computeMCP-gateway/config.toml` is:
+The full annotated file is [`config.example.toml`](config.example.toml). For
+most users `computeMCP-gateway --bootstrap` writes this file for them; the
+snippets below are the reference for editing it by hand. A minimal working
+`~/.config/computeMCP-gateway/config.toml` is:
 
 ```toml
 [server]
@@ -494,10 +572,12 @@ key and never committed to a repository.
 Instead of pre-generating a token and copying it around, a container can ask for
 one. Run `computeMCP-handshake` **inside the Terok container**; it queues a request,
 waits while you approve it on the gateway console, receives the token, and wires
-it into the container:
+it into the container. This is step 3 of
+[Set up the MCP inside a Terok task](#set-up-the-mcp-inside-a-terok-task).
 
 ```bash
-computeMCP-handshake picongpu-bot-dev2 --port 2223 --system hal,fwk394
+computeMCP-handshake picongpu-bot-dev2 --port 2222 --system hal,fwk394
+# --port must match [server] port in the gateway config (default 2222).
 # --system is a comma-separated allow-list; omit it for an empty ACL
 # (no targets) or pass --system '*' for all targets.
 ```
@@ -506,7 +586,7 @@ Flow:
 
 ```
 container                                     gateway (host)
-computeMCP-handshake <client> --port 2223          console:
+computeMCP-handshake <client> --port 2222          console:
    │  POST /v1/enroll  {client_id,targets}       gateway> enrollments
    ├──────────────────────────────────────────►  REQUEST ... CLIENT ... TARGETS
    │  (request queued, pending operator)         gateway> approve <request-id>
@@ -567,39 +647,67 @@ shield:
   does not pick up later project changes.
 - Adjust the port (`2222` above) to match `[server] port` in the gateway config.
 
-## Install the MCP inside a Terok container
+## Set up the MCP inside a Terok task
 
-```bash
-python3 -m venv /home/dev/.local/share/computeMCP/venv
-/home/dev/.local/share/computeMCP/venv/bin/pip install <this-package>
-ln -s /home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp /home/dev/.local/bin/computeMCP-mcp
-```
+Do these steps once per Terok task, after the gateway is running. They install
+the MCP bridge, let the task ask the gateway for its token, and record that
+token where the agent can read it.
 
-Configure the task environment. The MCP process reads two variables at start:
+1. **Install the MCP bridge in the task** (not on the host):
 
-```
-COMPUTEMCP_GATEWAY=http://host.containers.internal:2222
-COMPUTEMCP_TOKEN=<project-specific-token>
-```
+   ```bash
+   python3 -m venv /home/dev/.local/share/computeMCP/venv
+   /home/dev/.local/share/computeMCP/venv/bin/pip install <this-package>
+   ln -s /home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp /home/dev/.local/bin/computeMCP-mcp
+   ```
 
-Pass them either through the environment or, more robustly, directly in the MCP
-entry:
+2. **Allow the gateway through the Terok Shield** (default-deny). See
+   [Allow the gateway in the Terok Shield](#allow-the-gateway-in-the-terok-shield);
+   without this the handshake cannot connect.
 
-```json
-{
-  "mcp": {
-    "compute": {
-      "type": "local",
-      "command": ["/home/dev/.local/bin/computeMCP-mcp"],
-      "enabled": true,
-      "environment": {
-        "COMPUTEMCP_GATEWAY": "http://host.containers.internal:2222",
-        "COMPUTEMCP_TOKEN": "<project-specific-token>"
-      }
-    }
-  }
-}
-```
+3. **Request access with the handshake.** This is the one command the task
+   needs:
+
+   ```bash
+   computeMCP-handshake <client-id> --port 2222 --system hal,fwk394
+   # --system is the target allow-list; omit for none, or pass '*' for all.
+   ```
+
+   The task prints a request id and waits. On the host, approve it:
+
+   ```bash
+   computeMCP-gatewayctl enrollments
+   computeMCP-gatewayctl approve <request-id>
+   ```
+
+   On approval the gateway appends `[clients.<client-id>]`, writes the token
+   hash, reloads, and hands the plaintext token to the task once.
+
+4. **Point the MCP at the gateway.** The handshake writes `COMPUTEMCP_GATEWAY`
+   and `COMPUTEMCP_TOKEN` to the task (default: a marked block in `~/.bashrc`;
+   `--env-file` keeps the secret in a separate 0600 file). A running agent does
+   not see new shell variables, so also paste the printed `environment` snippet
+   into the MCP entry, or restart the agent from a fresh shell:
+
+   ```json
+   {
+     "mcp": {
+       "compute": {
+         "type": "local",
+         "command": ["/home/dev/.local/bin/computeMCP-mcp"],
+         "enabled": true,
+         "environment": {
+           "COMPUTEMCP_GATEWAY": "http://host.containers.internal:2222",
+           "COMPUTEMCP_TOKEN": "<project-specific-token>"
+         }
+       }
+     }
+   }
+   ```
+
+   `COMPUTEMCP_GATEWAY` is what the *container* uses to reach the host
+   (`host.containers.internal`, not the host's own address);
+   `COMPUTEMCP_TOKEN` is the per-project token.
 
 Prefer the explicit `environment` block: an `export` in `~/.bashrc` (or a
 login-shell config) does **not** reliably reach an already-running agent/TUI
@@ -1126,6 +1234,7 @@ Only targets inside the key's ACL are touched; anything else is refused.
 
 ```bash
 computeMCP-gatewayctl --config config.toml status
+computeMCP-gatewayctl --config config.toml --add-target   # wizard: add a system
 computeMCP-gatewayctl --config config.toml target-connect hal
 computeMCP-gatewayctl --config config.toml target-refresh hal
 computeMCP-gatewayctl --config config.toml target-stop hal

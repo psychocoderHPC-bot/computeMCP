@@ -154,7 +154,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="client id whose token to use (default: admin)")
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     parser.add_argument("--timeout", type=float, default=None)
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--add-target",
+        action="store_true",
+        help="interactively append a [targets.X] block to the config and exit "
+        "(no running gateway required)",
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
 
     sub.add_parser("status", help="show targets and their state")
     sub.add_parser("targets", help="list target names")
@@ -521,6 +527,19 @@ def _emit_sessions(args, body: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.add_target:
+        # Setup wizard: no gateway connection, no token needed.
+        from .setup import Wizard, WizardAbort, run_add_target
+
+        try:
+            return run_add_target(
+                args.config, wizard=Wizard(terminal=None)
+            )
+        except WizardAbort as exc:
+            print(f"add-target: {exc}", file=sys.stderr)
+            return 2
+    if not getattr(args, "command", None):
+        build_parser().error("a command is required (or use --add-target)")
     import asyncio
 
     return asyncio.run(_run(args))
