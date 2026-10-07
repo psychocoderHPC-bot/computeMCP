@@ -35,6 +35,16 @@ log = logging.getLogger(__name__)
 
 MARKER_PREFIX = ".computemcp-bundle-"
 PROVISION_SCRIPT = "computemcp-provision.sh"
+# The shipped bundle is the generic container provisioner: it builds and starts
+# the container on the login node and, when the target has a scheduler, also
+# submits the Slurm allocation.  ``computemcp-container`` is the canonical name;
+# ``computemcp-slurm`` is the legacy alias kept for existing configurations.
+# Both resolve to the same directory in the ``compute_mcp.bundles`` package, so
+# they yield the same content digest.
+CANONICAL_BUNDLE = "computemcp-container"
+# The shipped directory keeps its historical name, so both source names resolve
+# to it and yield the same content digest.
+_BUNDLE_DIRS: dict[str, str] = {CANONICAL_BUNDLE: "computemcp-slurm"}
 _EXECUTABLE = {
     "computemcp-container.sh",
     "computemcp-job.sh",
@@ -46,9 +56,16 @@ class BundleError(Exception):
     """A bundle could not be loaded or deployed."""
 
 
+def _bundle_dir(source: str) -> str:
+    """Map a source name (canonical or legacy alias) to its shipped directory."""
+    return _BUNDLE_DIRS.get(source, source)
+
+
 def load_bundle(source: str) -> "BundleContents":
     """Read a shipped bundle and compute its content digest."""
-    root = importlib.resources.files("compute_mcp.bundles").joinpath(source)
+    root = importlib.resources.files("compute_mcp.bundles").joinpath(
+        _bundle_dir(source)
+    )
     try:
         names = sorted(
             entry.name for entry in root.iterdir() if entry.is_file()

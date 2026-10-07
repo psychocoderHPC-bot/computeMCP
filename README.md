@@ -83,7 +83,7 @@ src/compute_mcp/
   mcp_server.py   MCP server (stdio) exposing computeMCP_* tools
   control.py      computeMCP-gatewayctl operator CLI
 tests/            unit tests (see `pytest -q`)
-scripts/computemcp-slurm/  Slurm provisioning bundle (packaged under src, symlinked; see its README)
+scripts/computemcp-slurm/  generic container provisioning bundle (legacy dir name; packaged under src, symlinked; see its README)
 config.example.toml
 systemd/compute-mcp-gateway.service
 ```
@@ -824,7 +824,8 @@ computes the resource plan, renders the per-stage scheduler arguments, and
 exports them to the trusted `provision_command` as environment variables.
 The login node needs only Bash for the argument bridge. The shipped
 provisioning bundle, its auto-build flow, GPU vendor transitions, and
-end-to-end lifecycle are documented in
+end-to-end lifecycle (including direct start on a non-Slurm host) are
+documented in
 [`scripts/computemcp-slurm/README.md`](scripts/computemcp-slurm/README.md).
 
 ### `[targets.X.node]`
@@ -937,9 +938,14 @@ Tells the gateway to deploy the shipped provisioning bundle over the route
 connection and run it from there. No hand-placed copy is needed, and the
 container's authorized public key is derived from `client_key`.
 
+The bundle is the generic container provisioner: it builds and starts the
+container on the login node and submits a Slurm allocation when the target has
+one. `computemcp-container` is the canonical name; `computemcp-slurm` is the
+legacy alias and resolves to the same shipped bundle.
+
 | Key | Type | Notes |
 | --- | --- | --- |
-| `source` | string | Bundled identifier. Currently `computemcp-slurm` |
+| `source` | string | Bundled identifier. `computemcp-container` is the generic provisioner; `computemcp-slurm` is the legacy alias and resolves to the same bundle |
 | `deploy-dir` | string | Remote absolute directory on shared storage. Defaults to `<container.storage-root>/bundle` |
 | `auto-deploy` | boolean | Default `true`: upload when the remote content marker differs. `false` pins the already-deployed copy, even after a gateway upgrade |
 | `provision-env` | string array | Shell lines run on the remote before the container runtime is used: once on the login/route node before the build, and again inside the container-start path on the job node. Empty (default) is a no-op |
@@ -981,7 +987,7 @@ provision_timeout = 960.0
 # defaults to <container.storage-root>/bundle and must be on storage visible to
 # login and compute nodes.
 [targets.rosi.bundle]
-source = "computemcp-slurm"
+source = "computemcp-container"
 # deploy-dir = "/scratch/USER/computemcp/bundle"
 # auto-deploy = true          # false pins the copy already on the login node
 # provision-env = ["module load apptainer", "source /etc/profile.d/spack.sh"]
@@ -1071,7 +1077,7 @@ sharing = "unknown"
 provision_timeout = 600.0
 
 [targets.cpuhost.bundle]
-source = "computemcp-slurm"
+source = "computemcp-container"
 
 # Node capacities: no GPUs described.
 [targets.cpuhost.node]
@@ -1132,7 +1138,7 @@ host_key_algorithms = ["ssh-ed25519"]
 auto_connect = true
 
 [targets.hal-docker.bundle]
-source = "computemcp-slurm"
+source = "computemcp-container"
 deploy-dir = "$HOME/computemcp/bundle"
 provision-env = ["source /etc/profile.d/docker.sh"]
 
@@ -1535,10 +1541,12 @@ once the job starts. The gateway supports this with `provision_command`, a
 trusted script that acquires the node and prints the endpoint to dial. A
 config-driven bundle ships as
 [`scripts/computemcp-slurm/`](scripts/computemcp-slurm/README.md): it builds
-the container, submits the allocation from the gateway-rendered arguments
-(see "Slurm allocation and container configuration"), starts a relay, and
-prints the endpoint. Use the bundle for new Slurm targets; the operator-written
-example below remains useful when the site scripts already own the job.
+the container and either submits the allocation from the gateway-rendered
+arguments (see "Slurm allocation and container configuration") or starts the
+container directly on a host without a scheduler; on the Slurm path it starts a
+relay and prints the endpoint. Use the bundle for new targets; the
+operator-written example below remains useful when the site scripts already own
+the job.
 
 How the pieces connect:
 

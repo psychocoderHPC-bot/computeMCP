@@ -301,7 +301,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # again inside the container-start path on the job node); an empty array is a
 # # no-op.  With a bundle block, provision_command is not required.
 # [targets.rosi.bundle]
-# source = "computemcp-slurm"
+# source = "computemcp-container"
 # # deploy-dir = "/scratch/USER/computemcp/bundle"
 # # auto-deploy = true
 # # provision-env = ["module load apptainer", "source /etc/profile.d/spack.sh"]
@@ -400,7 +400,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # provision_timeout = 600.0
 #
 # [targets.cpuhost.bundle]
-# source = "computemcp-slurm"
+# source = "computemcp-container"
 # # deploy-dir = "/scratch/USER/computemcp/bundle"
 #
 # [targets.cpuhost.node]
@@ -453,7 +453,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # auto_connect = true
 #
 # [targets.hal-docker.bundle]
-# source = "computemcp-slurm"
+# source = "computemcp-container"
 # deploy-dir = "$HOME/computemcp/bundle"
 # # provision-env = ["source /etc/profile.d/docker.sh"]
 #

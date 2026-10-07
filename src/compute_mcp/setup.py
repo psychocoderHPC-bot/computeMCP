@@ -77,6 +77,10 @@ class TargetAnswers:
     bundle: bool = False
     bundle_deploy_dir: str | None = None
     bundle_provision_env: tuple[str, ...] = ()
+    # Whether the target sits behind a Slurm scheduler.  Independent of the
+    # bundle: a plain Docker host uses the same generic provisioner without a
+    # node/allocation/slurm block.
+    use_slurm: bool = False
     node_cpus: int | None = None
     node_gpus: int | None = None
     node_memory: str | None = None
@@ -331,7 +335,7 @@ def render_target_block(answers: TargetAnswers) -> str:
     if answers.bundle:
         lines.append("")
         lines.append(f"[targets.{answers.name}.bundle]")
-        lines.append('source = "computemcp-slurm"')
+        lines.append('source = "computemcp-container"')
         if answers.bundle_deploy_dir:
             lines.append(f"deploy-dir = {_toml_str(answers.bundle_deploy_dir)}")
         if answers.bundle_provision_env:
@@ -675,12 +679,19 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
             )
 
     # A bundle needs tunnel transport and a client key (validated by the
-    # loader); only offer it where it can actually work.
-    if answers.transport == "tunnel" and answers.client_key:
+    # loader); only offer it where it can actually work.  The shipped bundle is
+    # the generic container provisioner, not Slurm-specific, so the provisioning
+    # question is independent of the scheduler question below.
+    if (
+        answers.container_runtime
+        and answers.transport == "tunnel"
+        and answers.client_key
+    ):
         if wizard.confirm(
-            "Does this target use the Slurm provisioning bundle?",
-            default=False,
-            description="the gateway deploys it and runs it on the login node",
+            "Should the gateway build and start this container?",
+            default=True,
+            description="the gateway deploys the generic provisioning bundle "
+            "over the route connection and runs it on the login node",
         ):
             answers.bundle = True
             if not answers.container_storage_root:
@@ -704,9 +715,18 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
             )
 
     # -- Slurm allocation (only for a Slurm target) ------------------------
-    # These keys describe the cluster scheduler.  A target without the Slurm
-    # bundle is a plain container/SSH host, so it is not asked.
+    # These keys describe the cluster scheduler and affect only the plan.  The
+    # question is asked only when a bundle is configured (a scheduler matters
+    # only there), and the section itself is gated on the explicit answer so a
+    # plain Docker host gets no node/allocation/slurm block.
     if answers.bundle:
+        answers.use_slurm = wizard.confirm(
+            "Is this target behind a Slurm scheduler?",
+            default=False,
+            description="enables the node, allocation and sbatch/srun plan "
+            "questions; a plain container host answers no",
+        )
+    if answers.use_slurm:
         wizard.section("Slurm allocation")
         if wizard.confirm(
             "Configure the Slurm node capacities and allocation policy?",

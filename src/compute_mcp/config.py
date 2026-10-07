@@ -108,7 +108,10 @@ MAPPING_VOCABULARY: dict[str, frozenset[str]] = {
 # Bundle identifiers shipped inside the ``compute_mcp.bundles`` package.  The
 # gateway deploys the exact revision it was built from; a target names one of
 # these instead of pointing provision_command at a hand-placed copy.
-KNOWN_BUNDLES = ("computemcp-slurm",)
+# ``computemcp-container`` is the canonical generic provisioner (builds and
+# starts the container on the login node, with or without a Slurm scheduler);
+# ``computemcp-slurm`` is the legacy alias and resolves to the same bundle.
+KNOWN_BUNDLES = ("computemcp-container", "computemcp-slurm")
 
 
 @dataclass(frozen=True)

@@ -1,10 +1,12 @@
-# computeMCP Slurm provisioning bundle
+# computeMCP container provisioning bundle
 
 One config-driven bundle replaces the per-system scripts.  The gateway renders a
 resource plan and two argument lists, exports them as `COMPUTEMCP_*` variables,
-and runs `computemcp-provision.sh` on the Slurm login node.  The helper builds
-the container, submits one single-node allocation, starts a relay, and prints
-`ENDPOINT host:port` once the forwarded SSH endpoint answers.
+and runs `computemcp-provision.sh` on the route (login) node.  The helper builds
+the container and, when the target has a scheduler, submits one single-node
+allocation, starts a relay, and prints `ENDPOINT host:port` once the forwarded
+SSH endpoint answers.  On a host without a scheduler it skips `sbatch`/`srun`
+and starts the container directly on the route node.
 
 ## Files
 
@@ -49,7 +51,7 @@ provision_timeout = 960.0
 
 # Let the gateway deploy and run this bundle; no manual copy or command.
 [targets.example.bundle]
-source = "computemcp-slurm"
+source = "computemcp-container"
 # deploy-dir = "/scratch/agent/computemcp/bundle"   # default <storage-root>/bundle
 # auto-deploy = true                                # false pins the deployed copy
 
@@ -94,7 +96,7 @@ values.
 
 | `[targets.X.bundle]` key | Behavior |
 | --- | --- |
-| `source` | Which shipped bundle to deploy. Currently `computemcp-slurm` |
+| `source` | Which shipped bundle to deploy. `computemcp-container` is canonical; `computemcp-slurm` is the legacy alias for the same bundle |
 | `deploy-dir` | Remote directory; defaults to `<storage-root>/bundle`. Overwritten only when the content marker differs |
 | `auto-deploy` | `true` (default) re-deploys on a hash change; `false` pins the deployed copy |
 

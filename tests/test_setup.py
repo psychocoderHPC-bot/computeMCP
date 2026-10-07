@@ -99,6 +99,7 @@ def _full_target():
         client_key="/home/u/.ssh/computemcp_container",
         host_key_sha256="SHA256:" + "a" * 40,
         bundle=True,
+        use_slurm=True,
         container_runtime="apptainer",
         container_storage_root="/scratch/u/computemcp",
         container_image="docker://ubuntu:24.04",
@@ -138,7 +139,7 @@ def test_render_config_loads(tmp_path):
     assert t.node.gpus == 4
     assert t.container.runtime == "apptainer"
     assert t.container.gpus == ("nvidia", "amd")
-    assert t.bundle.source == "computemcp-slurm"
+    assert t.bundle.source == "computemcp-container"
     assert t.allocation.single_node == "gpu-proportional"
     assert cfg.clients["alpaka"].allow_all is True
 
@@ -183,7 +184,7 @@ def test_render_target_block_is_parseable():
     block = render_target_block(_full_target())
     parsed = tomllib.loads(block)
     assert parsed["targets"]["rosi"]["node"]["cpus"] == 24
-    assert parsed["targets"]["rosi"]["bundle"]["source"] == "computemcp-slurm"
+    assert parsed["targets"]["rosi"]["bundle"]["source"] == "computemcp-container"
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +200,9 @@ def _bootstrap_answers():
         "ssh-ed25519",                         # host-key algorithms
         "n",                                   # no 2FA
         "y", "apptainer", "/scratch/u/computemcp", "docker://ubuntu:24.04", "nvidia",
-        "y",                                   # bundle
+        "y",                                   # build/start the container? yes
         "",                                    # pre-provision environment (none)
+        "y",                                   # behind a Slurm scheduler? yes
         "y",                                   # slurm description
         "24", "4", "378000M", "gpu-proportional", "exclusive", "4", "gpu", "02:00:00", "none",
         "n",                                   # no more targets
@@ -311,10 +313,10 @@ def _minimal_bootstrap(tmp_path):
 
 def test_add_target_appends_and_validates(tmp_path):
     config_path = _minimal_bootstrap(tmp_path)
-    # name, transport, host, port, user, fingerprint, 2FA, container, bundle, slurm
+    # name, transport, host, port, user, fingerprint, 2FA, container
     rc = run_add_target(
         config_path,
-        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n", "n", "n"]),
+        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n"]),
     )
     assert rc == 0
     # The target lives in its own include file, listed from the main config.
@@ -335,7 +337,7 @@ def test_add_target_rejects_duplicate_name(tmp_path):
     config_path = _minimal_bootstrap(tmp_path)
     run_add_target(
         config_path,
-        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n", "n", "n"]),
+        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n"]),
     )
     # Second attempt reuses the name; the validator re-asks, so supply it twice.
     before = config_path.read_text()
@@ -344,7 +346,7 @@ def test_add_target_rejects_duplicate_name(tmp_path):
         # runs out, proving the duplicate was refused rather than accepted.
         run_add_target(
             config_path,
-            wizard=_wizard(["hal", "hal", "direct", "h", "2222", "agent", "", "n", "n", "n", "n"]),
+            wizard=_wizard(["hal", "hal", "direct", "h", "2222", "agent", "", "n", "n"]),
         )
     assert config_path.read_text() == before
 
@@ -367,7 +369,7 @@ def test_add_target_rolls_back_target_file_on_invalid_append(tmp_path, monkeypat
     with pytest.raises(WizardAbort):
         run_add_target(
             config_path,
-            wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n", "n", "n"]),
+            wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n"]),
         )
     # The orphaned target file is removed; append_include reverts the main file.
     assert not (tmp_path / "systems" / "hal.toml").exists()
@@ -511,30 +513,86 @@ def test_collect_target_empty_user_is_omitted():
 def test_no_slurm_question_without_bundle():
     from compute_mcp.setup import collect_target
 
-    # container yes, bundle no -> no Slurm questions; the wizard must not ask
-    # for them, so the answer list ends right after the container/bundle answers.
+    # container yes, provision no -> no bundle, no Slurm questions; the wizard
+    # must not ask for them, so the answer list ends right after the container
+    # answers.
     w = _wizard(
         [
             "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n",
             "y", "apptainer", "$HOME/computemcp", "docker://ubuntu:24.04", "",
-            "n",  # bundle no
+            "n",  # build/start the container? no
         ]
     )
     answers = collect_target(w, set())
+    assert answers.bundle is False
     assert answers.node_cpus is None
     assert answers.container_storage_root == "$HOME/computemcp"
+
+
+def test_wizard_container_target_without_slurm_gets_bundle():
+    from compute_mcp.setup import collect_target
+
+    # A plain Docker host: container yes, provision yes, slurm no.  The bundle
+    # block must be written (the generic provisioner) and the container block
+    # too, with no node/allocation/slurm block.
+    w = _wizard(
+        [
+            "hal", "tunnel", "hal", "agent", "/home/u/.ssh/k", "", "n",
+            "y", "docker", "$HOME/computemcp", "ubuntu:24.04", "nvidia",
+            "y",   # build and start this container? yes
+            "",    # pre-provision environment (none)
+            "n",   # behind a Slurm scheduler? no
+        ]
+    )
+    answers = collect_target(w, set())
+    assert answers.bundle is True
+    assert answers.use_slurm is False
+    block = render_target_block(answers)
+    assert "[targets.hal.bundle]" in block
+    assert "[targets.hal.container]" in block
+    assert "[targets.hal.node]" not in block
+    assert "[targets.hal.allocation]" not in block
+    assert "[targets.hal.slurm" not in block
+    parsed = tomllib.loads(block)
+    assert parsed["targets"]["hal"]["bundle"]["source"] == "computemcp-container"
+    # The generated block must load through the real loader.
+    import tempfile
+    from pathlib import Path
+
+    from compute_mcp.config import load_config
+
+    with tempfile.TemporaryDirectory() as tmp:
+        write_target_file(Path(tmp), answers)
+        token_path = Path(tmp) / "tokens.toml"
+        token_path.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+        config_path = Path(tmp) / "config.toml"
+        config_path.write_text(
+            render_gateway_config(
+                listen="127.0.0.1",
+                port=2222,
+                allow_enrollment=False,
+                client_id="alpaka",
+                client_targets=(),
+                client_label=None,
+                token_file=str(token_path),
+                include=[target_relative_path("hal")],
+            )
+        )
+        cfg = load_config(config_path)
+    assert cfg.targets["hal"].bundle is not None
+    assert cfg.targets["hal"].node is None
 
 
 def test_collect_target_bundle_provision_env_comma_separated():
     from compute_mcp.setup import collect_target
 
-    # name, transport, aliases, user, key, fingerprint, 2FA, container n, bundle y,
-    # provision-env, slurm n
+    # name, transport, aliases, user, key, fingerprint, 2FA, container yes,
+    # provision yes, provision-env, slurm no
     w = _wizard(
         [
             "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n",
             "y", "apptainer", "$HOME/computemcp", "docker://ubuntu:24.04", "",
-            "y",  # bundle yes
+            "y",  # build/start the container? yes
             "module load apptainer, source /etc/profile.d/spack.sh",
             "n",  # no Slurm questions
         ]

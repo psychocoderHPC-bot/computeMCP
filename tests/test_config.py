@@ -1077,13 +1077,25 @@ def test_bundle_block_defaults():
         base_raw(
             client_key="/home/user/.ssh/key",
             container={"runtime": "apptainer", "storage-root": "/scratch/x"},
-            bundle={"source": "computemcp-slurm"},
+            bundle={"source": "computemcp-container"},
         )
     )
     bundle = cfg.targets["hal"].bundle
-    assert bundle.source == "computemcp-slurm"
+    assert bundle.source == "computemcp-container"
     assert bundle.deploy_dir is None
     assert bundle.auto_deploy is True
+
+
+def test_bundle_legacy_slurm_source_still_parses():
+    # Back-compat: existing configs keep loading and resolving.
+    cfg = parse_config(
+        base_raw(
+            client_key="/home/user/.ssh/key",
+            container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+            bundle={"source": "computemcp-slurm"},
+        )
+    )
+    assert cfg.targets["hal"].bundle.source == "computemcp-slurm"
 
 
 def test_bundle_block_parsed():

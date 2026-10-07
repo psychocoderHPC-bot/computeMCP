@@ -162,6 +162,17 @@ def test_load_bundle_unknown_source_rejected():
         load_bundle("does-not-exist")
 
 
+def test_load_bundle_container_name_and_legacy_alias_agree():
+    # The canonical generic name and the legacy Slurm alias resolve to the same
+    # shipped directory, so they must produce identical contents and digest.
+    canonical = load_bundle("computemcp-container")
+    legacy = load_bundle("computemcp-slurm")
+    assert {name for name, _ in canonical.files} == {
+        name for name, _ in legacy.files
+    }
+    assert canonical.digest == legacy.digest
+
+
 def test_resolve_deploy_dir_prefers_explicit_then_storage_root(tmp_path):
     explicit = _bundle_target(tmp_path, deploy_dir="/scratch/x/b")
     assert resolve_deploy_dir(explicit) == "/scratch/x/b"
