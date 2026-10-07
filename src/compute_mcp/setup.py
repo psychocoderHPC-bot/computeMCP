@@ -18,7 +18,6 @@ drive the flow without a terminal.
 from __future__ import annotations
 
 import contextlib
-import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -654,26 +653,6 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
 # ---------------------------------------------------------------------------
 # Flows
 # ---------------------------------------------------------------------------
-def _bootstrap_client_targets(wizard: Wizard, targets: list[TargetAnswers]) -> tuple[str, ...]:
-    names = [t.name for t in targets]
-    if not names:
-        return ()
-    wizard.section("Client access")
-    wizard.say("  A client is one Terok project allowed to use this gateway.")
-    answer = wizard.ask(
-        "Targets this client may access",
-        description="comma list of target names, or * for all",
-        default="*",
-    )
-    if answer.strip() == "*":
-        return ("*",)
-    requested = tuple(t.strip() for t in answer.split(",") if t.strip())
-    unknown = [t for t in requested if t not in names]
-    if unknown:
-        wizard.say(f"  unknown targets ignored: {', '.join(unknown)}")
-    return tuple(t for t in requested if t in names)
-
-
 def _run_targets(wizard: Wizard) -> list[TargetAnswers]:
     targets: list[TargetAnswers] = []
     wanted = wizard.confirm(
@@ -702,8 +681,9 @@ def run_bootstrap(
     token_path = path.parent / Path(default_token_path()).name
 
     wizard.say("computeMCP gateway setup")
-    wizard.say("  This writes a configuration and a hashed client token.  Every")
-    wizard.say("  question has a default in brackets; press Enter to accept it.")
+    wizard.say("  This writes a configuration and one hashed operator token for")
+    wizard.say("  computeMCP-gatewayctl.  Every question has a default in")
+    wizard.say("  brackets; press Enter to accept it.")
     if path.exists() and not force:
         raise WizardAbort(
             f"{path} already exists; pass --force to overwrite or use "
@@ -722,23 +702,17 @@ def run_bootstrap(
     allow_enrollment = wizard.confirm(
         "Allow interactive enrollment (handshake)?",
         default=True,
-        description="lets a Terok task request access; approval is still manual",
+        description="lets a Terok task request access; approval stays manual. "
+        "Written to the config so you can disable it later.",
     )
-    client_id = wizard.ask(
-        "Client id",
-        description="the Terok project this token belongs to",
-        default=os.environ.get("USER") or "alpaka",
-        validator=_validate_target_name,
-    )
-    client_label = wizard.ask(
-        "Client label",
-        description="optional human-readable note",
-        default=None,
-        required=False,
-    ) or None
+
+    # The operator client for computeMCP-gatewayctl.  A Terok task receives its
+    # own token through the handshake, so bootstrap mints no project token.
+    client_id = "admin"
+    client_label = "operator"
+    client_targets = ("*",)
 
     targets = _run_targets(wizard)
-    client_targets = _bootstrap_client_targets(wizard, targets)
 
     token = new_token()
     include = [target_relative_path(t.name) for t in targets]
@@ -791,15 +765,17 @@ def run_bootstrap(
         for target_path in written_targets:
             wizard.say(f"    {target_path}")
     wizard.say("")
-    wizard.say(f"  client {client_id!r} token (shown once, store it safely):")
+    wizard.say(f"  operator client {client_id!r} token (shown once, store it safely):")
     wizard.say(f"    {token}")
     wizard.say("")
     wizard.say("  Next steps:")
     wizard.say(f"    1. start the gateway:  computeMCP-gateway --config {path}")
-    wizard.say("    2. in each Terok task run the handshake, then approve it:")
-    wizard.say(f"         computeMCP-handshake {client_id} --port {port}")
-    wizard.say("         computeMCP-gatewayctl approve <request-id>")
-    wizard.say("    3. verify:  computeMCP-gatewayctl status")
+    wizard.say("    2. use the token above for computeMCP-gatewayctl, e.g.")
+    wizard.say("         export COMPUTEMCP_TOKEN=<token>")
+    wizard.say(f"         computeMCP-gatewayctl --config {path} status")
+    wizard.say("    3. inside each Terok task run the handshake, then approve it:")
+    wizard.say(f"         computeMCP-handshake <project-id> --port {port}")
+    wizard.say("         computeMCP-gatewayctl approve <request-id>   # on the host")
     return 0
 
 

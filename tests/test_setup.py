@@ -192,7 +192,7 @@ def test_render_target_block_is_parseable():
 
 def _bootstrap_answers():
     return [
-        "127.0.0.1", "2222", "y", "alpaka", "",
+        "127.0.0.1", "2222", "y",              # server + enrollment
         "y",                                   # set up a target
         "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "SHA256:" + "a" * 40, "n",
         "y", "apptainer", "/scratch/u/computemcp", "docker://ubuntu:24.04", "nvidia",
@@ -200,7 +200,6 @@ def _bootstrap_answers():
         "y",                                   # slurm description
         "24", "4", "378000M", "gpu-proportional", "exclusive", "4", "gpu", "02:00:00", "none",
         "n",                                   # no more targets
-        "*",                                   # client targets
     ]
 
 
@@ -216,7 +215,26 @@ def test_bootstrap_writes_config_and_hashed_token(tmp_path):
 
     cfg = load_config(config_path)
     assert set(cfg.targets) == {"rosi"}
-    assert cfg.clients["alpaka"].allow_all
+    # Bootstrap mints only the operator token, not a per-project one.
+    assert set(cfg.clients) == {"admin"}
+    assert cfg.clients["admin"].allow_all
+
+
+def test_bootstrap_enables_enrollment_by_default(tmp_path):
+    config_path = tmp_path / "config.toml"
+    run_bootstrap(config_path, wizard=_wizard(_bootstrap_answers()))
+    cfg = load_config(config_path)
+    assert cfg.server.allow_enrollment is True
+    assert "allow_enrollment = true" in config_path.read_text()
+
+
+def test_bootstrap_can_disable_enrollment(tmp_path):
+    answers = list(_bootstrap_answers())
+    answers[2] = "n"  # enrollment off
+    config_path = tmp_path / "config.toml"
+    run_bootstrap(config_path, wizard=_wizard(answers))
+    cfg = load_config(config_path)
+    assert cfg.server.allow_enrollment is False
 
 
 def test_bootstrap_refuses_overwrite_without_force(tmp_path):
@@ -230,11 +248,11 @@ def test_bootstrap_force_overwrites(tmp_path):
     config_path = tmp_path / "config.toml"
     run_bootstrap(config_path, wizard=_wizard(_bootstrap_answers()))
     # A minimal second run with --force: no target.
-    minimal = ["127.0.0.1", "2222", "n", "other", "", "n"]
+    minimal = ["127.0.0.1", "2222", "n", "n"]
     rc = run_bootstrap(config_path, force=True, wizard=_wizard(minimal))
     assert rc == 0
     cfg = load_config(config_path)
-    assert set(cfg.clients) == {"other"}
+    assert set(cfg.clients) == {"admin"}
     assert cfg.targets == {}
 
 
@@ -243,7 +261,7 @@ def test_bootstrap_stores_only_the_hash(tmp_path, capsys):
     run_bootstrap(config_path, wizard=_wizard(_bootstrap_answers()))
     tokens_text = (tmp_path / "tokens.toml").read_text()
     table = tomllib.loads(tokens_text)["tokens"]
-    stored = table["alpaka"]
+    stored = table["admin"]
     assert stored.startswith("sha256:")
     # The config itself must not contain a plaintext token.
     assert "token =" not in config_path.read_text()
@@ -282,7 +300,7 @@ def _minimal_bootstrap(tmp_path):
     config_path = tmp_path / "config.toml"
     run_bootstrap(
         config_path,
-        wizard=_wizard(["127.0.0.1", "2222", "n", "alpaka", "", "n"]),
+        wizard=_wizard(["127.0.0.1", "2222", "n", "n"]),
     )
     return config_path
 

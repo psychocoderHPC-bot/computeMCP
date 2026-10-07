@@ -38,10 +38,9 @@ on `PATH`, so `computeMCP-gateway`, `computeMCP-gatewayctl`, `computeMCP-handsha
 and `computeMCP-mcp` are ready to call directly. There is no virtualenv to
 activate and no symlink to create.
 
-`--bootstrap` asks for the server address, one client (your Terok project) and
-optionally a first target, writes `~/.config/computeMCP-gateway/config.toml` and
-`tokens.toml` (hashes only, mode 0600), and prints the client's plaintext token
-once. Add more systems later with
+`--bootstrap` asks for the server address and optionally a first target, writes
+`~/.config/computeMCP-gateway/config.toml` and `tokens.toml` (hashes only, mode
+0600), and prints the operator token once. Add more systems later with
 `computeMCP-gatewayctl --add-target`. To write elsewhere, pass `--config-dir
 DIR` (or `--config FILE`); `--force` overwrites an existing config.
 
@@ -109,8 +108,7 @@ them, and a default appears in brackets (press Enter to accept it).
 | Question | Meaning |
 | --- | --- |
 | Listen address / Port | Where the gateway serves its HTTP API (default `127.0.0.1:2222`) |
-| Allow interactive enrollment | Enables `computeMCP-handshake`; approval stays manual |
-| Client id / label | The Terok project this token belongs to |
+| Allow interactive enrollment | Written to `[server] allow_enrollment`; default `true`, set `false` to disable the handshake |
 | Set up a target | Whether to configure a remote system now |
 | Target name | Internal label, e.g. `hal` |
 | Transport | `tunnel` (SSH alias, recommended) or `direct` (host:port) |
@@ -120,9 +118,15 @@ them, and a default appears in brackets (press Enter to accept it).
 | Container runtime / storage / image / GPU vendors | Drives the provisioning bundle (see below) |
 | Slurm node capacities / allocation / sbatch | Optional; needed for `--set` overrides and dry-run |
 
+Bootstrap does not ask for a project id. It creates the single **operator**
+client `admin` (`targets = ["*"]`) and prints that token once; it is the token
+`computeMCP-gatewayctl` uses. A Terok task never receives a pre-generated token:
+it requests its own through `computeMCP-handshake` and you approve it on the
+host.
+
 On success it writes `config.toml` (0600), writes `tokens.toml` (0600, sha256
 hashes only), writes each target to its own `systems/<name>.toml` file and
-prints the client token once. Add another system later:
+prints the operator token once. Add another system later:
 
 ```bash
 computeMCP-gatewayctl --add-target                 # default config path
