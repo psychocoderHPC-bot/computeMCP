@@ -330,8 +330,12 @@ def render_target_block(answers: TargetAnswers) -> str:
         lines.append(f"proxy_jump = {_toml_str(answers.proxy_jump)}")
     if answers.interactive_auth:
         lines.append("interactive_auth = true")
-    if not answers.auto_connect:
-        lines.append("auto_connect = false")
+    # The config loader defaults auto_connect to false, so the wizard default
+    # (true) must be rendered explicitly to round-trip.  A target configured
+    # for auto-connect needs the key present as true; omitting it (or writing
+    # false) would fall back to the loader default and never auto-connect.
+    if answers.auto_connect:
+        lines.append("auto_connect = true")
     if answers.bundle:
         lines.append("")
         lines.append(f"[targets.{answers.name}.bundle]")
@@ -622,13 +626,26 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
         )
         answers.host_key_algorithms = _split_list(algorithms)
 
-    if wizard.confirm(
+    answers.interactive_auth = wizard.confirm(
         "Does the login node require a second factor (password/OTP)?",
         default=False,
         description="2FA targets connect only on an explicit connect/refresh",
-    ):
-        answers.interactive_auth = True
+    )
+    if answers.interactive_auth:
+        # A second factor cannot be supplied while the gateway connects on its
+        # own, so auto-connect is forced off and the question is skipped.
         answers.auto_connect = False
+        wizard.say(
+            "  Auto-connect is unavailable for 2FA targets; the gateway "
+            "connects this target only on an explicit connect/refresh."
+        )
+    else:
+        answers.auto_connect = wizard.confirm(
+            "Automatically connect this target on gateway start?",
+            default=True,
+            description="disabled targets connect only on an explicit "
+            "connect/refresh",
+        )
 
     # -- container ---------------------------------------------------------
     wizard.section("Container")

@@ -199,6 +199,7 @@ def _bootstrap_answers():
         "SHA256:" + "a" * 40,                  # fingerprint pins verification
         "ssh-ed25519",                         # host-key algorithms
         "n",                                   # no 2FA
+        "y",                                   # auto-connect on gateway start
         "y", "apptainer", "/scratch/u/computemcp", "docker://ubuntu:24.04", "nvidia",
         "y",                                   # build/start the container? yes
         "",                                    # pre-provision environment (none)
@@ -313,10 +314,10 @@ def _minimal_bootstrap(tmp_path):
 
 def test_add_target_appends_and_validates(tmp_path):
     config_path = _minimal_bootstrap(tmp_path)
-    # name, transport, host, port, user, fingerprint, 2FA, container
+    # name, transport, host, port, user, fingerprint, 2FA, auto-connect, container
     rc = run_add_target(
         config_path,
-        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n"]),
+        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "y", "n"]),
     )
     assert rc == 0
     # The target lives in its own include file, listed from the main config.
@@ -337,7 +338,7 @@ def test_add_target_rejects_duplicate_name(tmp_path):
     config_path = _minimal_bootstrap(tmp_path)
     run_add_target(
         config_path,
-        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n"]),
+        wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "y", "n"]),
     )
     # Second attempt reuses the name; the validator re-asks, so supply it twice.
     before = config_path.read_text()
@@ -346,7 +347,7 @@ def test_add_target_rejects_duplicate_name(tmp_path):
         # runs out, proving the duplicate was refused rather than accepted.
         run_add_target(
             config_path,
-            wizard=_wizard(["hal", "hal", "direct", "h", "2222", "agent", "", "n", "n"]),
+            wizard=_wizard(["hal", "hal", "direct", "h", "2222", "agent", "", "n", "y", "n", "n"]),
         )
     assert config_path.read_text() == before
 
@@ -369,7 +370,7 @@ def test_add_target_rolls_back_target_file_on_invalid_append(tmp_path, monkeypat
     with pytest.raises(WizardAbort):
         run_add_target(
             config_path,
-            wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n"]),
+            wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "y", "n"]),
         )
     # The orphaned target file is removed; append_include reverts the main file.
     assert not (tmp_path / "systems" / "hal.toml").exists()
@@ -407,7 +408,7 @@ def test_target_relative_path_isolated_under_systems():
 def test_collect_target_rejects_duplicate_existing_name():
     # The duplicate 'hal' is refused, so the next input is consumed as the name.
     w = _wizard(
-        ["hal", "hal2", "direct", "h", "2222", "agent", "", "n", "n", "n", "n"]
+        ["hal", "hal2", "direct", "h", "2222", "agent", "", "n", "y", "n", "n", "n", "n"]
     )
     answers = collect_target(w, {"hal"})
     assert answers.name == "hal2"
@@ -436,11 +437,12 @@ def test_validate_aliases():
 def test_collect_target_accepts_alias_list():
     from compute_mcp.setup import collect_target
 
-    # name, transport, aliases, user, key, fingerprint, 2FA, container, bundle, slurm
+    # name, transport, aliases, user, key, fingerprint, 2FA, auto-connect,
+    # container, bundle, slurm
     w = _wizard(
         [
             "rosi", "tunnel", "rosi,ex_rosi", "agent", "/home/u/.ssh/k", "",
-            "n", "n", "n", "n",
+            "n", "y", "n", "n", "n",
         ]
     )
     answers = collect_target(w, set())
@@ -473,10 +475,10 @@ def test_validate_remote_path_accepts_home_and_absolute():
 def test_collect_target_blank_fingerprint_disables_verification():
     from compute_mcp.setup import collect_target
 
-    # name, transport, aliases, user, key, blank fingerprint, 2FA, container n,
-    # bundle n
+    # name, transport, aliases, user, key, blank fingerprint, 2FA, auto-connect,
+    # container n, bundle n
     w = _wizard(
-        ["rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n", "n", "n"]
+        ["rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n", "y", "n", "n"]
     )
     answers = collect_target(w, set())
     assert answers.host_key_sha256 is None
@@ -489,7 +491,7 @@ def test_collect_target_pin_sets_algorithms():
     w = _wizard(
         [
             "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k",
-            "SHA256:" + "a" * 40, "ssh-ed25519,rsa-sha2-512", "n", "n", "n",
+            "SHA256:" + "a" * 40, "ssh-ed25519,rsa-sha2-512", "n", "y", "n", "n",
         ]
     )
     answers = collect_target(w, set())
@@ -502,7 +504,7 @@ def test_collect_target_empty_user_is_omitted():
 
     # "-" asks for no explicit user: the SSH config or local account decides.
     w = _wizard(
-        ["rosi", "tunnel", "rosi", "-", "/home/u/.ssh/k", "", "n", "n", "n"]
+        ["rosi", "tunnel", "rosi", "-", "/home/u/.ssh/k", "", "n", "y", "n", "n"]
     )
     answers = collect_target(w, set())
     assert answers.user == ""
@@ -519,6 +521,7 @@ def test_no_slurm_question_without_bundle():
     w = _wizard(
         [
             "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n",
+            "y",  # auto-connect on gateway start
             "y", "apptainer", "$HOME/computemcp", "docker://ubuntu:24.04", "",
             "n",  # build/start the container? no
         ]
@@ -538,6 +541,7 @@ def test_wizard_container_target_without_slurm_gets_bundle():
     w = _wizard(
         [
             "hal", "tunnel", "hal", "agent", "/home/u/.ssh/k", "", "n",
+            "y",  # auto-connect on gateway start
             "y", "docker", "$HOME/computemcp", "ubuntu:24.04", "nvidia",
             "y",   # build and start this container? yes
             "",    # pre-provision environment (none)
@@ -586,11 +590,12 @@ def test_wizard_container_target_without_slurm_gets_bundle():
 def test_collect_target_bundle_provision_env_comma_separated():
     from compute_mcp.setup import collect_target
 
-    # name, transport, aliases, user, key, fingerprint, 2FA, container yes,
-    # provision yes, provision-env, slurm no
+    # name, transport, aliases, user, key, fingerprint, 2FA, auto-connect,
+    # container yes, provision yes, provision-env, slurm no
     w = _wizard(
         [
             "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n",
+            "y",  # auto-connect on gateway start
             "y", "apptainer", "$HOME/computemcp", "docker://ubuntu:24.04", "",
             "y",  # build/start the container? yes
             "module load apptainer, source /etc/profile.d/spack.sh",
@@ -607,6 +612,110 @@ def test_collect_target_bundle_provision_env_comma_separated():
         "module load apptainer",
         "source /etc/profile.d/spack.sh",
     ]
+
+
+# -- auto-connect / 2FA coupling -------------------------------------------
+
+def _write_and_load(toml_dir, answers):
+    """Write one wizard target as a file + a minimal gateway config, then load."""
+    import tempfile
+    from pathlib import Path
+
+    token_path = toml_dir / "tokens.toml"
+    token_path.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+    config_path = toml_dir / "config.toml"
+    config_path.write_text(
+        render_gateway_config(
+            listen="127.0.0.1",
+            port=2222,
+            allow_enrollment=False,
+            client_id="alpaka",
+            client_targets=(),
+            client_label=None,
+            token_file=str(token_path),
+            include=[target_relative_path(answers.name)],
+        )
+    )
+    write_target_file(toml_dir, answers)
+    return load_config(config_path), toml_dir / "systems" / f"{answers.name}.toml"
+
+
+def test_wizard_auto_connect_yes_renders_and_loads_true(tmp_path):
+    from compute_mcp.setup import collect_target
+
+    # name, transport, aliases, user, key, blank fingerprint, 2FA no,
+    # auto-connect yes, container no
+    w = _wizard(
+        ["rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n", "y", "n"]
+    )
+    answers = collect_target(w, set())
+    assert answers.interactive_auth is False
+    assert answers.auto_connect is True
+    # The key must be rendered explicitly: the loader default is false, so an
+    # omitted key would not auto-connect after reload.
+    assert "auto_connect = true" in render_target_block(answers)
+    cfg, _ = _write_and_load(tmp_path, answers)
+    assert cfg.targets["rosi"].auto_connect is True
+
+
+def test_wizard_auto_connect_no_loads_false(tmp_path):
+    from compute_mcp.setup import collect_target
+
+    # name, transport, aliases, user, key, blank fingerprint, 2FA no,
+    # auto-connect no, container no
+    w = _wizard(
+        ["rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n", "n", "n"]
+    )
+    answers = collect_target(w, set())
+    assert answers.auto_connect is False
+    # Omit the key entirely (loader default false); never write "true".
+    assert "auto_connect = true" not in render_target_block(answers)
+    assert "auto_connect = false" not in render_target_block(answers)
+    cfg, _ = _write_and_load(tmp_path, answers)
+    assert cfg.targets["rosi"].auto_connect is False
+
+
+def test_wizard_2fa_skips_auto_connect_and_loads_false(tmp_path):
+    from compute_mcp.setup import collect_target
+
+    # name, transport, aliases, user, key, blank fingerprint, 2FA yes, container
+    # no.  The auto-connect question is never asked, so no input is consumed
+    # for it: after "y" (2FA) the wizard moves straight to the container.
+    w = _wizard(
+        ["rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "y", "n"]
+    )
+    answers = collect_target(w, set())
+    assert answers.interactive_auth is True
+    assert answers.auto_connect is False
+    # 2FA forces auto-connect off; the block must not claim auto-connect.
+    assert "auto_connect = true" not in render_target_block(answers)
+    assert "interactive_auth = true" in render_target_block(answers)
+    cfg, _ = _write_and_load(tmp_path, answers)
+    assert cfg.targets["rosi"].auto_connect is False
+    assert cfg.targets["rosi"].interactive_auth is True
+    # If the wizard wrongly asked for auto-connect it would have advanced the
+    # container answer into that slot, producing a runtime mismatch.  The
+    # container must be unconfigured here.
+    assert answers.container_runtime is None
+
+
+def test_wizard_2fa_container_yes_still_valid(tmp_path):
+    from compute_mcp.setup import collect_target
+
+    # 2FA yes, then container block: auto-connect is skipped, so the container
+    # answers follow immediately after the 2FA "y".
+    w = _wizard(
+        [
+            "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "y",
+            "y", "apptainer", "$HOME/computemcp", "docker://ubuntu:24.04", "",
+            "n",  # build/start the container? no
+        ]
+    )
+    answers = collect_target(w, set())
+    assert answers.interactive_auth is True
+    assert answers.auto_connect is False
+    assert answers.container_runtime == "apptainer"
+    assert "auto_connect = true" not in render_target_block(answers)
 
 
 def test_bootstrap_writes_readable_operator_token(tmp_path):
