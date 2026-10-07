@@ -1163,6 +1163,21 @@ runs the site setup before the container runtime is used.
 container runs under a different account, set `container_user` to it, or every
 `exec`/file call fails with `502`.
 
+The container login account rule is runtime-dependent in how the account is
+created, not in which name is dialed:
+
+- **Docker** creates the `container_user` account from scratch inside the
+  image, so an explicit `container_user` always works.
+- **Apptainer** cannot add an account to a sandbox, so the helper renames the
+  base image's existing `ubuntu` account to the resolved login name (keeping
+  its UID/GID), points its home at `/home/<container_user>`, and updates the
+  generated shell, `authorized_keys` and startscript to match. An explicit
+  `container_user` therefore works for Apptainer too. `ubuntu` stays the
+  backing account only until the first `configure`/`build`.
+
+Both runtimes resolve the name through the same source of truth, so the
+gateway dial and the helper never disagree.
+
 ```toml
 [targets.hal-docker]
 ssh_targets = ["hal"]
@@ -1253,10 +1268,11 @@ The gateway exports the resolved allocation and container description as
   `COMPUTEMCP_SANDBOX`: the container description from
   `[targets.X.container]`, with empty values when the block is absent.
 - `COMPUTEMCP_SSH_USER`: emitted whenever the target has a `container` or
-  `bundle` block. It is the account the container sshd must allow (`AllowUsers`):
+  `bundle` block. It is the account the container sshd must allow:
   `[targets.X] container_user`, else the `COMPUTEMCP_SSH_USER` environment
-  override, else `agent`. The helper creates that account inside the container
-  and points it at the container home.
+  override, else `agent`. Docker creates that account inside the container;
+  Apptainer renames the sandbox's existing account to it and points it at the
+  matching home.
 - `COMPUTEMCP_SSH_PUBLIC_KEY`: emitted for a `[targets.X.bundle]` target. The
   gateway derives it from `client_key` (the `.pub` half, or `ssh-keygen -y`),
   so no manual `authorized_keys` placement is needed. An explicit
@@ -1558,9 +1574,10 @@ targets = ["hal", "fwk394"]
   the SSH config alias or the local account decides. `container_user` is the
   account the gateway logs into INSIDE the development container, default
   `agent`. The container's sshd is key-only and accepts only that account (the
-  provisioning helper creates it and its `authorized_keys` from `client_key`),
-  so a `user`/`container_user` mismatch is the usual cause of a target that
-  connects but then fails every `exec` and file call with `502`
+  provisioning helper creates it for Docker, or renames the sandbox's existing
+  account to it for Apptainer, and installs `authorized_keys` from
+  `client_key`), so a `user`/`container_user` mismatch is the usual cause of a
+  target that connects but then fails every `exec` and file call with `502`
   ("Bad Gateway") because the container rejects the login. Keep `container_user`
   in sync with the account the container was built for; the gateway exports it
   to the bundle as `COMPUTEMCP_SSH_USER`.
@@ -1862,7 +1879,7 @@ always maps to a gateway-side dial failure below.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Target is `connected` but every `exec`/file call fails with `502` | The container dial is refused by the container's sshd. The bundle enforces `AllowUsers <container_user>` (key-only), so an explicit `container_user` that does not name the account the container was built for is rejected; the dialed account is `container_user`, or `COMPUTEMCP_SSH_USER`, or `agent`, never the `user` login | Make `container_user` name the in-container account (the bundle default is `agent`); unset it to get the helper default. Then `target-refresh <t>`. No `proxycommand`/tunnel misconfig needed; `user` (login) is fine as is; see [Configuration notes](#configuration-notes) for the distinction |
+| Target is `connected` but every `exec`/file call fails with `502` | The container dial is refused by the container's sshd. Docker enforces `AllowUsers <container_user>` (key-only); Apptainer's Dropbear serves the account the sandbox was configured with. An explicit `container_user` that does not name an account the container has is rejected; the dialed account is `container_user`, or `COMPUTEMCP_SSH_USER`, or `agent`, never the `user` login | Make `container_user` name the in-container account (the bundle default is `agent`); unset it to get the helper default. For Apptainer the sandbox account is renamed to it on the next `configure`/`target-refresh`, so an explicit name works there too. Then `target-refresh <t>`. No `proxycommand`/tunnel misconfig needed; `user` (login) is fine as is; see [Configuration notes](#configuration-notes) for the distinction |
 | `connected` + `502`, or the dial cannot reach the container at all | Stale endpoint: on a Slurm target the allocation was recycled/lost a node, or the container's published/fetched port changed after a recreate | `computeMCP-gatewayctl target-refresh <t>` re-runs provisioning and follows the new node/port; on recreate, also update `host_key_sha256` (see "Recreating a container changes its host key") |
 | Target fails to connect: "no host-key verification" / `Host key is not trusted` | Missing pin or stale pin: the container was recreated (new sshd host keys), or `host_key_sha256` is still a placeholder | Read the new fingerprint from the container and set `host_key_sha256` (+ `host_key_algorithms`), then refresh |
 | Target fails to connect: `Host key is not trusted for host` | Route or container key pin mismatch after recreate, or the alias now reaches a different sshd | Same as above; verify with `ssh-keygen -lf` on the key the gateway dials |

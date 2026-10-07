@@ -45,6 +45,10 @@ SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 
 # Docker-only defaults.  The gateway never needs to know these.
 SSH_USER="${COMPUTEMCP_SSH_USER:-agent}"
+if ! { [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && [ "$SSH_USER" != root ]; }; then
+    echo "Invalid COMPUTEMCP_SSH_USER: $SSH_USER" >&2
+    exit 2
+fi
 DOCKER_IMAGE="${NAME,,}:latest"
 DOCKER_RESTART="unless-stopped"
 
@@ -208,9 +212,14 @@ apptainer_configure() {
     command -v python3 >/dev/null
     # Edit the actual sandbox files, not Apptainer's runtime /etc/passwd mount.
     # No host account files are changed. Existing Ubuntu UID/GID are retained.
-    # The emitted account line goes to stderr so the helper keeps stdout clean
-    # for the gateway's ENDPOINT parse.
-    python3 - "$SANDBOX" "$CONTAINER_PORT" >&2 <<'CONFIGURE'
+    # The pre-existing ``ubuntu`` account is renamed to the gateway's login
+    # account (``COMPUTEMCP_SSH_USER``, default ``agent``) so the same account
+    # the gateway dials exists inside the sandbox.  Keeping one account and
+    # renaming it (rather than adding a second) avoids a duplicate UID/GID and
+    # every downstream reference (home, shell, authorized_keys, startscript)
+    # follows the renamed account.  The emitted account line goes to stderr so
+    # the helper keeps stdout clean for the gateway's ENDPOINT parse.
+    python3 - "$SANDBOX" "$CONTAINER_PORT" "$SSH_USER" >&2 <<'CONFIGURE'
 import os
 import shutil
 import stat
@@ -220,6 +229,11 @@ from pathlib import Path
 
 root = Path(sys.argv[1]).resolve(strict=True)
 port = int(sys.argv[2])
+user = sys.argv[3]
+if not __import__("re").fullmatch(r"[a-z_][a-z0-9_-]*", user) or user == "root":
+    raise SystemExit(f"Invalid container user: {user!r}")
+home = "/home/" + user
+shell = "/usr/local/bin/computemcp-" + user + "-shell"
 
 
 def target(relative):
@@ -267,9 +281,11 @@ for relative in ("etc/passwd", "etc/shadow"):
     if path.exists() and not backup.exists():
         shutil.copy2(path, backup)
 
+# Rename the sandbox account to the gateway's login account, keeping UID/GID.
+account[0] = user
 account[1] = "*"  # Public-key access only; no usable password.
-account[5] = "/home/ubuntu"
-account[6] = "/usr/local/bin/computemcp-ubuntu-shell"
+account[5] = home
+account[6] = shell
 write("etc/passwd", "".join(":".join(row) + "\n" for row in rows),
       stat.S_IMODE(passwd.stat().st_mode))
 shadow = target("etc/shadow")
@@ -277,25 +293,25 @@ if shadow.exists():
     rows = [line.split(":") for line in shadow.read_text().splitlines()]
     for row in rows:
         if row[0] == "ubuntu" and len(row) > 1:
+            row[0] = user
             row[1] = "*"
     write("etc/shadow", "".join(":".join(row) + "\n" for row in rows),
           stat.S_IMODE(shadow.stat().st_mode))
 
-for relative in ("root", "home/ubuntu", "usr/local/bin", "usr/libexec",
+for relative in ("root", "home/" + user, "usr/local/bin", "usr/libexec",
                  ".singularity.d/libs", "run"):
     target(relative).mkdir(parents=True, exist_ok=True)
 
-write("usr/local/bin/computemcp-ubuntu-shell", '''#!/bin/sh
-export HOME=/home/ubuntu USER=ubuntu LOGNAME=ubuntu
+write(shell.lstrip("/"), '''#!/bin/sh
+export HOME=%s USER=%s LOGNAME=%s
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 exec env -u LD_PRELOAD -u FAKEROOTKEY -u FAKEROOTUID -u FAKEROOTGID \\
     -u FAKEROOTEUID -u FAKEROOTEGID FAKEROOTDONTTRYCHOWN=1 \\
     /usr/bin/fakeroot /bin/bash "$@"
-''', 0o755)
+''' % (home, user, user), 0o755)
 shells = target("etc/shells")
 content = shells.read_text() if shells.exists() else ""
-shell = "/usr/local/bin/computemcp-ubuntu-shell"
 if shell not in content.splitlines():
     write("etc/shells", content.rstrip("\n") + "\n" + shell + "\n")
 write("etc/apt/apt.conf.d/99-root-mapped", 'APT::Sandbox::User "root";\n')
@@ -308,25 +324,25 @@ for relative in ("usr/lib/sftp-server", "usr/libexec/sftp-server"):
 
 write(".singularity.d/startscript", '''#!/bin/sh
 set -eu
-test -s /home/ubuntu/.ssh/authorized_keys
+test -s %s/.ssh/authorized_keys
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 # User namespaces are not required for the fakeroot-command fallback.
 exec env -u LD_PRELOAD -u FAKEROOTKEY FAKEROOTDONTTRYCHOWN=1 \\
     /usr/bin/fakeroot /usr/sbin/dropbear -F -E -e -s -j -k \\
-    -p 127.0.0.1:CONTAINER_PORT -P /run/dropbear-computemcp.pid \\
+    -p 127.0.0.1:%s -P /run/dropbear-computemcp.pid \\
     -r /etc/dropbear/dropbear_ed25519_host_key
-'''.replace('CONTAINER_PORT', str(port)), 0o755)
+''' % (home, port), 0o755)
 print(":".join(account))
 CONFIGURE
 
     install_authorized_key
-    echo "Configured sandbox ubuntu account and authorized_keys." >&2
+    echo "Configured sandbox $SSH_USER account and authorized_keys." >&2
 }
 
 apptainer_start() {
     command -v apptainer >/dev/null
     [ -d "$SANDBOX" ] || { echo "Missing sandbox; use build first." >&2; exit 1; }
-    test -x "$SANDBOX/usr/local/bin/computemcp-ubuntu-shell" || {
+    test -x "$SANDBOX$(printf '/usr/local/bin/computemcp-%s-shell' "$SSH_USER")" || {
         echo "Run configure once before starting this existing sandbox." >&2
         exit 1
     }
@@ -358,7 +374,7 @@ apptainer_start() {
     local COMMON=(--fakeroot --writable --containall --no-mount "home,cwd,hostfs,bind-paths")
     apptainer instance start "${COMMON[@]}" \
         --bind "$HOST_HOME:/root" \
-        --bind "$HOST_HOME:/home/ubuntu" \
+        --bind "$HOST_HOME:/home/$SSH_USER" \
         --bind /etc/resolv.conf:/etc/resolv.conf:ro \
         "${GPU_ARGS[@]}" "$SANDBOX" "$NAME"
     wait_for_banner 127.0.0.1 "$CONTAINER_PORT" || {
@@ -377,8 +393,8 @@ apptainer_stop() {
 }
 
 apptainer_shell() {
-    exec apptainer exec --pwd /home/ubuntu "instance://$NAME" \
-        /usr/local/bin/computemcp-ubuntu-shell -l
+    exec apptainer exec --pwd "/home/$SSH_USER" "instance://$NAME" \
+        "$(printf '/usr/local/bin/computemcp-%s-shell' "$SSH_USER")" -l
 }
 
 apptainer_fingerprint() {

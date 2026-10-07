@@ -54,6 +54,7 @@ REPO = Path(__file__).resolve().parent.parent
 BUNDLE_DIR = REPO / "src" / "compute_mcp" / "bundles" / "computemcp-slurm"
 PROVISION = BUNDLE_DIR / "computemcp-provision.sh"
 JOB = BUNDLE_DIR / "computemcp-job.sh"
+CONTAINER = BUNDLE_DIR / "computemcp-container.sh"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None, reason="bash is required for the shell tests"
@@ -1184,3 +1185,156 @@ def test_slurm_mode_settings_roundtrip_preserves_hook(tmp_path, stubs):
         ), marker_b.read_text(encoding="utf-8", errors="replace")
     finally:
         teardown()
+
+
+# --- Apptainer account provisioning ---------------------------------------
+
+_SANDBOX_PASSWD = (
+    "root:x:0:0:root:/root:/bin/bash\n"
+    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+    "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
+)
+
+
+def _make_fake_sandbox(root: Path) -> Path:
+    """Build the minimal Apptainer sandbox tree ``apptainer_configure`` needs.
+
+    The real sandbox is created by ``apptainer build``; for the hermetic test
+    only the executable sentinels, the host key and an Ubuntu account are
+    needed, so the test does not require Apptainer on the host.
+    """
+    sandbox = root / "sandbox"
+    for rel in (
+        "usr/bin/fakeroot",
+        "usr/sbin/dropbear",
+        "usr/lib/openssh/sftp-server",
+    ):
+        path = sandbox / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+    hostkey = sandbox / "etc/dropbear/dropbear_ed25519_host_key"
+    hostkey.parent.mkdir(parents=True, exist_ok=True)
+    hostkey.write_text("not-a-real-key\n", encoding="utf-8")
+    (sandbox / "etc/passwd").write_text(_SANDBOX_PASSWD, encoding="utf-8")
+    (sandbox / "etc/shadow").write_text(
+        "root:*:19000:0:99999:7:::\nubuntu:*:19000:0:99999:7:::\n",
+        encoding="utf-8",
+    )
+    (sandbox / "etc/shells").write_text("/bin/sh\n/bin/bash\n", encoding="utf-8")
+    return sandbox
+
+
+def _run_apptainer_configure(
+    tmp_path: Path, ssh_user: str | None, port: int
+) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    """Run the real ``apptainer_configure`` against a fake sandbox.
+
+    A stub ``apptainer`` satisfies the helper's ``command -v apptainer`` check;
+    the configuration itself only edits ordinary sandbox files with host
+    ``python3``.  Returns (result, sandbox, host_home).
+    """
+    root = tmp_path / "apptainer"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    apptainer_stub = bin_dir / "apptainer"
+    apptainer_stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    apptainer_stub.chmod(0o755)
+    sandbox = _make_fake_sandbox(root)
+    host_home = root / "hosthome"
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+            "COMPUTEMCP_SYSTEM": "aptest",
+            "COMPUTEMCP_SANDBOX_DIR": str(sandbox),
+            "COMPUTEMCP_HOST_HOME": str(host_home),
+            "COMPUTEMCP_CONTAINER_PORT": str(port),
+            "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
+            "COMPUTEMCP_STORAGE_ROOT": str(root / "storage"),
+        }
+    )
+    if ssh_user is not None:
+        env["COMPUTEMCP_SSH_USER"] = ssh_user
+    else:
+        env.pop("COMPUTEMCP_SSH_USER", None)
+    env["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=root,
+    )
+    return result, sandbox, host_home
+
+
+def _passwd_account(sandbox: Path) -> dict:
+    rows = {}
+    for line in (sandbox / "etc/passwd").read_text(encoding="utf-8").splitlines():
+        fields = line.split(":")
+        rows[fields[0]] = fields
+    return rows
+
+
+@pytest.mark.parametrize("ssh_user", ["agent", "dev", None])
+def test_apptainer_configure_renames_account_to_ssh_user(tmp_path, ssh_user):
+    """Apptainer exposes the gateway's login account, not hardcoded ``ubuntu``.
+
+    Regression: ``apptainer_configure`` used to keep the sandbox ``ubuntu``
+    account and ignore ``COMPUTEMCP_SSH_USER``, so a default target
+    (``container_user = "agent"``) connected but could not exec (502).  The
+    sandbox account is now renamed to the resolved login name (default
+    ``agent``) and every downstream reference follows it.
+    """
+    expected = ssh_user or "agent"
+    result, sandbox, host_home = _run_apptainer_configure(
+        tmp_path, ssh_user, _free_port()
+    )
+    assert result.returncode == 0, (
+        f"configure exited {result.returncode}\n"
+        f"stdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    accounts = _passwd_account(sandbox)
+    assert expected in accounts, accounts
+    assert "ubuntu" not in accounts, f"unexpected sandbox account retained: {accounts}"
+    line = accounts[expected]
+    # UID/GID (and the passwd field count) are preserved from the base image.
+    assert line[2] == "1000" and line[3] == "1000", line
+    assert line[5] == f"/home/{expected}", line
+    assert line[6] == f"/usr/local/bin/computemcp-{expected}-shell", line
+    assert line[1] == "*", line
+
+    shell_path = sandbox / f"usr/local/bin/computemcp-{expected}-shell"
+    assert shell_path.is_file(), shell_path
+    assert os.access(shell_path, os.X_OK)
+    shell_text = shell_path.read_text(encoding="utf-8")
+    assert f"HOME=/home/{expected}" in shell_text
+    assert f"USER={expected}" in shell_text
+    assert f"LOGNAME={expected}" in shell_text
+    assert (
+        (sandbox / "etc/shells")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        .count(f"/usr/local/bin/computemcp-{expected}-shell")
+        == 1
+    )
+
+    startscript = (sandbox / ".singularity.d/startscript").read_text(encoding="utf-8")
+    assert f"/home/{expected}/.ssh/authorized_keys" in startscript
+    assert "CONTAINER_PORT" not in startscript  # substituted, not left literal
+
+    auth = host_home / ".ssh/authorized_keys"
+    assert auth.read_text(encoding="utf-8") == (
+        "ssh-ed25519 AAAATEST fixture@test\n"
+    )
+    # The original account files are preserved for recovery.
+    backup = sandbox / "etc/passwd.computemcp-backup"
+    assert "ubuntu:x:1000" in backup.read_text(encoding="utf-8")
+
+
+def test_apptainer_configure_rejects_invalid_ssh_user(tmp_path):
+    result, _, _ = _run_apptainer_configure(tmp_path, "root", _free_port())
+    assert result.returncode == 2, result
+    assert "Invalid COMPUTEMCP_SSH_USER" in result.stderr, result.stderr
