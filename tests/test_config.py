@@ -1088,3 +1088,69 @@ def test_bundle_requires_tunnel_transport():
     }
     with pytest.raises(ConfigError, match="bundle requires tunnel"):
         parse_config(raw)
+
+
+# -- append_include ----------------------------------------------------------
+
+def _include_base(tmp_path, include_text=""):
+    from compute_mcp.config import append_include  # noqa: F401
+
+    tokens = tmp_path / "tokens.toml"
+    tokens.write_text('[tokens]\n"a" = "sha256:' + "a" * 64 + '"\n')
+    body = include_text + (
+        "[server]\nport = 2222\n\n"
+        f'[auth]\ntoken_file = "{tokens}"\n\n'
+        '[clients.a]\ntargets = ["*"]\n'
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    (tmp_path / "systems").mkdir(exist_ok=True)
+    for name in ("a", "b"):
+        (tmp_path / "systems" / f"{name}.toml").write_text(
+            f'[targets.{name}]\nssh_targets = ["{name}"]\nuser = "agent"\n'
+        )
+    return path
+
+
+def test_append_include_inserts_when_absent(tmp_path):
+    from compute_mcp.config import append_include, load_config
+
+    path = _include_base(tmp_path)
+    append_include(path, "systems/a.toml")
+    assert "systems/a.toml" in path.read_text()
+    assert "a" in load_config(path).targets
+
+
+def test_append_include_is_idempotent(tmp_path):
+    from compute_mcp.config import append_include
+
+    path = _include_base(tmp_path)
+    append_include(path, "systems/a.toml")
+    append_include(path, "systems/a.toml")
+    assert path.read_text().count("systems/a.toml") == 1
+
+
+def test_append_include_extends_single_line(tmp_path):
+    from compute_mcp.config import append_include, load_config
+
+    path = _include_base(tmp_path, 'include = ["systems/a.toml"]\n\n')
+    append_include(path, "systems/b.toml")
+    assert set(load_config(path).targets) == {"a", "b"}
+
+
+def test_append_include_extends_multi_line(tmp_path):
+    from compute_mcp.config import append_include, load_config
+
+    path = _include_base(tmp_path, 'include = [\n    "systems/a.toml",\n]\n\n')
+    append_include(path, "systems/b.toml")
+    assert set(load_config(path).targets) == {"a", "b"}
+
+
+def test_append_include_reverts_on_invalid(tmp_path):
+    from compute_mcp.config import ConfigError, append_include
+
+    path = _include_base(tmp_path)
+    before = path.read_text()
+    with pytest.raises(ConfigError):
+        append_include(path, "systems/missing.toml")
+    assert path.read_text() == before

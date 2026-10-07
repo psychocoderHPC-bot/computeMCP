@@ -23,9 +23,12 @@ from compute_mcp.setup import (
     collect_target,
     render_gateway_config,
     render_target_block,
+    render_target_file,
     render_tokens_file,
     run_add_target,
     run_bootstrap,
+    target_relative_path,
+    write_target_file,
 )
 
 
@@ -116,6 +119,7 @@ def test_render_config_loads(tmp_path):
     target = _full_target()
     tokens = tmp_path / "tokens.toml"
     tokens.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+    write_target_file(tmp_path, target)
     text = render_gateway_config(
         listen="127.0.0.1",
         port=2222,
@@ -124,7 +128,7 @@ def test_render_config_loads(tmp_path):
         client_targets=("*",),
         client_label=None,
         token_file=str(tokens),
-        targets=[target],
+        include=[target_relative_path("rosi")],
     )
     config_path = tmp_path / "config.toml"
     config_path.write_text(text)
@@ -150,6 +154,7 @@ def test_render_direct_target_loads(tmp_path):
     )
     tokens = tmp_path / "tokens.toml"
     tokens.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+    write_target_file(tmp_path, target)
     text = render_gateway_config(
         listen="127.0.0.1",
         port=2222,
@@ -158,7 +163,7 @@ def test_render_direct_target_loads(tmp_path):
         client_targets=(),
         client_label="dev",
         token_file=str(tokens),
-        targets=[target],
+        include=[target_relative_path("hal")],
     )
     config_path = tmp_path / "config.toml"
     config_path.write_text(text)
@@ -290,6 +295,10 @@ def test_add_target_appends_and_validates(tmp_path):
         wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n", "n", "n"]),
     )
     assert rc == 0
+    # The target lives in its own include file, listed from the main config.
+    target_file = tmp_path / "systems" / "hal.toml"
+    assert target_file.exists()
+    assert "systems/hal.toml" in config_path.read_text()
     cfg = load_config(config_path)
     assert "hal" in cfg.targets
     assert cfg.targets["hal"].transport.remote_host == "10.0.0.9"
@@ -318,10 +327,9 @@ def test_add_target_rejects_duplicate_name(tmp_path):
     assert config_path.read_text() == before
 
 
-def test_add_target_rolls_back_on_invalid_append(tmp_path, monkeypatch):
+def test_add_target_rolls_back_target_file_on_invalid_append(tmp_path, monkeypatch):
     config_path = _minimal_bootstrap(tmp_path)
     before = config_path.read_text()
-    # Force the loader to reject the appended content.
     import compute_mcp.setup as setup_module
 
     calls = {"n": 0}
@@ -339,7 +347,37 @@ def test_add_target_rolls_back_on_invalid_append(tmp_path, monkeypatch):
             config_path,
             wizard=_wizard(["hal", "direct", "10.0.0.9", "2222", "agent", "", "n", "n", "n", "n"]),
         )
+    # The orphaned target file is removed; append_include reverts the main file.
+    assert not (tmp_path / "systems" / "hal.toml").exists()
     assert config_path.read_text() == before
+
+
+def test_bootstrap_writes_per_target_files(tmp_path):
+    config_path = tmp_path / "config.toml"
+    run_bootstrap(config_path, wizard=_wizard(_bootstrap_answers()))
+    text = config_path.read_text()
+    assert 'include = [' in text
+    assert 'systems/rosi.toml' in text
+    # The target is not inline in the main file.
+    assert "[targets.rosi]" not in text
+    assert (tmp_path / "systems" / "rosi.toml").exists()
+    cfg = load_config(config_path)
+    assert "rosi" in cfg.targets
+
+
+def test_render_target_file_is_includable(tmp_path):
+    text = render_target_file(_full_target())
+    assert text.startswith("#")
+    assert "[targets.rosi]" in text
+    target = tmp_path / "rosi.toml"
+    target.write_text(text)
+    parsed = tomllib.loads(text)
+    assert parsed["targets"]["rosi"]["node"]["cpus"] == 24
+
+
+def test_target_relative_path_isolated_under_systems():
+    assert target_relative_path("config") == "systems/config.toml"
+    assert target_relative_path("tokens") == "systems/tokens.toml"
 
 
 def test_collect_target_rejects_duplicate_existing_name():

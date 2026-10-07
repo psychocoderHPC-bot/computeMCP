@@ -1169,6 +1169,77 @@ def _atomic_write(path: Path, text: str, mode: int | None = None) -> None:
     os.replace(tmp, path)
 
 
+def append_include(config_path: str | Path, include_entry: str) -> None:
+    """Add one path to the top-level ``include`` list, preserving the file.
+
+    TOML has no incremental array append, and this must not disturb the
+    operator's comments or formatting.  The function operates line-wise:
+
+    - an ``include`` array spanning several lines gets the entry inserted on its
+      own line before the closing ``]``;
+    - a single-line ``include = [...]`` is rewritten into the multi-line form;
+    - a file without ``include`` gets one inserted after the leading comment
+      block and before the first table (where TOML allows a root key).
+
+    An entry already present is a no-op, so callers can retry safely.  The file
+    is re-validated after the edit and reverted on failure.
+    """
+    path = Path(config_path)
+    original = path.read_text()
+    with path.open("rb") as handle:
+        raw = tomllib.load(handle)
+    current = raw.get("include", [])
+    if not isinstance(current, list) or not all(isinstance(e, str) for e in current):
+        raise ConfigError(f"{path}: 'include' must be a list of file path strings")
+    if include_entry in current:
+        return
+
+    lines = original.splitlines()
+    quote = _toml_quote(include_entry)
+    start = next(
+        (i for i, line in enumerate(lines) if line.lstrip().startswith("include")),
+        None,
+    )
+    if start is None:
+        insert_at = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                insert_at = i + 1
+                continue
+            insert_at = i
+            break
+        lines[insert_at:insert_at] = ["", f"include = [{quote}]"]
+    else:
+        end = start
+        while "]" not in lines[end]:
+            end += 1
+            if end >= len(lines):
+                raise ConfigError(f"{path}: unterminated include array")
+        if start == end:
+            # Single-line form: rewrite as a multi-line array.
+            inner_start = lines[start].index("[") + 1
+            inner = lines[start][inner_start : lines[start].rindex("]")]
+            entries = [e.strip() for e in inner.split(",") if e.strip()]
+            indent = "    "
+            rebuilt = [lines[start][: inner_start], *[indent + e + "," for e in entries]]
+            rebuilt.append(indent + quote + ",")
+            rebuilt.append("]")
+            lines[start : start + 1] = rebuilt
+        else:
+            closing = lines[end]
+            indent = closing[: len(closing) - len(closing.lstrip())] or "    "
+            lines.insert(end, indent + quote + ",")
+
+    updated = "\n".join(lines).rstrip("\n") + "\n"
+    _atomic_write(path, updated)
+    try:
+        load_config(path, token_file=None)
+    except ConfigError:
+        _atomic_write(path, original)
+        raise
+
+
 def append_client(
     config_path: str | Path,
     client_id: str,

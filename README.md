@@ -121,16 +121,17 @@ them, and a default appears in brackets (press Enter to accept it).
 | Slurm node capacities / allocation / sbatch | Optional; needed for `--set` overrides and dry-run |
 
 On success it writes `config.toml` (0600), writes `tokens.toml` (0600, sha256
-hashes only) and prints the client token once. Add another system later:
+hashes only), writes each target to its own `systems/<name>.toml` file and
+prints the client token once. Add another system later:
 
 ```bash
 computeMCP-gatewayctl --add-target                 # default config path
 computeMCP-gatewayctl --config FILE --add-target   # explicit config
 ```
 
-`--add-target` validates the existing file, appends one `[targets.X]` block,
-re-validates the whole file and rolls back if the result would not load. It does
-not need a running gateway.
+`--add-target` writes one `systems/<name>.toml` file, appends it to the main
+`include` list, re-validates the whole graph and rolls back both files if the
+result would not load. It does not need a running gateway.
 
 Create a dedicated gateway-to-container key (never the user's normal key):
 
@@ -460,6 +461,9 @@ snippets below are the reference for editing it by hand. A minimal working
 `~/.config/computeMCP-gateway/config.toml` is:
 
 ```toml
+# Targets may be split into per-target files instead of inlined:
+#   include = ["systems/rosi.toml", "systems/hal.toml"]
+
 [server]
 # Bind where Terok/Podman reaches the host (often host.containers.internal).
 # Keep it loopback unless containers must connect from another address.
@@ -780,6 +784,29 @@ gateway file.
 
 A reload reads the complete include graph, validates it, and applies it
 atomically, so a broken include file leaves the active configuration intact.
+
+### One file per target
+
+`--bootstrap` and `--add-target` give every target its own file named after the
+target, placed in a `systems/` subdirectory next to the main config, and list it
+under `include`:
+
+```
+~/.config/computeMCP-gateway/
+  config.toml            # server, auth, clients, include list
+  tokens.toml            # hashed client tokens
+  systems/
+    rosi.toml            # [targets.rosi] and its nested tables
+    hal.toml             # [targets.hal]
+```
+
+The `systems/` subdirectory keeps a target name from colliding with `config.toml`
+or `tokens.toml`. Add a target with
+`computeMCP-gatewayctl --add-target`, which writes the file and appends the
+include in one step, then `computeMCP-gatewayctl reload` picks it up. The file
+name follows the target: to rename a target, rename the file and update the
+`include` list. Hand-written configurations may inline `[targets.X]` as before;
+the loader treats both forms the same.
 
 ## Slurm allocation and container configuration
 
