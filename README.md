@@ -79,7 +79,7 @@ src/compute_mcp/
 tests/            unit tests (see `pytest -q`)
 scripts/computemcp-slurm/  Slurm provisioning bundle (packaged under src, symlinked; see its README)
 config.example.toml
-systemd/computeMCP-gateway.service
+systemd/compute-mcp-gateway.service
 ```
 
 ## Install (gateway on the host, not as root)

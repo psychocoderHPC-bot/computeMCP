@@ -249,6 +249,26 @@ def test_bootstrap_non_terminal_aborts(tmp_path):
         run_bootstrap(tmp_path / "config.toml", wizard=_wizard([], terminal=False))
 
 
+def test_bootstrap_no_orphan_token_when_validation_fails(tmp_path, monkeypatch):
+    """A failed bootstrap must not leave a hashed token behind."""
+    import compute_mcp.setup as setup_module
+
+    # Force the post-write validation to fail.
+    def bad_load(path, token_file=None):
+        raise ConfigError("injected failure")
+
+    monkeypatch.setattr(setup_module, "load_config", bad_load)
+    with pytest.raises(WizardAbort):
+        run_bootstrap(tmp_path / "config.toml", wizard=_wizard(_bootstrap_answers()))
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / "tokens.toml").exists()
+
+
+def test_ask_rejects_control_characters():
+    w = _wizard(["bad\tvalue", "good"])
+    assert w.ask("q") == "good"
+
+
 # ---------------------------------------------------------------------------
 # add-target flow
 # ---------------------------------------------------------------------------

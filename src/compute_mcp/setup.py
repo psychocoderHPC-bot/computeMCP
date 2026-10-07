@@ -133,6 +133,11 @@ class Wizard:
                     self._print("  a value is required")
                     continue
                 return ""
+            # Answers become TOML values; a newline or other control character
+            # would yield invalid TOML that only fails later at validation.
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+                self._print("  no control characters or newlines")
+                continue
             if choices and value not in choices:
                 self._print(f"  choose one of: {', '.join(choices)}")
                 continue
@@ -531,21 +536,24 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
                 v for v in answers.container_gpus if v in GPU_VENDORS
             )
 
-    if wizard.confirm(
-        "Does this target use the Slurm provisioning bundle?",
-        default=False,
-        description="the gateway deploys it and runs it on the login node",
-    ):
-        answers.bundle = True
-        if not answers.container_storage_root:
-            # A bundle needs a deploy directory; otherwise the loader rejects it.
-            answers.bundle_deploy_dir = wizard.ask(
-                "Bundle deploy directory",
-                description="remote directory on storage shared by login and "
-                "compute nodes",
-                default=str(Path.home() / "computemcp" / "bundle"),
-                validator=_validate_absolute_path,
-            )
+    # A bundle needs tunnel transport and a client key (validated by the
+    # loader); only offer it where it can actually work.
+    if answers.transport == "tunnel" and answers.client_key:
+        if wizard.confirm(
+            "Does this target use the Slurm provisioning bundle?",
+            default=False,
+            description="the gateway deploys it and runs it on the login node",
+        ):
+            answers.bundle = True
+            if not answers.container_storage_root:
+                # A bundle needs a deploy directory; otherwise the loader rejects it.
+                answers.bundle_deploy_dir = wizard.ask(
+                    "Bundle deploy directory",
+                    description="remote directory on storage shared by login and "
+                    "compute nodes",
+                    default=str(Path.home() / "computemcp" / "bundle"),
+                    validator=_validate_absolute_path,
+                )
 
     # -- Slurm node/allocation (optional) ---------------------------------
     if wizard.confirm(
@@ -704,18 +712,28 @@ def run_bootstrap(
     with contextlib.suppress(OSError):
         path.parent.chmod(0o700)
     # Write the token hash first: the config names token_file explicitly, and an
-    # explicit token file must exist when the config is validated below.
-    append_token_hash(token_path, client_id, token)
-    with contextlib.suppress(OSError):
-        token_path.chmod(0o600)
-    _atomic_write(path, text, mode=0o600)
-    # Validate what was written before declaring success.
+    # explicit token file must exist when the config is validated below.  Remove
+    # both on any failure so a partial bootstrap leaves nothing behind.
     try:
+        append_token_hash(token_path, client_id, token)
+        with contextlib.suppress(OSError):
+            token_path.chmod(0o600)
+        _atomic_write(path, text, mode=0o600)
         load_config(path, token_file=None)
     except ConfigError as exc:
         with contextlib.suppress(OSError):
             path.unlink()
-        raise WizardAbort(f"generated configuration did not validate: {exc}") from exc
+        with contextlib.suppress(OSError):
+            token_path.unlink()
+        raise WizardAbort(
+            f"generated configuration did not validate: {exc}"
+        ) from exc
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        with contextlib.suppress(OSError):
+            token_path.unlink()
+        raise WizardAbort(f"could not write the configuration: {exc}") from exc
 
     wizard.section("Done")
     wizard.say(f"  config: {path}")
