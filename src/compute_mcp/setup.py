@@ -18,6 +18,8 @@ drive the flow without a terminal.
 from __future__ import annotations
 
 import contextlib
+import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -39,6 +41,9 @@ from .config import (
 GPU_VENDORS = ("nvidia", "amd", "intel")
 CONTAINER_RUNTIMES = ("apptainer", "docker")
 TRANSPORTS = ("tunnel", "direct")
+# OpenSSH Host aliases are arbitrary tokens; reject whitespace and glob/negation
+# metacharacters that `ssh -G` would interpret specially.
+_SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class WizardAbort(SystemExit):
@@ -54,9 +59,12 @@ class TargetAnswers:
     ssh_targets: tuple[str, ...] = ()
     direct_host: str | None = None
     direct_port: int = 2222
-    user: str = "agent"
+    user: str = ""
     client_key: str = ""
     host_key_sha256: str | None = None
+    host_key_check: str = "on"
+    host_key_algorithms: tuple[str, ...] = ()
+    known_hosts: str | None = None
     proxy_jump: str | None = None
     interactive_auth: bool = False
     auto_connect: bool = True
@@ -218,6 +226,27 @@ def _validate_target_name(value: str) -> str | None:
     return None
 
 
+def _split_list(value: str) -> tuple[str, ...]:
+    """Split a comma/whitespace separated answer into ordered unique items."""
+    items = [item.strip() for item in value.replace(" ", ",").split(",")]
+    return tuple(dict.fromkeys(item for item in items if item))
+
+
+def _normalize_user(value: str) -> str:
+    """Map the explicit "unset" sentinel to an empty user string."""
+    return "" if value.strip() in ("-", "none", "unset") else value.strip()
+
+
+def _validate_aliases(value: str) -> str | None:
+    aliases = _split_list(value)
+    if not aliases:
+        return "enter at least one alias"
+    for alias in aliases:
+        if not _SSH_ALIAS_RE.match(alias):
+            return f"invalid alias {alias!r}"
+    return None
+
+
 def _validate_sha256(value: str) -> str | None:
     if not value.startswith("SHA256:") or len(value) < 12:
         return "expected a value like 'SHA256:...'"
@@ -228,6 +257,32 @@ def _validate_absolute_path(value: str) -> str | None:
     if not value.startswith("/"):
         return "enter an absolute path"
     return None
+
+
+def _validate_remote_path(value: str) -> str | None:
+    """Accept an absolute path or a leading ``$HOME``/``~`` reference.
+
+    The scripts expand these in the remote shell, so the operator does not have
+    to know the remote home directory.
+    """
+    if value.startswith("/") or value.startswith("$HOME") or value.startswith("~"):
+        return None
+    return "enter an absolute path or a $HOME/... reference"
+
+
+def _expand_local_home(value: str) -> str:
+    """Expand a leading ``~`` or ``$HOME`` using the gateway user's home.
+
+    Used only for a local probe default; remote values keep the placeholder.
+    """
+    home = str(Path.home())
+    if value == "~":
+        return home
+    if value.startswith("~/"):
+        return home + value[1:]
+    if value.startswith("$HOME"):
+        return home + value[len("$HOME") :]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +306,20 @@ def render_target_block(answers: TargetAnswers) -> str:
         lines.append(f"remote_port = {answers.direct_port}")
     elif answers.ssh_targets:
         lines.append(f"ssh_targets = {_toml_array(answers.ssh_targets)}")
-    lines.append(f"user = {_toml_str(answers.user)}")
+    if answers.user:
+        lines.append(f"user = {_toml_str(answers.user)}")
     if answers.client_key:
         lines.append(f"client_key = {_toml_str(answers.client_key)}")
     if answers.host_key_sha256:
         lines.append(f"host_key_sha256 = {_toml_str(answers.host_key_sha256)}")
+    if answers.host_key_check != "on":
+        lines.append(f'host_key_check = {_toml_str(answers.host_key_check)}')
+    if answers.host_key_algorithms:
+        lines.append(
+            f"host_key_algorithms = {_toml_array(answers.host_key_algorithms)}"
+        )
+    if answers.known_hosts:
+        lines.append(f"known_hosts = {_toml_str(answers.known_hosts)}")
     if answers.proxy_jump:
         lines.append(f"proxy_jump = {_toml_str(answers.proxy_jump)}")
     if answers.interactive_auth:
@@ -482,19 +546,27 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
     )
 
     answers = TargetAnswers(name=name, transport=transport)
+    session_user = os.environ.get("USER") or ""
     if transport == "tunnel":
         alias = wizard.ask(
             "SSH alias",
-            description="Host name from ~/.ssh/config, e.g. hal",
+            description="one or more ~/.ssh/config Host names, tried in order; "
+            "comma-separate for failover, e.g. hal,ex_hal",
+            validator=_validate_aliases,
         )
-        answers.ssh_targets = (alias,)
-        probed = probe_ssh_alias(alias)
-        default_user = (probed or {}).get("user") or "agent"
-        answers.user = wizard.ask(
+        aliases = _split_list(alias)
+        answers.ssh_targets = aliases
+        probed = probe_ssh_alias(aliases[0])
+        default_user = (probed or {}).get("user") or session_user
+        remote_user = wizard.ask(
             "Remote user",
-            description="login user for the container/route connection",
+            description="login user for the container/route connection; press "
+            "Enter for the current user, or type - to leave it unset and let "
+            "the SSH config decide",
             default=default_user,
+            required=False,
         )
+        answers.user = _normalize_user(remote_user)
         default_key = str(Path.home() / ".ssh" / "computemcp_container")
         answers.client_key = wizard.ask(
             "Private key path",
@@ -509,20 +581,36 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
         answers.ssh_targets = ()
         answers.direct_host = host
         answers.direct_port = port or 2222
-        answers.user = wizard.ask("Remote user", default="agent")
+        remote_user = wizard.ask(
+            "Remote user",
+            description="container login user; press Enter for the current "
+            f"user ({session_user or 'unset'}), or - to leave it unset",
+            default=session_user,
+            required=False,
+        )
+        answers.user = _normalize_user(remote_user)
 
     answers.host_key_sha256 = wizard.ask(
         "Container host-key fingerprint",
-        description="pins the container sshd key; blank to verify later",
+        description="pin the container sshd key as SHA256:...; leave blank to "
+        "disable host-key verification",
         default=None,
         required=False,
         validator=_validate_sha256,
     ) or None
     if answers.host_key_sha256 is None:
+        answers.host_key_check = "off"
         wizard.say(
-            "  No fingerprint set.  Set host_key_check = \"off\" or add the"
+            "  Blank fingerprint: host-key verification is disabled "
+            '(host_key_check = "off").'
         )
-        wizard.say("  fingerprint before production use.")
+    else:
+        algorithms = wizard.ask(
+            "Host-key algorithms",
+            description="comma list of ssh-keygen key types to accept",
+            default="ssh-ed25519",
+        )
+        answers.host_key_algorithms = _split_list(algorithms)
 
     if wizard.confirm(
         "Does the login node require a second factor (password/OTP)?",
@@ -545,13 +633,13 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
             default="apptainer",
             choices=CONTAINER_RUNTIMES,
         )
-        default_root = str(Path.home() / "computemcp")
         answers.container_storage_root = wizard.ask(
             "Storage root",
             description="remote directory for sandbox, home and state; must be "
-            "visible to login and compute nodes",
-            default=default_root,
-            validator=_validate_absolute_path,
+            "visible to login and compute nodes. Use $HOME or ~ for the remote "
+            "home, e.g. $HOME/computemcp",
+            default="$HOME/computemcp",
+            validator=_validate_remote_path,
         )
         default_image = (
             "docker://ubuntu:24.04"
@@ -565,7 +653,8 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
         )
         vendors = wizard.ask(
             "GPU vendors",
-            description="comma list; blank for CPU-only",
+            description="comma list, any of nvidia, amd, intel; blank for "
+            "CPU-only",
             default="",
             required=False,
         )
@@ -593,60 +682,74 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
                 answers.bundle_deploy_dir = wizard.ask(
                     "Bundle deploy directory",
                     description="remote directory on storage shared by login and "
-                    "compute nodes",
-                    default=str(Path.home() / "computemcp" / "bundle"),
-                    validator=_validate_absolute_path,
+                    "compute nodes; $HOME or ~ is expanded on the target",
+                    default="$HOME/computemcp/bundle",
+                    validator=_validate_remote_path,
                 )
 
-    # -- Slurm node/allocation (optional) ---------------------------------
-    if wizard.confirm(
-        "Describe the Slurm node capacities and allocation policy?",
-        default=bool(answers.bundle) or bool(answers.container_runtime),
-        description="needed for --set overrides and dry-run previews",
-    ):
-        answers.node_cpus = wizard.ask_int(
-            "CPUs per node", description="allocatable Slurm CPUs", default=None, minimum=1
-        )
-        answers.node_gpus = wizard.ask_int(
-            "GPUs per node", description="scheduler-visible GPU units", default=None, minimum=0
-        )
-        answers.node_memory = wizard.ask(
-            "Memory per node",
-            description="allocatable host memory with a unit, e.g. 378000M",
-            default=None,
-            required=False,
-        ) or None
-        answers.allocation_single = wizard.ask(
-            "Single-node allocation mode",
-            description="how one node is sized by default",
-            default="gpu-proportional" if (answers.node_gpus or 0) else "cpu-proportional",
-            choices=ALLOCATION_MODES,
-        )
-        answers.allocation_multi = wizard.ask(
-            "Multi-node allocation mode",
-            description="used when nodes > 1",
-            default="exclusive",
-            choices=MULTI_NODE_MODES,
-        )
-        answers.allocation_max_nodes = wizard.ask_int(
-            "Maximum nodes", description="upper bound for --set nodes=", default=1, minimum=1
-        )
-        answers.sbatch_partition = wizard.ask(
-            "Slurm partition",
-            description="partition name for sbatch",
-            default=None,
-            required=False,
-        ) or None
-        answers.sbatch_time = wizard.ask(
-            "Time limit",
-            description="wall time for sbatch, e.g. 02:00:00",
-            default="02:00:00",
-        )
-        answers.srun_cpu_bind = wizard.ask(
-            "srun cpu-bind",
-            description="step CPU binding; 'none' keeps scheduler defaults",
-            default="none",
-        )
+    # -- Slurm allocation (only for a Slurm target) ------------------------
+    # These keys describe the cluster scheduler.  A target without the Slurm
+    # bundle is a plain container/SSH host, so it is not asked.
+    if answers.bundle:
+        wizard.section("Slurm allocation")
+        if wizard.confirm(
+            "Configure the Slurm node capacities and allocation policy?",
+            default=True,
+            description="node sizes, the default allocation mode and the "
+            "sbatch partition; needed for --set overrides and dry-run previews",
+        ):
+            answers.node_cpus = wizard.ask_int(
+                "CPUs per node",
+                description="allocatable Slurm CPUs",
+                default=None,
+                minimum=1,
+            )
+            answers.node_gpus = wizard.ask_int(
+                "GPUs per node",
+                description="scheduler-visible GPU units",
+                default=None,
+                minimum=0,
+            )
+            answers.node_memory = wizard.ask(
+                "Memory per node",
+                description="allocatable host memory with a unit, e.g. 378000M",
+                default=None,
+                required=False,
+            ) or None
+            answers.allocation_single = wizard.ask(
+                "Single-node allocation mode",
+                description="how one node is sized by default",
+                default="gpu-proportional" if (answers.node_gpus or 0) else "cpu-proportional",
+                choices=ALLOCATION_MODES,
+            )
+            answers.allocation_multi = wizard.ask(
+                "Multi-node allocation mode",
+                description="used when nodes > 1",
+                default="exclusive",
+                choices=MULTI_NODE_MODES,
+            )
+            answers.allocation_max_nodes = wizard.ask_int(
+                "Maximum nodes",
+                description="upper bound for --set nodes=",
+                default=1,
+                minimum=1,
+            )
+            answers.sbatch_partition = wizard.ask(
+                "Slurm partition",
+                description="partition name for sbatch",
+                default=None,
+                required=False,
+            ) or None
+            answers.sbatch_time = wizard.ask(
+                "Time limit",
+                description="wall time for sbatch, e.g. 02:00:00",
+                default="02:00:00",
+            )
+            answers.srun_cpu_bind = wizard.ask(
+                "srun cpu-bind",
+                description="step CPU binding; 'none' keeps scheduler defaults",
+                default="none",
+            )
     return answers
 
 

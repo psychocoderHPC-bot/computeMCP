@@ -341,7 +341,7 @@ class SSHBackend:
             return await asyncssh.connect(
                 host,
                 port=port,
-                username=target.user,
+                username=target.user or None,
                 client_keys=client_keys,
                 passphrase=passphrase,
                 known_hosts=known_hosts,

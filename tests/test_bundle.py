@@ -291,3 +291,52 @@ def test_public_key_for_reads_pub_file(tmp_path):
 def test_public_key_for_missing_key_returns_none(tmp_path):
     target = _bundle_target(tmp_path)
     assert public_key_for(target) is None
+
+
+class _HomeConn:
+    """Connection that answers the HOME probe and records run commands."""
+
+    def __init__(self, home="/home/remote"):
+        self.home = home
+        self.commands = []
+
+    async def run(self, command, **kwargs):
+        self.commands.append(command)
+        if command == 'printf %s "$HOME"':
+            return _Result(0, self.home.encode())
+        if command.startswith("test -f "):
+            return _Result(1)  # marker absent -> deploy
+        return _Result(0)
+
+
+@pytest.mark.asyncio
+async def test_resolve_remote_dir_expands_home():
+    from compute_mcp.bundle import resolve_remote_dir
+
+    conn = _HomeConn("/home/remote")
+    assert await resolve_remote_dir(conn, "$HOME/computemcp") == "/home/remote/computemcp"
+    assert await resolve_remote_dir(conn, "~/computemcp") == "/home/remote/computemcp"
+    assert await resolve_remote_dir(conn, "$HOME") == "/home/remote"
+    assert await resolve_remote_dir(conn, "/abs/x") == "/abs/x"
+
+
+@pytest.mark.asyncio
+async def test_resolve_remote_dir_rejects_relative():
+    from compute_mcp.bundle import BundleError, resolve_remote_dir
+
+    with pytest.raises(BundleError):
+        await resolve_remote_dir(_HomeConn(), "relative/path")
+
+
+@pytest.mark.asyncio
+async def test_ensure_deployed_expands_home_for_sftp(tmp_path):
+    from compute_mcp.bundle import ensure_deployed, load_bundle, marker_name
+
+    target = _bundle_target(tmp_path, deploy_dir="$HOME/computemcp/bundle")
+    store: dict[str, bytes] = {}
+    sftp = _sftp_factory(store)
+    conn = _HomeConn("/home/remote")
+    resolved = await ensure_deployed(conn, target, sftp_factory=sftp)
+    assert resolved == "/home/remote/computemcp/bundle"
+    digest = load_bundle("computemcp-slurm").digest
+    assert f"/home/remote/computemcp/bundle/{marker_name(digest)}" in store

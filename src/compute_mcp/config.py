@@ -265,8 +265,12 @@ class BundleConfig:
         if self.deploy_dir is not None:
             if not isinstance(self.deploy_dir, str) or not self.deploy_dir.strip():
                 raise ConfigError("bundle.deploy_dir must be a non-empty string")
-            if not self.deploy_dir.startswith("/"):
-                raise ConfigError("bundle.deploy_dir must be an absolute path")
+            # ``$HOME``/``~`` are expanded by the remote helper; anything else
+            # must be absolute so a typo cannot resolve relative to the CWD.
+            if not self.deploy_dir.startswith(("/", "$HOME", "~")):
+                raise ConfigError(
+                    "bundle.deploy_dir must be absolute or start with $HOME/~"
+                )
         if not isinstance(self.auto_deploy, bool):
             raise ConfigError("bundle.auto_deploy must be true or false")
 
@@ -600,8 +604,10 @@ class TargetConfig:
                 "'on_failure' or 'always'"
             )
         validate_target_name(self.name)
-        if not self.user:
-            raise ConfigError(f"target {self.name!r} has no user")
+        # ``user`` may be empty: the SSH config alias or the local account then
+        # supplies the login user.  Only a non-string is rejected.
+        if not isinstance(self.user, str):
+            raise ConfigError(f"target {self.name!r} user must be a string")
         if self.connect_mode not in ("shared", "dedicated"):
             raise ConfigError(
                 f"target {self.name!r} connect_mode must be 'shared' or 'dedicated'"
@@ -767,7 +773,9 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
     if "agent" in value and not isinstance(value.get("agent"), (list, tuple)):
         raise ConfigError(f"target {name!r} agent must be a list of tables")
 
-    user = value.get("user", "agent")
+    # Absent means "let the SSH config alias or local account decide"; an
+    # explicit empty string is treated the same as absent.
+    user = value.get("user", "")
     has_ssh_targets = "ssh_targets" in value
     ssh_targets = tuple(value.get("ssh_targets", ()))
     kind = value.get("transport")

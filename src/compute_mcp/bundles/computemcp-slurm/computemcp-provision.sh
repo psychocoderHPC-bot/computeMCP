@@ -40,6 +40,13 @@ if ! { [[ "$SYSTEM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [ "$SYSTEM" != . ] && 
     exit 2
 fi
 STORAGE_ROOT="${COMPUTEMCP_STORAGE_ROOT:-$HOME/.local/share/computemcp}"
+# Accept a literal $HOME/~ prefix from the gateway and expand it here, so the
+# operator can configure $HOME/computemcp without knowing the remote home path.
+if [[ "$STORAGE_ROOT" =~ ^\$HOME(/|$) ]]; then
+    STORAGE_ROOT="$HOME${STORAGE_ROOT#\$HOME}"
+elif [[ "$STORAGE_ROOT" =~ ^~(/|$) ]]; then
+    STORAGE_ROOT="$HOME${STORAGE_ROOT#\~}"
+fi
 SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
 STATE="${COMPUTEMCP_STATE_DIR:-$SYSTEM_DIR/state}"
 SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"

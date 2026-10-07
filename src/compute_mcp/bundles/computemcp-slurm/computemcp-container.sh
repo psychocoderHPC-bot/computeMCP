@@ -25,6 +25,12 @@ esac
 # --- Configuration from the gateway environment ---------------------------
 SYSTEM="${COMPUTEMCP_SYSTEM:-computemcp}"
 STORAGE_ROOT="${COMPUTEMCP_STORAGE_ROOT:-$HOME/.local/share/computemcp}"
+# Expand a literal $HOME/~ prefix passed by the gateway.
+if [[ "$STORAGE_ROOT" =~ ^\$HOME(/|$) ]]; then
+    STORAGE_ROOT="$HOME${STORAGE_ROOT#\$HOME}"
+elif [[ "$STORAGE_ROOT" =~ ^~(/|$) ]]; then
+    STORAGE_ROOT="$HOME${STORAGE_ROOT#\~}"
+fi
 SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
 SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"
 HOST_HOME="${COMPUTEMCP_HOST_HOME:-$SYSTEM_DIR/home}"

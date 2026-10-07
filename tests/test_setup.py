@@ -194,7 +194,10 @@ def _bootstrap_answers():
     return [
         "127.0.0.1", "2222", "y",              # server + enrollment
         "y",                                   # set up a target
-        "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "SHA256:" + "a" * 40, "n",
+        "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k",
+        "SHA256:" + "a" * 40,                  # fingerprint pins verification
+        "ssh-ed25519",                         # host-key algorithms
+        "n",                                   # no 2FA
         "y", "apptainer", "/scratch/u/computemcp", "docker://ubuntu:24.04", "nvidia",
         "y",                                   # bundle
         "y",                                   # slurm description
@@ -406,3 +409,116 @@ def test_collect_target_rejects_duplicate_existing_name():
     answers = collect_target(w, {"hal"})
     assert answers.name == "hal2"
     assert answers.transport == "direct"
+
+
+# -- SSH alias list ----------------------------------------------------------
+
+def test_split_list_variants():
+    from compute_mcp.setup import _split_list
+
+    assert _split_list("hal") == ("hal",)
+    assert _split_list("hal, ex_hal") == ("hal", "ex_hal")
+    assert _split_list("hal ex_hal") == ("hal", "ex_hal")
+    assert _split_list("hal,hal") == ("hal",)  # deduplicated, order kept
+
+
+def test_validate_aliases():
+    from compute_mcp.setup import _validate_aliases
+
+    assert _validate_aliases("hal,ex_hal") is None
+    assert _validate_aliases("") is not None
+    assert _validate_aliases("bad alias!") is not None
+
+
+def test_collect_target_accepts_alias_list():
+    from compute_mcp.setup import collect_target
+
+    # name, transport, aliases, user, key, fingerprint, 2FA, container, bundle, slurm
+    w = _wizard(
+        [
+            "rosi", "tunnel", "rosi,ex_rosi", "agent", "/home/u/.ssh/k", "",
+            "n", "n", "n", "n",
+        ]
+    )
+    answers = collect_target(w, set())
+    assert answers.ssh_targets == ("rosi", "ex_rosi")
+
+
+def test_render_target_block_multi_alias():
+    target = TargetAnswers(
+        name="rosi",
+        ssh_targets=("rosi", "ex_rosi"),
+        user="agent",
+        client_key="/k",
+    )
+    block = render_target_block(target)
+    parsed = tomllib.loads(block)
+    assert parsed["targets"]["rosi"]["ssh_targets"] == ["rosi", "ex_rosi"]
+
+
+# -- host-key + remote-path refinements --------------------------------------
+
+def test_validate_remote_path_accepts_home_and_absolute():
+    from compute_mcp.setup import _validate_remote_path
+
+    assert _validate_remote_path("/scratch/x") is None
+    assert _validate_remote_path("$HOME/computemcp") is None
+    assert _validate_remote_path("~/computemcp") is None
+    assert _validate_remote_path("relative/path") is not None
+
+
+def test_collect_target_blank_fingerprint_disables_verification():
+    from compute_mcp.setup import collect_target
+
+    # name, transport, aliases, user, key, blank fingerprint, 2FA, container n,
+    # bundle n
+    w = _wizard(
+        ["rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n", "n", "n"]
+    )
+    answers = collect_target(w, set())
+    assert answers.host_key_sha256 is None
+    assert answers.host_key_check == "off"
+
+
+def test_collect_target_pin_sets_algorithms():
+    from compute_mcp.setup import collect_target
+
+    w = _wizard(
+        [
+            "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k",
+            "SHA256:" + "a" * 40, "ssh-ed25519,rsa-sha2-512", "n", "n", "n",
+        ]
+    )
+    answers = collect_target(w, set())
+    assert answers.host_key_check == "on"
+    assert answers.host_key_algorithms == ("ssh-ed25519", "rsa-sha2-512")
+
+
+def test_collect_target_empty_user_is_omitted():
+    from compute_mcp.setup import collect_target
+
+    # "-" asks for no explicit user: the SSH config or local account decides.
+    w = _wizard(
+        ["rosi", "tunnel", "rosi", "-", "/home/u/.ssh/k", "", "n", "n", "n"]
+    )
+    answers = collect_target(w, set())
+    assert answers.user == ""
+    block = render_target_block(answers)
+    assert "user = " not in block
+
+
+def test_no_slurm_question_without_bundle():
+    from compute_mcp.setup import collect_target
+
+    # container yes, bundle no -> no Slurm questions; the wizard must not ask
+    # for them, so the answer list ends right after the container/bundle answers.
+    w = _wizard(
+        [
+            "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n",
+            "y", "apptainer", "$HOME/computemcp", "docker://ubuntu:24.04", "",
+            "n",  # bundle no
+        ]
+    )
+    answers = collect_target(w, set())
+    assert answers.node_cpus is None
+    assert answers.container_storage_root == "$HOME/computemcp"

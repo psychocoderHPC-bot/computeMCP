@@ -112,11 +112,11 @@ them, and a default appears in brackets (press Enter to accept it).
 | Set up a target | Whether to configure a remote system now |
 | Target name | Internal label, e.g. `hal` |
 | Transport | `tunnel` (SSH alias, recommended) or `direct` (host:port) |
-| SSH alias / Remote user / Private key | Route connection details; the key default is `~/.ssh/computemcp_container` |
-| Container host-key fingerprint | Optional `SHA256:...` pin of the container sshd key |
+| SSH alias / Remote user / Private key | Route connection; the alias accepts a comma-separated priority list (e.g. `hal,ex_hal`), tried in order for failover. `Remote user` defaults to the current user; type `-` to leave it unset and let the SSH config decide. Key default `~/.ssh/computemcp_container` |
+| Container host-key fingerprint | `SHA256:...` pin. Leave blank to disable verification (`host_key_check = "off"`); a pin also asks for the accepted host-key algorithms (default `ssh-ed25519`, comma list) |
 | Second factor | Whether the login node needs a password/OTP |
-| Container runtime / storage / image / GPU vendors | Drives the provisioning bundle (see below) |
-| Slurm node capacities / allocation / sbatch | Optional; needed for `--set` overrides and dry-run |
+| Container runtime / storage / image / GPU vendors | Drives the provisioning bundle. `Storage root` accepts `$HOME`/`~`, expanded on the target (default `$HOME/computemcp`). `GPU vendors` is a subset of `nvidia, amd, intel` |
+| Slurm node capacities / allocation / sbatch | Asked only for a target that uses the Slurm bundle; optional, needed for `--set` overrides and dry-run previews |
 
 Bootstrap does not ask for a project id. It creates the single **operator**
 client `admin` (`targets = ["*"]`) and prints that token once; it is the token

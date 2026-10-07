@@ -326,7 +326,7 @@ async def _dial_hop(
     """Dial one route hop, optionally through an already-open jump connection."""
     host = info["hostname"]
     port = info["port"]
-    username = info["user"] or fallback_user
+    username = info["user"] or fallback_user or None
     keys = list(client_keys) if client_keys else None
     if tunnel is None:
         # First hop: use the dedicated route primitive (pin + prompter aware).
@@ -536,13 +536,14 @@ class TunnelManager:
         dest_host = transport.remote_host
         dest_port = transport.remote_port
         if provision and (target.provision_command or target.bundle):
+            resolved_dir: str | None = None
             if target.bundle:
                 # Deploy the shipped bundle over the live route, then run it
                 # from the deploy directory.  The upload is skipped when the
                 # remote content marker matches; explicit provision_command or
                 # close_command still take precedence over the bundle.
                 try:
-                    await bundle_module.ensure_deployed(conn, target)
+                    resolved_dir = await bundle_module.ensure_deployed(conn, target)
                 except (bundle_module.BundleError, asyncssh.Error, OSError) as exc:
                     for opened_conn in reversed(opened):
                         await _close_connection(opened_conn)
@@ -550,7 +551,9 @@ class TunnelManager:
                         f"target {target.name!r} bundle deploy on route "
                         f"{route!r} failed: {exc}"
                     ) from exc
-            argv_tuple = bundle_module.provision_argv(target, "provision")
+            argv_tuple = bundle_module.provision_argv(
+                target, "provision", deploy_dir=resolved_dir
+            )
             argv = " ".join(shlex.quote(p) for p in argv_tuple)
             prefix = format_provision_env(provision_env)
             command = f"{prefix} {argv}" if prefix else argv
@@ -723,9 +726,26 @@ class TunnelManager:
         timeout is logged and teardown still proceeds.  When there is no live
         ``connection`` the call is a logged no-op.
         """
+        argv = target.close_command
+        if not argv and target.bundle is not None and connection is not None:
+            # Resolve $HOME for the derived bundle stop; a failure here is
+            # advisory (teardown still proceeds).
+            try:
+                resolved = await bundle_module.resolve_remote_dir(
+                    connection, bundle_module.resolve_deploy_dir(target)
+                )
+                argv = bundle_module.provision_argv(
+                    target, "stop", deploy_dir=resolved
+                )
+            except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+                log.warning(
+                    "target %s: could not resolve bundle stop path: %s",
+                    target.name, exc,
+                )
+                argv = bundle_module.provision_argv(target, "stop")
         await self._run_advisory_command(
             "close_command",
-            bundle_module.provision_argv(target, "stop") or target.close_command,
+            argv,
             target.close_command_timeout,
             target,
             route,

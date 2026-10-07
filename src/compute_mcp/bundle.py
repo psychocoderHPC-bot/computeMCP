@@ -158,14 +158,46 @@ def provision_argv(target: TargetConfig, action: str) -> tuple[str, ...]:
     An explicit ``provision_command``/``close_command`` always wins; a bundle
     target without one uses the deployed helper.
     """
+def provision_argv(
+    target: TargetConfig, action: str, *, deploy_dir: str | None = None
+) -> tuple[str, ...]:
+    """Provisioning argv for ``action`` ('provision'/'stop').
+
+    An explicit ``provision_command``/``close_command`` always wins; a bundle
+    target without one uses the deployed helper.  ``deploy_dir`` is the already
+    resolved remote directory (``$HOME`` expanded); without it the configured
+    value is used verbatim, which the caller must not shell-quote-escape.
+    """
     if action == "provision" and target.provision_command:
         return target.provision_command
     if action == "stop" and target.close_command:
         return target.close_command
     if target.bundle is None:
         return ()
-    script = posixpath.join(resolve_deploy_dir(target), PROVISION_SCRIPT)
+    directory = deploy_dir or resolve_deploy_dir(target)
+    script = posixpath.join(directory, PROVISION_SCRIPT)
     return ("bash", script, "provision" if action == "provision" else "stop")
+
+
+async def resolve_remote_dir(conn, path: str, run=None) -> str:
+    """Expand a leading ``$HOME``/``~`` in ``path`` using the remote account.
+
+    The gateway does not know the remote home directory, so it asks the login
+    node once and substitutes.  An absolute path is returned unchanged.
+    """
+    if path.startswith("/"):
+        return path
+    if not (path == "$HOME" or path.startswith("$HOME/") or path == "~" or path.startswith("~/")):
+        raise BundleError(f"deploy directory must be absolute or start with $HOME/~: {path!r}")
+    run = run or _run
+    result = await run(conn, 'printf %s "$HOME"')
+    if getattr(result, "exit_status", 1) != 0:
+        raise BundleError("could not resolve the remote home directory")
+    home = (getattr(result, "stdout", b"") or b"").decode(errors="replace").strip()
+    if not home.startswith("/"):
+        raise BundleError(f"remote home directory is not absolute: {home!r}")
+    remainder = path[1:] if path == "~" else path[len("$HOME") :] if path.startswith("$HOME") else path[1:]
+    return home + (remainder or "")
 
 
 async def ensure_deployed(
@@ -175,7 +207,7 @@ async def ensure_deployed(
     sftp_factory=None,
     run=None,
 ) -> str:
-    """Deploy the bundle when needed; return the remote directory.
+    """Deploy the bundle when needed; return the resolved remote directory.
 
     ``conn`` is the live route connection.  The SFTP subsystem is the fast path;
     a base64 stream over ``run`` is the fallback.  Marker presence is checked
@@ -185,9 +217,9 @@ async def ensure_deployed(
     if bundle_cfg is None:
         return ""
     contents = load_bundle(bundle_cfg.source)
-    deploy_dir = resolve_deploy_dir(target)
-    marker = marker_name(contents.digest)
     run = run or _run
+    deploy_dir = await resolve_remote_dir(conn, resolve_deploy_dir(target), run)
+    marker = marker_name(contents.digest)
 
     if await _marker_present(conn, deploy_dir, marker, run):
         return deploy_dir
