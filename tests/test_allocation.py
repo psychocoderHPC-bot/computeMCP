@@ -294,6 +294,27 @@ def test_capacity_ceiling_rejects_request_above_capacity():
             compute_plan(target, override)
 
 
+def test_gpu_proportional_rejects_explicit_memory_above_capacity():
+    """gpu-proportional must apply the same node-capacity ceiling to an
+    explicit ``--set mem-per-node`` that cpu-proportional/full/exclusive do;
+    the same ceiling must NOT reject the computed per-GPU share."""
+    target = make_target(node=ROSI_NODE)  # 378000 MiB capacity
+    # 400000 MiB > 378000 MiB node capacity: the explicit request is refused,
+    # naming the target, the requested MiB, and the node capacity.
+    with pytest.raises(
+        ConfigError,
+        match=r"hal.*400000 MiB per node.*node capacity of 378000 MiB",
+    ):
+        compute_plan(target, {"mem-per-node": "400000M"})
+    # At exactly the capacity the request is accepted (= full node memory).
+    plan = compute_plan(target, {"mem-per-node": "378000M"})
+    assert plan.memory_per_node_mib == 378000
+    # A computed per-GPU share always stays at or below capacity and is never
+    # rejected by the new check: 2 GPUs = 189000 MiB < 378000 MiB.
+    plan = compute_plan(target, {"gpus-per-node": 2})
+    assert plan.memory_per_node_mib == 189000
+
+
 def test_ordering_manual_before_mapped_in_configuration_order():
     target = make_target(
         slurm=SlurmConfig(

@@ -189,8 +189,10 @@ stop_relay() {
 
 # --- Non-provision actions --------------------------------------------------
 if [ "$ACTION" = stop ] || [ "$ACTION" = close ]; then
+    SCANCEL_ARGS=("$JOBID")
+    [ -z "$CLUSTER" ] || SCANCEL_ARGS=(--clusters="$CLUSTER" "$JOBID")
     if [ -n "$JOBID" ] && [ -n "$(job_state)" ]; then
-        scancel "$JOBID"
+        scancel "${SCANCEL_ARGS[@]}"
     fi
     stop_relay
     echo "Stopped tracked job ${JOBID:-none} and relay; container files remain." >&2
@@ -279,6 +281,13 @@ if [ "$ACTION" = provision ]; then
         *) JOBID=""; CLUSTER="" ;;
     esac
 
+    # Report, never silently drop, a half-started allocation.  Installed before
+    # submission so a failure after sbatch (or jobid write) still reports it.
+    report_job() {
+        echo "Allocation state: job ${JOBID:-none} cluster ${CLUSTER:-none}; settings ${STATE}/srun-$SYSTEM.settings" >&2
+    }
+    trap 'STATUS=$?; if (( STATUS != 0 )); then report_job; fi' EXIT
+
     if [ -z "$JOBID" ]; then
         stop_relay
         SETTINGS="$STATE/srun-$SYSTEM.settings"        HELPER_ARGS=(--parsable --job-name="computemcp-$SYSTEM")
@@ -291,21 +300,17 @@ if [ "$ACTION" = provision ]; then
         }
         sbatch_has --output || sbatch_has -o || HELPER_ARGS+=(--output="$STATE/slurm-%j.log")
         sbatch_has --error  || sbatch_has -e || HELPER_ARGS+=(--error="$STATE/slurm-%j.log")
+        # Write the settings file BEFORE sbatch: a fast scheduler can start the
+        # job step before a post-submission write lands, and job.sh sources it.
+        write_settings "$SETTINGS"
         RESULT="$(sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
         JOBID="${RESULT%%;*}"
         [[ "$JOBID" =~ ^[0-9]+$ ]] || { echo "Invalid sbatch result: $RESULT" >&2; exit 1; }
         if [[ "$RESULT" == *';'* ]]; then CLUSTER="${RESULT#*;}"; fi
-        write_settings "$SETTINGS"
         printf '%s\n' "$JOBID" > "$STATE/jobid"
         printf '%s\n' "$CLUSTER" > "$STATE/cluster"
         echo "Submitted job $JOBID (cluster ${CLUSTER:-default}). Settings: $SETTINGS" >&2
     fi
-
-    # Report, never silently drop, a half-started allocation.
-    report_job() {
-        echo "Allocation state: job ${JOBID:-none} cluster ${CLUSTER:-none}; settings ${STATE}/srun-$SYSTEM.settings" >&2
-    }
-    trap 'STATUS=$?; if (( STATUS != 0 )); then report_job; fi' EXIT
 
     END=$((SECONDS + WAIT_SECONDS))
     NODE=""

@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from compute_mcp.auth import hash_token
 from compute_mcp.config import (
     ClientConfig,
+    ConfigError,
     GatewayConfig,
     ServerConfig,
     SessionConfig,
@@ -2483,6 +2484,84 @@ def test_build_provision_env_empty_args_and_missing_plan_values():
     assert env["COMPUTEMCP_GPU_VENDORS"] == ""
     assert env["COMPUTEMCP_HOST_HOME"] == ""
     assert env["COMPUTEMCP_SANDBOX"] == "false"
+
+
+def test_build_provision_env_rejects_null_and_carriage_return_in_values():
+    """CR must be refused alongside NUL in every provision-env value (the
+    NUL-only check left a CR-in-value shell-line-smuggling hole)."""
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import ConfigError, TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    plan = ResolvedPlan(nodes=1)
+    for bad_sbatch, bad_srun in (
+        ("x\0y", ()),
+        ("x\ry", ()),
+    ):
+        with pytest.raises(ConfigError, match="COMPUTEMCP_SBATCH_ARGS"):
+            build_provision_env(target, plan, bad_sbatch, bad_srun)
+    # A CR smuggled into the srun deck is refused just as thoroughly.
+    with pytest.raises(ConfigError, match="COMPUTEMCP_SRUN_ARGS"):
+        build_provision_env(target, plan, (), ("x\ry",))
+
+
+def test_build_provision_env_allows_newlines_in_arg_decks():
+    """Newlines are the intentional delimiter of the two ARGS decks and must
+    NOT be refused; only NUL and CR are."""
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    plan = ResolvedPlan(nodes=1)
+    env = build_provision_env(target, plan, ("--nodes=2", "--gres=gpu:1"), ("--overlap",))
+    assert env["COMPUTEMCP_SBATCH_ARGS"] == "--nodes=2\n--gres=gpu:1"
+    assert env["COMPUTEMCP_SRUN_ARGS"] == "--overlap"
+
+
+async def test_connect_with_invalid_override_leaves_state_failed_not_connecting():
+    """A connect with a bad --set override on an allocation target must not
+    leave the runtime wedged in state=='connecting'; last_error records what
+    failed and the exception propagates (mapped to 400 at the HTTP layer)."""
+    gw, target = _allocation_gateway()
+    rt = gw.runtimes["hal"]
+    assert rt.state == "disconnected"
+    with pytest.raises(ConfigError, match="unknown --set key"):
+        await gw.connect_target("hal", overrides={"bogus": 1})
+    # The regression: state must NOT be "connecting" after a failed connect.
+    assert rt.state != "connecting"
+    assert rt.state in ("failed", "disconnected")
+    assert "unknown --set key" in (rt.last_error or "")
+
+
+async def test_connect_with_invalid_override_propagates_on_http_endpoint(monkeypatch):
+    """The HTTP edge maps the same ConfigError to a 400 and leaves the
+    runtime in a terminal error state, not "connecting"."""
+    gw, target = _allocation_gateway()
+    rt = gw.runtimes["hal"]
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/targets/hal/connect", headers=auth("alpaka-token"),
+            json={"set": {"bogus": 1}},
+        )
+        assert resp.status == 400
+    finally:
+        await client.close()
+    assert rt.state != "connecting"
+    assert rt.state in ("failed", "disconnected")
+    assert rt.last_error and "unknown --set key" in rt.last_error
 
 
 def test_plan_signature_stability_and_none():

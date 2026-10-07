@@ -113,12 +113,21 @@ def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> d
     env["COMPUTEMCP_SANDBOX"] = (
         "true" if container is not None and container.sandbox else "false"
     )
-    # A shell string cannot carry NUL; refuse it here (HTTP 400 at the edge)
-    # rather than let it reach the trusted provision command.
+    # A shell string cannot carry NUL or carriage return; refuse both here
+    # (HTTP 400 at the edge) rather than let them reach the trusted provision
+    # command (a CR in a value could smuggle an extra shell line).  LF stays
+    # allowed: it is the intentional delimiter of the two ARGS variables, whose
+    # individual arguments are already validated (allocation.py).
     for name, value in env.items():
-        if "\x00" in name or "\x00" in value:
+        if "\x00" in value or "\r" in value:
             raise ConfigError(
-                f"provisioning environment {name!r} contains a NUL byte"
+                f"provisioning environment {name!r} contains a NUL byte or "
+                f"carriage return"
+            )
+        if "\x00" in name or "\r" in name:
+            raise ConfigError(
+                f"provisioning environment name {name!r} contains a NUL byte "
+                f"or carriage return"
             )
     return env
 
@@ -372,7 +381,14 @@ class Gateway:
         provision_env: dict[str, str] | None = None
         plan = None
         if self._env_configured(target) or overrides:
-            plan, provision_env = self._resolve_allocation(target, overrides)
+            try:
+                plan, provision_env = self._resolve_allocation(target, overrides)
+            except (ConfigError, ValueError) as exc:
+                # A bad override must not wedge the runtime in "connecting":
+                # record the failure and re-raise (the HTTP layer maps it to 400).
+                runtime.state = "failed"
+                runtime.last_error = str(exc)
+                raise
         connect_kwargs: dict[str, Any] = {"factor": factor}
         if provision_env is not None:
             # Only allocation/container targets carry the environment contract;

@@ -436,6 +436,15 @@ def compute_plan(
                     )
                 memory = per_gpu * gpus
             defaults_used = True
+        elif capacity_mib is not None and memory > capacity_mib:
+            # An explicit --set mem-per-node is checked against the node
+            # capacity (as the CPU ceiling above and cpu-proportional / full /
+            # exclusive do); a computed per-GPU share never exceeds capacity and
+            # is left untouched.
+            raise ConfigError(
+                f"target {target.name!r}: requested {memory} MiB per node "
+                f"exceed the node capacity of {capacity_mib} MiB"
+            )
     elif policy == "cpu-proportional":
         if cpus is None:
             if capacity_cpus is None:
