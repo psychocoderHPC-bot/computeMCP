@@ -585,3 +585,414 @@ def test_route_host_key_sha256_normalized_like_container_pin():
         assert getattr(cfg.targets["hal"], field) == good
         with pytest.raises(ConfigError):
             parse_config(base_raw(**{field: "not-a-pin"}))
+
+
+# -- include: merge semantics -------------------------------------------------
+
+def test_include_relative_path_resolves_against_including_file(tmp_path: Path, monkeypatch):
+    root = tmp_path / "cfgroot"
+    shared = root / "shared"
+    shared.mkdir(parents=True)
+    (shared / "targets.toml").write_text(
+        '[clients.ci]\ntoken = "abc"\ntargets = ["hal"]\n'
+        '\n'
+        "[targets.hal]\n"
+        'ssh_targets = ["hal"]\n'
+        'user = "agent"\n'
+        'host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"\n'
+        "node.cpus = 24\n"
+        "node.gpus = 4\n"
+        'node.memory = "378000M"\n'
+    )
+    entry = root / "gateway.toml"
+    entry.write_text('include = ["shared/targets.toml"]\n')
+    # Chdir away from the config directory: the relative include is resolved
+    # against the entry file's directory, never the process CWD.
+    monkeypatch.chdir(tmp_path)
+    cfg = load_config(entry)
+    assert cfg.targets["hal"].node.cpus == 24
+    assert cfg.targets["hal"].node.gpus == 4
+    assert cfg.targets["hal"].node.memory == "378000M"
+    assert cfg.include_paths == (str(shared / "targets.toml"),)
+    assert cfg.config_path == str(entry)
+
+
+def test_include_absolute_path_accepted(tmp_path: Path):
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    shared = other / "targets.toml"
+    shared.write_text(
+        "[targets.hal]\n"
+        'transport = "direct"\n'
+        'user = "agent"\n'
+        'host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"\n'
+        "[clients.ci]\n"
+        'token = "abc"\n'
+        'targets = ["hal"]\n'
+    )
+    entry = tmp_path / "gateway.toml"
+    entry.write_text(f'include = ["{shared}"]\n')
+    cfg = load_config(entry)
+    assert "hal" in cfg.targets
+    assert cfg.include_paths == (str(shared),)
+
+
+
+def _write_include_tree(base, entry_text, **files):
+    for rel, content in files.items():
+        path = base / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    entry = base / "gateway.toml"
+    entry.write_text(entry_text)
+    return entry
+
+
+def test_include_duplicate_leaf_names_both_files(tmp_path: Path):
+    entry = _write_include_tree(
+        tmp_path,
+        'include = ["a.toml", "b.toml"]\n[clients.ci]\ntargets = []\n',
+        **{
+            "a.toml": "node.cpus = 1\n[t]\nx = 1\n",
+            "b.toml": "node.cpus = 2\n[s]\ny = 2\n",
+        },
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(entry)
+    msg = str(excinfo.value)
+    assert "node.cpus" in msg
+    assert str(tmp_path / "a.toml") in msg
+    assert str(tmp_path / "b.toml") in msg
+
+
+def test_include_missing_file_rejected(tmp_path: Path):
+    entry = _write_include_tree(
+        tmp_path,
+        'include = ["missing.toml"]\n[t]\nx = 1\n',
+    )
+    with pytest.raises(ConfigError, match="configuration file not found"):
+        load_config(entry)
+
+
+def test_include_cycle_rejected(tmp_path: Path):
+    entry = _write_include_tree(
+        tmp_path,
+        'include = ["b.toml"]\n[t]\nx = 1\n',
+        **{
+            "a.toml": 'include = ["b.toml"]\n[a]\ny = 1\n',
+            "b.toml": 'include = ["a.toml"]\n[b]\nz = 1\n',
+        },
+    )
+    with pytest.raises(ConfigError, match="include cycle detected"):
+        load_config(entry)
+
+
+def test_include_diamond_is_applied_once(tmp_path: Path):
+    entry = _write_include_tree(
+        tmp_path,
+        'include = ["a.toml", "b.toml"]\n',
+        **{
+            "a.toml": '[targets.hal]\ninclude = ["common.toml"]\n[a]\nx = 1\n[clients.ci]\ntoken = "abc"\ntargets = ["hal"]\n',
+            "b.toml": 'include = ["common.toml"]\n[b]\ny = 2\n',
+            "common.toml": 'transport = "direct"\nuser = "agent"\nhost_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"\n',
+        },
+    )
+    cfg = load_config(entry)
+    # First-seen preorder: a, common, b (a diamond is not a duplicate).
+    assert cfg.include_paths == (
+        str(tmp_path / "a.toml"),
+        str(tmp_path / "common.toml"),
+        str(tmp_path / "b.toml"),
+    )
+    assert cfg.include_paths.count(str(tmp_path / "common.toml")) == 1
+
+
+def test_no_include_yields_empty_include_paths(tmp_path: Path):
+    entry = _write_include_tree(
+        tmp_path,
+        "[clients.ci]\ntoken = \"abc\"\ntargets = []\n"
+        "[targets.hal]\ntransport = \"direct\"\nuser = \"agent\"\n"
+        'host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"\n',
+    )
+    cfg = load_config(entry)
+    assert cfg.include_paths == ()
+
+
+def test_include_must_be_a_list_of_strings(tmp_path: Path):
+    entry = _write_include_tree(tmp_path, "include = \"b.toml\"\n[t]\nx = 1\n")
+    with pytest.raises(ConfigError, match="must be a list of file path strings"):
+        load_config(entry)
+
+
+# -- node allocation tables ---------------------------------------------------
+
+def test_node_table_parsed_and_validated():
+    cfg = parse_config(
+        base_raw(node={"cpus": 32, "gpus": 2, "memory": "378000M"})
+    )
+    node = cfg.targets["hal"].node
+    assert node.cpus == 32
+    assert node.gpus == 2
+    assert node.memory == "378000M"
+
+
+def test_node_table_missing_is_none():
+    assert parse_config(base_raw()).targets["hal"].node is None
+
+
+def test_node_table_unknown_key_rejected():
+    with pytest.raises(ConfigError, match="unknown key"):
+        parse_config(base_raw(node={"cpus": 4, "accelerators": 1}))
+
+
+
+
+def test_node_table_negative_cpus_rejected():
+    with pytest.raises(ConfigError, match="positive integer"):
+        parse_config(base_raw(node={"cpus": -4}))
+    with pytest.raises(ConfigError, match="positive integer"):
+        parse_config(base_raw(node={"gpus": 0}))
+
+
+def test_node_table_empty_memory_rejected():
+    with pytest.raises(ConfigError, match="non-empty string"):
+        parse_config(base_raw(node={"memory": ""}))
+
+
+def test_node_table_memory_must_be_string():
+    with pytest.raises(ConfigError, match="non-empty string"):
+        parse_config(base_raw(node={"memory": 378000}))
+
+
+def test_allocation_table_parsed_and_validated():
+    cfg = parse_config(
+        base_raw(
+            allocation={
+                "default-gpus": 1,
+                "default-cpus": 8,
+                "single-node": "gpu-proportional",
+                "multi-node": "full",
+                "max-nodes": 4,
+            }
+        )
+    )
+    alloc = cfg.targets["hal"].allocation
+    assert alloc.default_gpus == 1
+    assert alloc.default_cpus == 8
+    assert alloc.single_node == "gpu-proportional"
+    assert alloc.multi_node == "full"
+    assert alloc.max_nodes == 4
+
+
+def test_allocation_missing_is_none():
+    assert parse_config(base_raw()).targets["hal"].allocation is None
+
+
+def test_allocation_unknown_mode_rejected():
+    for field, bad in (("single-node", "sometimes"), ("multi-node", "gpu-proportional")):
+        with pytest.raises(ConfigError, match="must be one of"):
+            parse_config(base_raw(allocation={field: bad}))
+
+
+def test_allocation_multi_node_rejects_partial_modes():
+    for bad in ("gpu-proportional", "cpu-proportional"):
+        with pytest.raises(ConfigError, match="must be one of"):
+            parse_config(base_raw(allocation={"multi-node": bad}))
+
+
+def test_allocation_max_nodes_must_be_positive():
+    with pytest.raises(ConfigError, match="positive integer"):
+        parse_config(base_raw(allocation={"max-nodes": 0}))
+    with pytest.raises(ConfigError, match="positive integer"):
+        parse_config(base_raw(allocation={"default-gpus": True}))
+
+
+def test_allocation_unknown_key_rejected():
+    with pytest.raises(ConfigError, match="unknown key"):
+        parse_config(base_raw(allocation={"single-node": "full", "warp": "dmesg"}))
+
+
+def test_slurm_stage_tables_parsed_and_stages_independent():
+    cfg = parse_config(
+        base_raw(
+            slurm={
+                "sbatch": {"partition": "gpu", "time": "02:00:00"},
+                "sbatch-map": {
+                    "nodes": "nodes",
+                    "gpus-per-node": "gres",
+                    "memory-per-node": "mem",
+                },
+                "srun": {"ntasks-per-node": 1, "cpu-bind": "none"},
+                "srun-map": {"cpus-per-node": "cpus-per-task"},
+            }
+        )
+    )
+    slurm = cfg.targets["hal"].slurm
+    assert slurm.sbatch.options == {"partition": "gpu", "time": "02:00:00"}
+    assert slurm.sbatch.mapping == {
+        "nodes": "nodes",
+        "gpus-per-node": "gres",
+        "memory-per-node": "mem",
+    }
+    assert slurm.srun.options == {"ntasks-per-node": 1, "cpu-bind": "none"}
+    assert slurm.srun.mapping == {"cpus-per-node": "cpus-per-task"}
+
+
+def test_slurm_unknown_key_rejected():
+    with pytest.raises(ConfigError, match="unknown key"):
+        parse_config(base_raw(slurm={"sbatch": {}, "wat": {}}))
+
+
+def test_slurm_empty_table_is_equivalent_to_absent():
+    cfg = parse_config(base_raw(slurm={}))
+    assert cfg.targets["hal"].slurm is None
+
+
+def test_mapping_unknown_key_rejected():
+    with pytest.raises(ConfigError, match="unknown mapping key"):
+        parse_config(
+            base_raw(
+                slurm={
+                    "sbatch": {"ntasks-per-node": 1},
+                    "sbatch-map": {"ntasks": "1"},
+                }
+            )
+        )
+
+
+def test_mapping_unknown_representation_rejected():
+    for key, bad in (
+        ("nodes", "node"),
+        ("gpus-per-node", "gpus-per"),
+        ("cpus-per-node", "cpus-per-node"),
+        ("memory-per-node", "mem-per-cpu"),
+        ("exclusive", "x"),
+    ):
+        options = {"ntasks-per-node": 1} if key == "cpus-per-node" else None
+        with pytest.raises(ConfigError, match="must be one of"):
+            parse_config(
+                base_raw(
+                    slurm={
+                        "sbatch": options or {},
+                        "sbatch-map": {key: bad},
+                    }
+                )
+            )
+
+
+def test_mapping_cpus_per_node_requires_one_task_per_node():
+    # Precondition: the stage needs ntasks-per-node or ntasks of exactly 1.
+    for options in ({}, {"ntasks-per-node": 2}, {"ntasks": 4}):
+        with pytest.raises(ConfigError, match="one task per node"):
+            parse_config(
+                base_raw(
+                    slurm={
+                        "sbatch": options,
+                        "sbatch-map": {"cpus-per-node": "cpus-per-task"},
+                    }
+                )
+            )
+    # Both accepted spellings pass.
+    for options in ({"ntasks-per-node": 1}, {"ntasks": 1}):
+        cfg = parse_config(
+            base_raw(
+                slurm={
+                    "sbatch": options,
+                    "sbatch-map": {"cpus-per-node": "cpus-per-task"},
+                }
+            )
+        )
+        assert cfg.targets["hal"].slurm.sbatch.mapping == {
+            "cpus-per-node": "cpus-per-task"
+        }
+
+
+def test_container_block_parsed():
+    cfg = parse_config(
+        base_raw(
+            container={
+                "runtime": "apptainer",
+                "storage-root": "/scratch/x",
+                "image": "ubuntu:24.04",
+                "gpus": ["nvidia", "amd"],
+                "host-home": "/home/agent",
+                "sandbox": True,
+            }
+        )
+    )
+    ctr = cfg.targets["hal"].container
+    assert ctr.runtime == "apptainer"
+    assert ctr.storage_root == "/scratch/x"
+    assert ctr.image == "ubuntu:24.04"
+    assert ctr.gpus == ("nvidia", "amd")
+    assert ctr.host_home == "/home/agent"
+    assert ctr.sandbox is True
+
+
+def test_container_missing_is_none():
+    assert parse_config(base_raw()).targets["hal"].container is None
+
+
+def test_container_requires_runtime():
+    with pytest.raises(ConfigError, match="requires"):
+        parse_config(base_raw(container={"storage-root": "/x"}))
+
+
+def test_container_runtime_enum():
+    with pytest.raises(ConfigError, match="apptainer"):
+        parse_config(base_raw(container={"runtime": "podman"}))
+    assert (
+        parse_config(base_raw(container={"runtime": "docker"}))
+        .targets["hal"]
+        .container.runtime
+        == "docker"
+    )
+
+
+def test_container_gpu_vendor_enum():
+    with pytest.raises(ConfigError, match="unknown vendor"):
+        parse_config(
+            base_raw(container={"runtime": "docker", "gpus": ["nvidia", "intel", "zotac"]})
+        )
+    with pytest.raises(ConfigError, match="unknown vendor"):
+        # A whitespace entry is not a vendor: rejected by the enum, not the
+        # separate non-empty check (whose sorted() set renders it invisibly).
+        parse_config(
+            base_raw(
+                container={"runtime": "docker", "gpus": ["nvidia", " "]}
+            )
+        )
+    vendors = (
+        parse_config(
+            base_raw(
+                container={"runtime": "docker", "gpus": ["nvidia", "amd", "nvidia"]}
+            )
+        )
+        .targets["hal"]
+        .container.gpus
+    )
+    assert vendors == ("nvidia", "amd")  # deduplicated on first-seen
+
+
+def test_container_unknown_key_rejected():
+    with pytest.raises(ConfigError, match="unknown key"):
+        parse_config(base_raw(container={"runtime": "docker", "extra": 1}))
+
+
+def test_back_compat_config_without_new_tables_loads():
+    """Existing configs without [node]/[allocation]/[slurm]/[container] load unchanged."""
+    cfg = parse_config(base_raw())
+    target = cfg.targets["hal"]
+    assert target.node is None
+    assert target.allocation is None
+    assert target.slurm is None
+    assert target.container is None
+
+    raw = {
+        "server": {"listen": "127.0.0.1", "port": 2222},
+        "clients": {"alpaka": {"token": "secret", "targets": ["x"]}},
+        "targets": {"x": {"transport": "direct", "user": "agent"}},
+    }
+    cfg = parse_config(raw)
+    assert cfg.targets["x"].node is None
+    assert cfg.include_paths == ()

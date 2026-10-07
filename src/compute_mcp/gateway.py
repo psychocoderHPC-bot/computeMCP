@@ -17,11 +17,18 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
 from . import __version__
 from .auth import AuthError, Authenticator, Client, ForbiddenTarget
+from .allocation import (
+    compute_plan,
+    plan_summary,
+    render_args,
+    validate_conflicts,
+)
 from .config import (
     ConfigError,
     GatewayConfig,
@@ -66,6 +73,75 @@ log = logging.getLogger("compute_mcp.gateway")
 RECOVERY_POLL_SECONDS = 5.0
 
 
+def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> dict[str, str]:
+    """Build the gateway -> provisioner environment contract.
+
+    The gateway converts the resolved plan, the rendered per-stage arguments
+    and the container description into ``COMPUTEMCP_*`` variables that the
+    trusted provisioning command consumes (see the design doc,
+    "Gateway-to-provisioner interface").  Only the two ARGS variables and the
+    plan/container variables are emitted: nothing here can collide with a user
+    environment variable.
+
+    ``COMPUTEMCP_SBATCH_ARGS`` / ``COMPUTEMCP_SRUN_ARGS`` carry one complete
+    argument per newline with no trailing newline; an empty string means an
+    empty argument list.  The two stages are rendered independently and never
+    copied between each other.  Numeric per-node fields become an empty string
+    when the plan has no value; ``COMPUTEMCP_NODES``, ``COMPUTEMCP_EXCLUSIVE``
+    and ``COMPUTEMCP_MODE`` are always concrete.
+    """
+    def _num(value) -> str:
+        return "" if value is None else str(value)
+
+    env = {
+        "COMPUTEMCP_SBATCH_ARGS": "\n".join(sbatch_args),
+        "COMPUTEMCP_SRUN_ARGS": "\n".join(srun_args),
+        "COMPUTEMCP_NODES": str(plan.nodes),
+        "COMPUTEMCP_CPUS_PER_NODE": _num(plan.cpus_per_node),
+        "COMPUTEMCP_GPUS_PER_NODE": _num(plan.gpus_per_node),
+        "COMPUTEMCP_MEMORY_PER_NODE_MIB": _num(plan.memory_per_node_mib),
+        "COMPUTEMCP_EXCLUSIVE": "true" if plan.exclusive else "false",
+        "COMPUTEMCP_MODE": plan.mode,
+        "COMPUTEMCP_SYSTEM": target.name,
+    }
+    container = target.container
+    env["COMPUTEMCP_CONTAINER_RUNTIME"] = container.runtime if container else ""
+    env["COMPUTEMCP_STORAGE_ROOT"] = (container.storage_root or "") if container else ""
+    env["COMPUTEMCP_IMAGE"] = (container.image or "") if container else ""
+    env["COMPUTEMCP_GPU_VENDORS"] = ",".join(container.gpus) if container else ""
+    env["COMPUTEMCP_HOST_HOME"] = (container.host_home or "") if container else ""
+    env["COMPUTEMCP_SANDBOX"] = (
+        "true" if container is not None and container.sandbox else "false"
+    )
+    # A shell string cannot carry NUL; refuse it here (HTTP 400 at the edge)
+    # rather than let it reach the trusted provision command.
+    for name, value in env.items():
+        if "\x00" in name or "\x00" in value:
+            raise ConfigError(
+                f"provisioning environment {name!r} contains a NUL byte"
+            )
+    return env
+
+
+def plan_signature(summary: dict | None) -> tuple | None:
+    """Effective per-node request of a stored plan summary, for mismatch checks.
+
+    Two override sets that resolve to the same concrete request are a no-op;
+    only a value difference requires a refresh.
+    """
+    if not summary:
+        return None
+    plan = summary.get("plan") or {}
+    return (
+        plan.get("nodes"),
+        plan.get("cpus_per_node"),
+        plan.get("gpus_per_node"),
+        plan.get("memory_per_node_mib"),
+        plan.get("exclusive"),
+        plan.get("mode"),
+    )
+
+
 class InteractiveAuthRequired(RuntimeError):
     """A target needs a second factor and no factor was supplied for the request."""
 
@@ -93,6 +169,11 @@ class TargetRuntime:
     # be used.  Never carries a secret; only tells operators why a connect was
     # refused/failed so a real tunnel error is not masked as "needs 2FA".
     awaiting_factor: bool = False
+    # Resolved allocation retained across a connect/refresh so recovery and a
+    # later refresh reuse it instead of silently reverting to defaults.  Empty
+    # for a target with no allocation block.
+    resolved_plan: dict | None = None
+    resolved_overrides: dict[str, Any] = field(default_factory=dict)
     recovery_task: asyncio.Task | None = field(default=None, repr=False)
 
     def public(self, clients: int = 0) -> dict:
@@ -109,11 +190,29 @@ class TargetRuntime:
             "needs_refresh": self.needs_refresh,
             "provisioned_endpoint": self.provisioned_endpoint,
             "awaiting_factor": self.awaiting_factor,
+            # Additive: a target without a Slurm allocation reports None so the
+            # existing keys/format stay unchanged for existing callers.
+            "resolved_plan": self.resolved_plan,
+            "resolved_overrides": dict(self.resolved_overrides),
         }
+
+
+def validate_config_allocations(config: GatewayConfig) -> None:
+    """Cross-check every target's enabled mappings against its manual options.
+
+    This runs at gateway startup and before a reload is applied, so
+    ``computeMCP-gatewayctl reload`` refuses a bad configuration (and keeps the
+    previous one) instead of discovering the conflict at connect time.
+    ``validate_conflicts`` is imported lazily to avoid a circular import
+    (allocation imports config); it is pure and side-effect free.
+    """
+    for target in config.targets.values():
+        validate_conflicts(target)
 
 
 class Gateway:
     def __init__(self, config: GatewayConfig, transport_override: str | None = None):
+        validate_config_allocations(config)
         self.config = config
         self.transport_override = transport_override
         self._apply_transport_override()
@@ -202,6 +301,47 @@ class Gateway:
         with contextlib.suppress(TunnelError, SSHError, HostKeyError):
             await self.ensure_connected(name)
 
+    # -- allocation resolution --------------------------------------------
+    @staticmethod
+    def _allocation_configured(target: TargetConfig) -> bool:
+        return (
+            target.node is not None
+            or target.allocation is not None
+            or target.slurm is not None
+        )
+
+    @staticmethod
+    def _env_configured(target: TargetConfig) -> bool:
+        return (
+            target.node is not None
+            or target.allocation is not None
+            or target.slurm is not None
+            or target.container is not None
+        )
+
+    def _resolve_allocation(
+        self, target: TargetConfig, overrides: dict[str, Any] | None
+    ) -> tuple[Any, dict[str, str]]:
+        """Resolve plan, per-stage args and the provision environment.
+
+        Overrides resolve before mapping: they are validated by
+        :func:`compute_plan`, which also re-checks mapping/manual conflicts.
+        An override on a target with no ``node``/``allocation``/``slurm`` block
+        is refused, so a missing mapping can never be mistaken for successful
+        enforcement.  Raises :class:`ConfigError` (HTTP 400 at the edge).
+        """
+        if overrides and not self._allocation_configured(target):
+            raise ConfigError(
+                f"target {target.name!r} has no Slurm allocation configuration; "
+                "--set overrides cannot be applied (configure [node], "
+                "[allocation] or [slurm] first)"
+            )
+        validate_conflicts(target)
+        plan = compute_plan(target, overrides)
+        sbatch, srun = render_args(target, plan)
+        provision_env = build_provision_env(target, plan, sbatch, srun)
+        return plan, provision_env
+
     # -- state machine -----------------------------------------------------
     async def ensure_connected(self, name: str) -> TargetRuntime:
         target = self._target(name)
@@ -213,18 +353,36 @@ class Gateway:
                 if runtime.tunnel and runtime.tunnel.is_alive():
                     return runtime
                 self._mark_lost(runtime, "tunnel connection closed")
-            return await self._connect_locked(target, runtime)
+            # Recovery/automatic reconnect must retain the resolved settings
+            # instead of silently reverting to the configured defaults.
+            return await self._connect_locked(
+                target, runtime, overrides=(runtime.resolved_overrides or None)
+            )
 
     async def _connect_locked(
-        self, target: TargetConfig, runtime: TargetRuntime, factor: str | None = None
+        self,
+        target: TargetConfig,
+        runtime: TargetRuntime,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
     ) -> TargetRuntime:
         runtime.state = "connecting"
         runtime.last_error = None
+        provision_env: dict[str, str] | None = None
+        plan = None
+        if self._env_configured(target) or overrides:
+            plan, provision_env = self._resolve_allocation(target, overrides)
+        connect_kwargs: dict[str, Any] = {"factor": factor}
+        if provision_env is not None:
+            # Only allocation/container targets carry the environment contract;
+            # every other target keeps the exact previous call shape.
+            connect_kwargs["provision_env"] = provision_env
         try:
             tunnel = await self.tunnels.connect(
                 target,
                 on_route=lambda route, exc: log.debug("route %s failed: %s", route, exc),
-                factor=factor,
+                **connect_kwargs,
             )
         except TunnelError as exc:
             runtime.state = "failed"
@@ -240,6 +398,12 @@ class Gateway:
             runtime.provisioned_endpoint = f"{host}:{port}"
         else:
             runtime.provisioned_endpoint = None
+        if plan is not None:
+            runtime.resolved_plan = plan_summary(target, plan)
+            runtime.resolved_overrides = dict(plan.overrides)
+        else:
+            runtime.resolved_plan = None
+            runtime.resolved_overrides = {}
         runtime.connected_since = datetime.now(timezone.utc)
         runtime.needs_refresh = False
         runtime.backoff = 0.0
@@ -257,24 +421,57 @@ class Gateway:
         runtime.last_error = reason
         runtime.connected_since = None
 
-    async def connect_target(self, name: str, factor: str | None = None) -> dict:
+    async def connect_target(
+        self,
+        name: str,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
             if runtime.state == "connected":
+                if overrides:
+                    # A connect with overrides on a live target must not
+                    # silently tear down or silently accept a different
+                    # allocation: compare the effective settings and require an
+                    # explicit refresh when they differ.
+                    plan, _ = self._resolve_allocation(target, overrides)
+                    new_sig = plan_signature(plan_summary(target, plan))
+                    if new_sig != plan_signature(runtime.resolved_plan):
+                        result = runtime.public(
+                            self.sessions.count_for_target(name)
+                        )
+                        result["needs_refresh"] = True
+                        result["warning"] = (
+                            "requested allocation settings differ from the "
+                            f"active allocation for target {name!r}; run "
+                            f"'target-refresh {name} --set ...' to apply them"
+                        )
+                        return result
+                    # Effective settings are equal: no-op, allocation preserved.
                 return runtime.public(self.sessions.count_for_target(name))
             warning = self._factor_warning(target, factor)
             if target.interactive_auth and factor is None:
                 return self._interactive_skip(runtime)
             if warning is not None:
                 factor = None  # key-only downstream
-            await self._connect_locked(target, runtime, factor=factor)
+            await self._connect_locked(
+                target, runtime, factor=factor, overrides=overrides
+            )
             result = runtime.public(self.sessions.count_for_target(name))
         if warning:
             result["warning"] = warning
         return result
 
-    async def refresh_target(self, name: str, factor: str | None = None) -> dict:
+    async def refresh_target(
+        self,
+        name: str,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
@@ -285,16 +482,69 @@ class Gateway:
             warning = self._factor_warning(target, factor)
             if warning is not None:
                 factor = None  # key-only downstream
+            # A refresh without explicit overrides re-applies the settings the
+            # target already retained, so recovery never silently reverts to
+            # defaults.  Resolve/validate before any teardown: a bad override
+            # must not destroy a still-active allocation.
+            effective = (
+                overrides
+                if overrides is not None
+                else (runtime.resolved_overrides or None)
+            )
+            if effective or self._env_configured(target):
+                self._resolve_allocation(target, effective)
             # Release the old allocation before provisioning a new one.  The
             # route connection is still alive here, so the command can run.
             await self._run_close_command(name)
             await self._stop_locked(name)
             await self.backend.disconnect(name)
             await self.sessions.close_for_target(name, reason="refresh")
-            await self._connect_locked(target, runtime, factor=factor)
+            await self._connect_locked(
+                target, runtime, factor=factor, overrides=effective
+            )
             result = runtime.public(self.sessions.count_for_target(name))
         if warning:
             result["warning"] = warning
+        return result
+
+    def preview_target(
+        self, name: str, overrides: dict[str, Any] | None = None
+    ) -> dict:
+        """Pure allocation preview: no connection, no allocation, no state change.
+
+        Returns the resolved plan summary, the per-stage rendered args and the
+        provision environment contract.  For a connected target, a preview whose
+        effective settings differ from the retained ones reports
+        ``needs_refresh``; a plain connect and a preview never disturb the live
+        allocation.
+        """
+        target = self._target(name)
+        runtime = self.runtimes[name]
+        plan, provision_env = self._resolve_allocation(target, overrides)
+        sbatch, srun = render_args(target, plan)
+        summary = plan_summary(target, plan)
+        result = {
+            "target": name,
+            "connected": runtime.state == "connected",
+            "planned": summary,
+            "sbatch_args": list(sbatch),
+            "srun_args": list(srun),
+            "provision_env": provision_env,
+            "would_emit": {
+                "sbatch": list(sbatch),
+                "srun": list(srun),
+                "not_emitted": list(summary.get("not_emitted", [])),
+            },
+        }
+        if runtime.state == "connected":
+            new_sig = plan_signature(summary)
+            if new_sig != plan_signature(runtime.resolved_plan):
+                result["needs_refresh"] = True
+                result["warning"] = (
+                    "previewed allocation settings differ from the active "
+                    f"allocation for target {name!r}; run 'target-refresh "
+                    f"{name} --set ...' to apply them"
+                )
         return result
 
     def _factor_warning(self, target: TargetConfig, factor: str | None) -> str | None:
@@ -633,7 +883,12 @@ class Gateway:
         before this runs, so a malformed file never reaches here.  Unchanged
         connected targets keep their tunnels; removed targets are stopped;
         changed targets are marked for refresh (and refreshed if connected).
+
+        Allocation conflicts are re-checked here, before any state changes, so
+        a reload that would introduce an inconsistent mapping is rejected and
+        the active configuration is retained.
         """
+        validate_config_allocations(new_config)
         if self.transport_override:
             # Re-apply the test/debug transport override to the new config.
             saved = self.transport_override
@@ -721,22 +976,28 @@ class Gateway:
             raise web.HTTPNotFound(text="unknown target")
         return web.json_response(self.public_status(name))
 
-    async def _request_factor(self, request: web.Request) -> str | None:
-        """Read the optional ``{"factor": "..."}`` JSON body.
+    async def _request_json(self, request: web.Request) -> dict:
+        """Read and validate the optional JSON object body once.
 
-        An absent or empty body is allowed (returns ``None``).  Malformed JSON or
-        a non-string factor is a 400.  The value is never logged or echoed.
+        The request body can only be read once; callers must derive both the
+        2FA factor and the allocation overrides from this single result.  An
+        absent or empty body is an empty object; malformed JSON or a non-object
+        body is a 400.
         """
         if not request.can_read_body:
-            return None
+            return {}
         try:
             body = await request.json()
         except Exception as exc:  # noqa: BLE001 - bad client body
             raise web.HTTPBadRequest(text="body must be JSON") from exc
         if body in (None, {}):
-            return None
+            return {}
         if not isinstance(body, dict):
             raise web.HTTPBadRequest(text="body must be a JSON object")
+        return body
+
+    @staticmethod
+    def _body_factor(body: dict) -> str | None:
         factor = body.get("factor")
         if factor is None:
             return None
@@ -744,19 +1005,44 @@ class Gateway:
             raise web.HTTPBadRequest(text="'factor' must be a string")
         return factor or None
 
+    @staticmethod
+    def _body_overrides(body: dict) -> dict[str, Any] | None:
+        overrides = body.get("set")
+        if overrides is None:
+            return None
+        if not isinstance(overrides, dict):
+            raise web.HTTPBadRequest(text="'set' must be an object of override values")
+        return {str(k): v for k, v in overrides.items()}
+
     async def h_connect(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
-        factor = await self._request_factor(request)
-        return web.json_response(await self.connect_target(name, factor=factor))
+        body = await self._request_json(request)
+        factor = self._body_factor(body)
+        overrides = self._body_overrides(body)
+        return web.json_response(
+            await self.connect_target(name, factor=factor, overrides=overrides)
+        )
 
     async def h_refresh(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
-        factor = await self._request_factor(request)
-        return web.json_response(await self.refresh_target(name, factor=factor))
+        body = await self._request_json(request)
+        factor = self._body_factor(body)
+        overrides = self._body_overrides(body)
+        return web.json_response(
+            await self.refresh_target(name, factor=factor, overrides=overrides)
+        )
+
+    async def h_preview(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        name = request.match_info["target"]
+        client.require_target(name)
+        body = await self._request_json(request)
+        overrides = self._body_overrides(body)
+        return web.json_response(self.preview_target(name, overrides=overrides))
 
     async def h_stop(self, request: web.Request) -> web.Response:
         client = self._auth(request)
@@ -1315,6 +1601,7 @@ class Gateway:
         router.add_get("/v1/targets/{target}", self.h_get_target)
         router.add_post("/v1/targets/{target}/connect", self.h_connect)
         router.add_post("/v1/targets/{target}/refresh", self.h_refresh)
+        router.add_post("/v1/targets/{target}/preview", self.h_preview)
         router.add_post("/v1/targets/{target}/stop", self.h_stop)
         router.add_post("/v1/exec", self.h_exec)
         router.add_post("/v1/sessions", self.h_session_create)

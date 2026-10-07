@@ -24,6 +24,7 @@ name a configured target; an arbitrary SSH hostname is never accepted.
 
 ```
 src/compute_mcp/
+  allocation.py   Slurm allocation planning and sbatch/srun argument rendering
   config.py       TOML loading + validation, transport selection
   auth.py         constant-time bearer auth and per-client ACLs
   tunnel.py       asyncio SSH tunnel manager, route failover, recovery
@@ -36,6 +37,7 @@ src/compute_mcp/
   mcp_server.py   MCP server (stdio) exposing computeMCP_* tools
   control.py      computeMCP-gatewayctl operator CLI
 tests/            unit tests (see `pytest -q`)
+scripts/computemcp-slurm/  Slurm provisioning bundle (see its README)
 config.example.toml
 systemd/computeMCP-gateway.service
 ```
@@ -626,6 +628,391 @@ Running `opencode run` remotely through `computeMCP_exec` may need `</dev/null`:
 stdin is a non-TTY pipe there, and `opencode run` can wait on it until EOF. The
 skill covers the symptom and the workaround.
 
+## Configuration includes
+
+A top-level `include` key splits the gateway configuration across files.
+Relative paths in the list resolve against the directory of the including
+file. Absolute paths are accepted as-is.
+
+```toml
+include = [
+    "systems/rosi.toml",
+    "systems/hal.toml",
+    "/opt/computeMCP-gateway/systems/other.toml",
+]
+
+[server]
+listen = "127.0.0.1"
+port = 2222
+
+[clients.alpaka]
+targets = ["rosi", "hal"]
+```
+
+Each included file keeps its full `[targets.NAME]` structure, including the
+node, allocation, slurm, and container tables. The loader parses each file
+independently and then merges the tables. If two files set the same leaf
+value, the merge is rejected and names both files. A missing include file or
+a cycle among the includes is a load error. `include` keys are stripped from
+the merged result, so the rest of the configuration is parsed as a plain
+gateway file.
+
+A reload reads the complete include graph, validates it, and applies it
+atomically, so a broken include file leaves the active configuration intact.
+
+## Slurm allocation and container configuration
+
+When a target describes a Slurm node, an allocation policy, manual
+`sbatch`/`srun` options, and an optional container runtime, the gateway
+computes the resource plan, renders the per-stage scheduler arguments, and
+exports them to the trusted `provision_command` as environment variables.
+The login node needs only Bash for the argument bridge. The shipped
+provisioning bundle, its auto-build flow, GPU vendor transitions, and
+end-to-end lifecycle are documented in
+[`scripts/computemcp-slurm/README.md`](scripts/computemcp-slurm/README.md).
+
+### `[targets.X.node]`
+
+Per-node capacity description. All fields are optional; an unset field carries
+no capacity and the plan resolves it at the policy level (e.g. a missing
+`gpus` makes `gpu-proportional` fall back to the full per-node CPU and
+memory share).
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `cpus` | positive integer | Slurm CPUs per node under the site's SMT policy (not physical cores) |
+| `gpus` | positive integer | Scheduler-visible GPUs per node |
+| `memory` | string | Allocatable host memory per node, e.g. `"378000M"`. A bare integer is MiB. Not installed RAM, not GPU memory |
+
+Use these to tell the gateway what a node at this site can hand out. The
+plan does not restate capacities as min/max ranges; `max-nodes` is the
+independent upper bound.
+
+### `[targets.X.allocation]`
+
+Defaults and the allocation policies. One node is the default. A GPU system
+defaults to one GPU per node; a CPU-only system can set `default-cpus`.
+
+| Key | Accepts |
+| --- | --- |
+| `default-gpus` | positive integer; accepted but currently the mode itself fixes the GPU count (one GPU in `gpu-proportional`, the node capacity in `full`/`exclusive`) |
+| `default-cpus` | positive integer; used by `cpu-proportional` as the CPU request when the node has no `cpus` description. With `node.cpus` set and no override, the full per-node capacity is the request |
+| `single-node` | one of `gpu-proportional`, `cpu-proportional`, `full`, `exclusive` |
+| `multi-node` | `full` or `exclusive` |
+| `max-nodes` | positive integer; hard bound on the requested node count |
+
+Mode semantics (per node):
+
+| Mode | Calculated intent |
+| --- | --- |
+| `gpu-proportional` | CPU and memory scale with the requested GPU count. An integer per-GPU CPU share and a whole-MiB per-GPU memory share are derived from node capacities first, then multiplied by the requested GPUs. The division truncates and the preview shows the calculated result. |
+| `cpu-proportional` | Memory scales with the requested CPU count against the node capacity. Intended for CPU-only targets. |
+| `full` | The full configured per-node capacities, without an exclusivity flag. |
+| `exclusive` | The full configured per-node capacities, plus the exclusivity intent. The intent alone does not emit `--exclusive`; the `exclusive` mapping (or a manual `exclusive = true`) does. |
+
+### `[targets.X.slurm.sbatch]` and `[targets.X.slurm.srun]`
+
+Free-form manual options for the two Slurm stages. Keys are option names
+without the leading `--`. The value is a scalar, a boolean, or an array:
+
+| Value form | Rendered |
+| --- | --- |
+| string or integer | `--key=value` |
+| `true` | `--key` (bare flag) |
+| `false` | omitted |
+| array of strings/ints | `--key=value` repeated once per entry |
+
+A stage absent from the config emits no argument at all for that stage. An
+empty `[slurm]` table is equivalent to no Slurm block.
+
+Protocol options the provisioning helper owns (`parsable`, `quiet`, `wrap`)
+are rejected in manual options; the helper adds its own launcher flags.
+Option names must be plain tokens (no leading `--`, no whitespace), and
+a value containing a newline, carriage return, or NUL is rejected.
+
+### `[targets.X.slurm.sbatch-map]` and `[targets.X.slurm.srun-map]`
+
+Bounded mappings from calculated values to scheduler options. Each mapping
+entry is optional; a missing entry emits nothing. The vocabulary is fixed:
+
+| Calculated key | Mapping value | Emitted option |
+| --- | --- | --- |
+| `nodes` | `nodes` | `--nodes=N` |
+| `gpus-per-node` | `gres` | `--gres=gpu:N` |
+| `gpus-per-node` | `gpus-per-node` | `--gpus-per-node=N` |
+| `cpus-per-node` | `cpus-per-task` | `--cpus-per-task=C`, only valid with one task per node in the same stage |
+| `memory-per-node` | `mem` | `--mem=<MiB>M`, whole MiB with an explicit unit |
+| `exclusive` | `exclusive` | `--exclusive` when the plan computed exclusivity; omitted otherwise |
+
+The `cpus-per-node` -> `cpus-per-task` mapping requires a one-task-per-node
+layout in the same stage. Set `ntasks-per-node = 1` (or `ntasks = 1`) in the
+matching manual options. The validator rejects a mapping whose task-layout
+precondition is not met.
+
+A mapping and a manual option for the same family in the same stage are
+rejected at load time, not silently prioritized: the error names the target,
+stage, calculated field, and manual key. Alternative forms of the same
+family conflict too: manual `mem` or `mem-per-cpu` against `memory-per-node`,
+manual `gres`/`gpus`/`gpus-per-task`/`gpus-per-node` against `gpus-per-node`,
+manual `nodes` or `n` against `nodes`, manual `exclusive` against `exclusive`.
+The two stages are checked independently, so `slurm.sbatch-map` and
+`slurm.srun-map` may map the same calculated value differently.
+
+Without a mapping, no resource argument is generated for that value. The
+gateway can still compute a plan for discovery and preview; the computed
+value then appears in the preview's `not_emitted` list.
+
+### `[targets.X.container]`
+
+Describes the container runtime for the provisioning bundle.
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `runtime` | `"apptainer"` or `"docker"` | Required whenever the block is present |
+| `storage-root` | string | Base for the system state, sandbox, and home directories under. See the bundle README for the resulting layout |
+| `image` | string | Base image. `docker://<ref>` for Apptainer, plain reference for Docker |
+| `gpus` | string array | Subset of `nvidia`, `amd`, `intel`. Missing device nodes are reported and skipped |
+| `host-home` | string | Host directory carrying `.ssh/authorized_keys` that the container trusts |
+| `sandbox` | boolean | Informational flag; the helper reads the actual sandbox path |
+
+### Worked example: GPU target with Apptainer (ROSI illustration)
+
+This template mirrors the design-document ROSI illustration: one GPU per
+node by default, `ntasks-per-node = 1` in both stages, and a manual
+`mem = "100G"` that opts the target out of the calculated memory share.
+The `cpus-per-node -> cpus-per-task` mapping is legal because each stage's
+manual options pin the one-task-per-node layout. Replace the partition,
+the `/home/USER` paths, and the storage paths with your site values.
+
+```toml
+[targets.rosi]
+ssh_targets = ["rosi"]
+user = "agent"
+client_key = "/home/USER/.ssh/computemcp_container"
+host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+host_key_algorithms = ["ssh-ed25519"]
+host_key_check = "on"
+auto_connect = true
+sharing = "exclusive"
+provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
+close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
+provision_timeout = 960.0
+
+# Node capacities.  The numbers mirror the reviewed ROSI PIConGPU template,
+# not current verified cluster hardware:
+[targets.rosi.node]
+cpus = 24
+gpus = 4
+memory = "378000M"
+
+# Defaults and policies:
+[targets.rosi.allocation]
+default-gpus = 1
+single-node = "gpu-proportional"
+multi-node = "exclusive"
+max-nodes = 4
+
+# Manual submission options.  The map fills the resource numbers on top.
+[targets.rosi.slurm.sbatch]
+partition = "REPLACE_WITH_PARTITION_NAME"
+time = "02:00:00"
+mem = "100G"                # fixed memory; the calculated share is not emitted
+ntasks-per-node = 1
+
+# Calculated-value mappings for submission:
+[targets.rosi.slurm.sbatch-map]
+nodes = "nodes"
+gpus-per-node = "gres"
+cpus-per-node = "cpus-per-task"
+exclusive = "exclusive"
+# No memory mapping: the manual mem option is authoritative.
+
+# Job-step launch options:
+[targets.rosi.slurm.srun]
+ntasks-per-node = 1
+cpu-bind = "none"
+
+[targets.rosi.slurm.srun-map]
+nodes = "nodes"
+cpus-per-node = "cpus-per-task"
+
+# Container runtime for the provisioning bundle:
+[targets.rosi.container]
+runtime = "apptainer"
+storage-root = "/scratch/USER/computemcp"
+image = "docker://ubuntu:24.04"
+gpus = ["nvidia"]
+host-home = "/scratch/USER/computemcp/home"
+sandbox = true
+```
+
+For the node above, one GPU per node computes 6 CPUs (24/4) and 94500 MiB of
+per-node memory (378000/4). With `--set gpus-per-node=2`, the same mode
+computes 12 CPUs and 189000 MiB. The rendered `COMPUTEMCP_SBATCH_ARGS` is:
+
+```
+--partition=REPLACE_WITH_PARTITION_NAME
+--time=02:00:00
+--mem=100G
+--ntasks-per-node=1
+--nodes=1
+--gres=gpu:2
+--cpus-per-task=12
+```
+
+The calculated `memory-per-node` does not emit an `--mem` option because no
+mapping is configured; the preview lists it under `not_emitted` and the
+fixed manual option remains authoritative.
+
+### Worked example: CPU-only target with Docker
+
+CPU-only target. `cpu-proportional` requests the full per-node CPU capacity
+by default (16 here), memory follows the same ratio (128 GiB for the whole
+node), and the two mappings emit the CPU and memory requests. `default-cpus`
+applies when the node description has no `cpus` key.
+
+```toml
+[targets.cpuhost]
+ssh_targets = ["cpuhost"]
+user = "agent"
+client_key = "/home/USER/.ssh/computemcp_container"
+host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+host_key_algorithms = ["ssh-ed25519"]
+auto_connect = false
+sharing = "unknown"
+provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
+close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
+provision_timeout = 600.0
+
+# Node capacities: no GPUs described.
+[targets.cpuhost.node]
+cpus = 16
+memory = "128G"
+
+# Policies.  default-cpus applies when node.cpus is unset; with cpus set
+# (16 here) the full per-node capacity is the request and this value is
+# recorded for completeness.
+[targets.cpuhost.allocation]
+default-cpus = 4
+single-node = "cpu-proportional"
+
+[targets.cpuhost.slurm.sbatch]
+partition = "REPLACE_WITH_PARTITION_NAME"
+time = "01:00:00"
+ntasks-per-node = 1
+
+[targets.cpuhost.slurm.sbatch-map]
+cpus-per-node = "cpus-per-task"
+memory-per-node = "mem"
+
+[targets.cpuhost.slurm.srun]
+ntasks-per-node = 1
+cpu-bind = "none"
+
+[targets.cpuhost.slurm.srun-map]
+cpus-per-node = "cpus-per-task"
+
+# Container runtime for the provisioning bundle:
+[targets.cpuhost.container]
+runtime = "docker"
+storage-root = "/scratch/USER/computemcp"
+image = "ubuntu:24.04"
+```
+
+With the defaults, the plan resolves to 16 CPUs and 131072 MiB of per-node
+memory (the full 128 GiB node capacity). A `--set cpus-per-node=8` override
+scales memory to the same ratio (half the node) and renders
+`--cpus-per-task=8 --mem=65536M`.
+
+### Connect-time overrides, refresh, and dry-run preview
+
+`computeMCP-gatewayctl target-connect <t>` and `target-refresh <t>` accept
+repeatable `--set KEY=VALUE` entries. The `--dry-run` flag renders the
+allocation without connecting. Valid `--set` keys: `nodes`,
+`gpus-per-node`, `cpus-per-node`, `mem-per-node`, `mode`. The `mode` value
+is one of the allocation modes; a multi-node `mode` limited to `full` and
+`exclusive` follows the same rule as the configuration.
+
+```bash
+computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2
+computeMCP-gatewayctl target-connect rosi --set nodes=2 --set cpus-per-node=12 --set mem-per-node=100G
+# Dry-run: print the plan without connecting or allocating
+computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2 --dry-run
+```
+
+The preview prints the planned intent (mode, nodes, per-node calculations,
+exclusive), the manual settings per stage, the rendered arguments per stage,
+the calculated fields not emitted, and the final `COMPUTEMCP_SBATCH_ARGS`
+and `COMPUTEMCP_SRUN_ARGS`. The HTTP equivalent is
+`POST /v1/targets/{target}/preview` with the same override body.
+
+A preview changes no live allocation. For a connected target whose current
+allocation differs from the previewed one, the result carries
+`needs_refresh: true` and a warning.
+
+#### Lifecycle semantics
+
+- **Disconnected connect**: applies the allocation defaults plus any
+  `--set` overrides.
+- **Connected target, no overrides**: preserves the active allocation; the
+  target keeps its resolved settings.
+- **Connected connect with differing settings**: reports a mismatch
+  (`needs_refresh: true` with a warning). Nothing is torn down, and the
+  resulting allocation continues on the connection.
+- **Refresh** (`target-refresh <t> --set …`): applies the overrides to the
+  retained resolved settings and recreates the allocation
+  (releases the old one via `close_command`, then provisions a new one).
+- **Recovery without overrides**: `target-refresh <t>` re-applies the
+  target's retained resolved settings, not the configured defaults, so the
+  operator's previous `--set` request continues to apply after a reconnection
+  triggered by a route loss or a restart.
+- **Validation**: overrides resolve before mapping; an explicit partial
+  GPU/CPU request that conflicts with a `full`/`exclusive` multi-node policy
+  is an error, not a silent replacement.
+
+### Environment transport contract
+
+The gateway exports the resolved allocation and container description as
+`COMPUTEMCP_*` environment variables around the existing
+`provision_command`, over the authenticated route connection:
+
+- `COMPUTEMCP_SBATCH_ARGS` and `COMPUTEMCP_SRUN_ARGS`: one complete argument
+  per line, no trailing newline. An empty value means an empty argument list.
+  The provisioning helper parses each with `mapfile -t` into Bash arrays and
+  does not use `eval` or unquoted expansion.
+- `COMPUTEMCP_NODES`, `COMPUTEMCP_CPUS_PER_NODE`,
+  `COMPUTEMCP_GPUS_PER_NODE`, `COMPUTEMCP_MEMORY_PER_NODE_MIB`,
+  `COMPUTEMCP_EXCLUSIVE`, `COMPUTEMCP_MODE`: the resolved plan. Numeric
+  per-node fields are empty when the plan has no value; the other three are
+  concrete.
+- `COMPUTEMCP_SYSTEM`, `COMPUTEMCP_CONTAINER_RUNTIME`,
+  `COMPUTEMCP_STORAGE_ROOT`, `COMPUTEMCP_IMAGE`,
+  `COMPUTEMCP_GPU_VENDORS`, `COMPUTEMCP_HOST_HOME`,
+  `COMPUTEMCP_SANDBOX`: the container description from
+  `[targets.X.container]`.
+
+`sbatch` and `srun` remain separate stages: the helper submits
+`sbatch "${SBATCH_ARGS[@]}" …`; the batch job launches
+`srun "${SRUN_ARGS[@]}" …`. No value moves from one list to the other.
+
+### Requirements and validation
+
+- The helper on the login node parses both `*_ARGS` variables with
+  `mapfile -t` into Bash arrays and runs them quoted; `eval` and unquoted
+  expansion are not used. See
+  [`scripts/computemcp-slurm/README.md`](scripts/computemcp-slurm/README.md)
+  for the full bridge and the manual-fallback path.
+- The `cpus-per-node` -> `cpus-per-task` mapping is re-checked at plan time
+  in addition to the load-time check, so the two stages stay semantically
+  aligned as the config evolves.
+- A request that prints `--nodes=N` with `N > 1` passes the gateway-side
+  allocation, but the provisioning helper exits with `multi-node not yet
+  supported` before `sbatch`. Multi-node allocation is not currently
+  supported end-to-end.
+- `reload` re-runs the conflict validation (mappings and manual options)
+  over the loaded config; a load-time error rejects the new config and the
+  previous one stays active.
+
 ## Run the gateway
 
 ```bash
@@ -916,7 +1303,13 @@ targets = ["hal", "fwk394"]
 On an HPC system the login node is fixed, but the development container runs in
 a Slurm job on a compute node whose name (and the forwarded port) only exist
 once the job starts. The gateway supports this with `provision_command`, a
-trusted script that acquires the node and prints the endpoint to dial.
+trusted script that acquires the node and prints the endpoint to dial. A
+config-driven bundle ships as
+[`scripts/computemcp-slurm/`](scripts/computemcp-slurm/README.md): it builds
+the container, submits the allocation from the gateway-rendered arguments
+(see "Slurm allocation and container configuration"), starts a relay, and
+prints the endpoint. Use the bundle for new Slurm targets; the operator-written
+example below remains useful when the site scripts already own the job.
 
 How the pieces connect:
 
@@ -972,23 +1365,30 @@ The minimal possible script, useful for testing the wiring:
 printf 'ENDPOINT 127.0.0.1:2200\n'
 ```
 
-A realistic self-started-job script (operator-written; a later mode can let the
-gateway own `sbatch` by changing only this script):
+A realistic operator script (the gateway can supply `COMPUTEMCP_SBATCH_ARGS`
+when the target carries an allocation, so the job request follows the gateway's
+plan; the `sleep infinity` step predates the current bundle):
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOGIN="${TEROK_LOGIN:-rosi5}"                    # informational: this runs on the login node
-JOB_NAME="${TEROK_JOB_NAME:-terok-dev}"
-CONTAINER_PORT="${TEROK_CONTAINER_PORT:-2222}"   # container's sshd port on the node
-LOGIN_FORWARD_PORT="${TEROK_FORWARD_PORT:-2200}"
-ALLOC="${TEROK_SBATCH_ARGS:---nodes=1 --time=08:00:00}"
+JOB_NAME="terok-dev"
+CONTAINER_PORT=2222                              # container's sshd port on the node
+LOGIN_FORWARD_PORT=2200
+SBATCH_ARGS=()
+if [ -n "${COMPUTEMCP_SBATCH_ARGS:-}" ]; then
+    mapfile -t SBATCH_ARGS <<< "$COMPUTEMCP_SBATCH_ARGS"
+fi
 
 # 1. Reuse a running job for this target, or submit one that stays alive.
+#    When the gateway exports COMPUTEMCP_SBATCH_ARGS, the rendered plan
+#    replaces the inline defaults below.
+#    (The shipped bundle wraps the same idea into computemcp-job.sh and keeps
+#    the allocation alive with a helper script instead of --wrap.)
 jobid="$(squeue -h -u "$USER" -n "$JOB_NAME" -t R -o '%A' | head -n1 || true)"
 if [ -z "$jobid" ]; then
-    jobid="$(sbatch --parsable --job-name "$JOB_NAME" $ALLOC --wrap 'sleep infinity')"
+    jobid="$(sbatch --parsable --job-name "$JOB_NAME" "${SBATCH_ARGS[@]:---nodes=1 --time=08:00:00}" --wrap 'sleep infinity')"
 fi
 
 # 2. Wait until the job is running and report its node.
@@ -1119,7 +1519,7 @@ shown as `provisioned_endpoint` in `status`/`GET /v1/targets/{name}`.
 GET    /v1/health
 GET    /v1/targets
 GET    /v1/targets/{target}
-POST   /v1/targets/{target}/connect | /refresh | /stop
+POST   /v1/targets/{target}/connect | /refresh | /stop | /preview
 POST   /v1/exec
 POST   /v1/sessions ; GET /v1/sessions ; GET|DELETE /v1/sessions/{id}
 POST   /v1/sessions/{id}/write | /read | /resize
@@ -1140,8 +1540,10 @@ POST   /v1/enroll-requests/{request}/deny    # admin
 streams the request body into SFTP without buffering. Both support large files.
 
 `POST /v1/targets/{target}/connect` and `/refresh` accept an optional JSON body
-`{"factor": "..."}` carrying the per-request second factor for an
-`interactive_auth` target. The factor is used once, never persisted or logged.
+`{"factor": "...", "set": {"gpus-per-node": 2, ...}}` carrying the per-request
+second factor and the allocation overrides. The factor is used once, never
+persisted or logged. `POST /v1/targets/{target}/preview` accepts the same
+override body and returns the rendered plan with no connection state change.
 The MCP/agent tool surface is unchanged; agents do not call these endpoints
 directly.
 

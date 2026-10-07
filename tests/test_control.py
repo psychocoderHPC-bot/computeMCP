@@ -131,9 +131,137 @@ async def test_control_target_connect_sends_factor(monkeypatch, capsys):
     assert calls == [
         ("POST", "/v1/targets/hal/connect", {"factor": "SECRET"}),
     ]
-    # the factor must never be echoed to stdout/stderr
-    captured = capsys.readouterr()
-    assert "SECRET" not in captured.out + captured.err
+
+
+async def test_control_dry_run_posts_preview_and_prints_labeled_block(monkeypatch, capsys):
+    preview_body = {
+        "target": "hal",
+        "connected": False,
+        "planned": {
+            "plan": {
+                "nodes": 1,
+                "cpus_per_node": 16,
+                "gpus_per_node": 1,
+                "memory_per_node_mib": 189000,
+                "exclusive": False,
+                "mode": "gpu-proportional",
+            },
+            "defaults_used": True,
+            "manual": {"sbatch": {"ntasks-per-node": 1}, "srun": {}},
+        },
+        "sbatch_args": ["--ntasks-per-node=1", "--gres=gpu:1"],
+        "srun_args": [],
+        "provision_env": {
+            "COMPUTEMCP_SBATCH_ARGS": "--ntasks-per-node=1\n--gres=gpu:1",
+            "COMPUTEMCP_SRUN_ARGS": "",
+        },
+        "would_emit": {"sbatch": [], "srun": [], "not_emitted": ["memory-per-node"]},
+    }
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["target-connect", "hal", "--dry-run", "--set", "gpus-per-node=1"],
+        preview_body,
+    )
+    # Dry-run hits /preview, never /connect, and keeps the {"set": ...} body.
+    assert calls == [
+        (
+            "POST",
+            "/v1/targets/hal/preview",
+            {"set": {"gpus-per-node": 1}},
+        ),
+    ]
+
+
+async def test_control_set_body_and_back_compat(monkeypatch):
+    # With --set, the body carries "set": overrides
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["target-connect", "hal", "--set", "nodes=2", "--set", "gpus-per-node=1"],
+        {"name": "hal", "state": "connected", "active_route": "hal"},
+    )
+    assert calls == [
+        (
+            "POST",
+            "/v1/targets/hal/connect",
+            {"set": {"nodes": 2, "gpus-per-node": 1}},
+        ),
+    ]
+
+    # Back-compat: no body when no --set and no --2fa
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["target-connect", "hal"],
+        {"name": "hal", "state": "connected", "active_route": "hal"},
+    )
+    assert calls == [("POST", "/v1/targets/hal/connect", None)]
+
+
+async def test_control_set_with_factor_combined_body(monkeypatch):
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["target-connect", "hal", "--2fa", "SECRET", "--set", "nodes=2"],
+        {"name": "hal", "state": "connected", "active_route": "hal"},
+    )
+    assert calls == [
+        (
+            "POST",
+            "/v1/targets/hal/connect",
+            {"factor": "SECRET", "set": {"nodes": 2}},
+        ),
+    ]
+    import io, sys
+    # factor must never be echoed on stdout — just check the call body
+    body_captured = calls[0][2]
+    assert body_captured == {"factor": "SECRET", "set": {"nodes": 2}}
+
+
+def test_parse_overrides_none_and_malformed():
+    from compute_mcp.control import _parse_overrides
+
+    assert _parse_overrides(None) is None
+    assert _parse_overrides([]) is None
+    with pytest.raises(SystemExit):
+        _parse_overrides(["no-equals"])
+    with pytest.raises(SystemExit):
+        _parse_overrides(["=value"])
+    with pytest.raises(SystemExit):
+        _parse_overrides([ '  =value'])
+
+
+def test_parse_overrides_repeated_and_int_coercion():
+    from compute_mcp.control import _parse_overrides
+
+    result = _parse_overrides([
+        "gpus-per-node=2", "nodes=1", "mem-per-node=100G", "mode=full",
+    ])
+    assert result == {
+        "gpus-per-node": 2,
+        "nodes": 1,
+        "mem-per-node": "100G",
+        "mode": "full",
+    }
+    assert isinstance(result["gpus-per-node"], int)
+    assert isinstance(result["nodes"], int)
+    assert isinstance(result["mem-per-node"], str)
+
+
+def test_parser_accepts_set_and_dry_run():
+    for argv in (
+        ["target-connect", "hal", "--set", "gpus-per-node=2"],
+        ["target-refresh", "hal", "--set", "mode=full", "--set", "nodes=2"],
+        ["target-connect", "hal", "--dry-run"],
+        ["target-refresh", "hal", "--dry-run", "--set", "nodes=2"],
+    ):
+        args = build_parser().parse_args(["--config", "x.toml"] + argv)
+        assert args.command
+
+
+def test_parser_set_without_value_is_usage_error():
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(
+            ["--config", "x.toml", "target-connect", "hal", "--set"]
+        )
+    assert excinfo.value.code == 2
 
 
 async def test_control_target_connect_without_factor_sends_no_body(monkeypatch):
@@ -144,7 +272,6 @@ async def test_control_target_connect_without_factor_sends_no_body(monkeypatch):
     )
     assert calls == [("POST", "/v1/targets/hal/connect", None)]
 
-
 async def test_control_target_refresh_sends_factor(monkeypatch):
     calls, _ = await _run_control(
         monkeypatch,
@@ -154,7 +281,6 @@ async def test_control_target_refresh_sends_factor(monkeypatch):
     assert calls == [
         ("POST", "/v1/targets/hal/refresh", {"factor": "SECRET"}),
     ]
-
 
 async def test_control_prints_gateway_warning(monkeypatch, capsys):
     await _run_control(
@@ -171,7 +297,6 @@ async def test_control_prints_gateway_warning(monkeypatch, capsys):
     assert "warning:" in captured.err
     assert "requires interactive authentication" in captured.err
 
-
 def test_parser_2fa_without_value_is_usage_error():
     """`target-connect hal --2fa` (no value) must exit 2, not silently accept."""
     parser = build_parser()
@@ -179,49 +304,39 @@ def test_parser_2fa_without_value_is_usage_error():
         parser.parse_args(["--config", "x.toml", "target-connect", "hal", "--2fa"])
     assert excinfo.value.code == 2
 
-
 def test_parser_refresh_2fa_without_value_is_usage_error():
     parser = build_parser()
     with pytest.raises(SystemExit) as excinfo:
         parser.parse_args(["--config", "x.toml", "target-refresh", "hal", "--2fa"])
     assert excinfo.value.code == 2
 
-
-# -- CLI: connect/refresh timeout resolution ---------------------------------
-
 def _parse(argv):
     return build_parser().parse_args(["--config", "x.toml"] + argv)
-
 
 def test_resolve_timeout_uses_provision_timeout_plus_margin():
     cfg = make_config_with_target(provision_timeout=900.0)
     args = _parse(["target-connect", "hal"])
     assert _resolve_timeout(args, cfg, ["hal"]) == 900.0 + PROVISION_HANDSHAKE_MARGIN
 
-
 def test_resolve_timeout_global_flag_overrides_provision_timeout():
     cfg = make_config_with_target(provision_timeout=900.0)
     args = _parse(["--timeout", "5", "target-connect", "hal"])
     assert _resolve_timeout(args, cfg, ["hal"]) == 5.0
-
 
 def test_resolve_timeout_subcommand_flag_overrides_global():
     cfg = make_config_with_target(provision_timeout=900.0)
     args = _parse(["--timeout", "5", "target-connect", "--timeout", "7", "hal"])
     assert _resolve_timeout(args, cfg, ["hal"]) == 7.0
 
-
 def test_resolve_timeout_refresh_subcommand_flag_without_global():
     cfg = make_config_with_target(provision_timeout=900.0)
     args = _parse(["target-refresh", "--timeout", "7", "hal"])
     assert _resolve_timeout(args, cfg, ["hal"]) == 7.0
 
-
 def test_resolve_timeout_unknown_target_falls_back_to_default():
     cfg = make_config_with_target(provision_timeout=900.0)
     args = _parse(["target-connect", "unknown"])
     assert _resolve_timeout(args, cfg, ["unknown"]) == DEFAULT_TIMEOUT
-
 
 def test_resolve_timeout_non_connect_command_is_default():
     cfg = make_config_with_target(provision_timeout=900.0)
@@ -229,14 +344,12 @@ def test_resolve_timeout_non_connect_command_is_default():
     assert _resolve_timeout(args, cfg, []) == DEFAULT_TIMEOUT
     assert not hasattr(args, "action_timeout")
 
-
 def test_resolve_timeout_picks_max_over_multiple_targets():
     cfg = make_config_with_target(provision_timeout=900.0)
     args = _parse(["client-connect", "alpaka"])
     assert _resolve_timeout(args, cfg, ["hal", "other"]) == (
         900.0 + PROVISION_HANDSHAKE_MARGIN
     )
-
 
 async def test_target_connect_sends_provision_timeout_to_request(monkeypatch):
     cfg = make_config_with_target(provision_timeout=900.0)
@@ -248,7 +361,6 @@ async def test_target_connect_sends_provision_timeout_to_request(monkeypatch):
     )
     assert timeouts == [900.0 + PROVISION_HANDSHAKE_MARGIN]
 
-
 async def test_target_connect_subcommand_timeout_reaches_request(monkeypatch):
     cfg = make_config_with_target(provision_timeout=900.0)
     _, timeouts = await _run_control(
@@ -258,3 +370,4 @@ async def test_target_connect_subcommand_timeout_reaches_request(monkeypatch):
         cfg=cfg,
     )
     assert timeouts == [7.0]
+

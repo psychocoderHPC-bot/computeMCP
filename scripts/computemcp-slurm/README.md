@@ -1,0 +1,181 @@
+# computeMCP Slurm provisioning bundle
+
+One config-driven bundle replaces the per-system scripts.  The gateway renders a
+resource plan and two argument lists, exports them as `COMPUTEMCP_*` variables,
+and runs `computemcp-provision.sh` on the Slurm login node.  The helper builds
+the container, submits one single-node allocation, starts a relay, and prints
+`ENDPOINT host:port` once the forwarded SSH endpoint answers.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `computemcp-provision.sh` | Login-node entry point: `provision` (default), `stop`, `close`, `shell`, `status` |
+| `computemcp-container.sh` | Runtime dispatcher for `apptainer` and `docker` |
+| `computemcp-job.sh` | Batch script that runs on the compute node and keeps the allocation alive |
+| `computemcp-relay.py` | Loopback relay that carries SSH over `srun` steps |
+
+Place the four code files side by side on storage visible to login and compute
+nodes.  No site name, account, partition, image, or path is hardcoded.
+
+## Login-node requirements
+
+Slurm client tools (`sbatch`, `squeue`, `scancel`, `srun`), Bash, `flock`,
+`python3`, and the selected runtime (`apptainer` or `docker`).  The Apptainer
+configure step uses `python3` on the login node, so Python 3 remains a login
+node requirement even though the argument bridge itself is pure Bash.  Compute
+nodes need the same runtime and `python3`.
+
+## Gateway configuration
+
+```toml
+[targets.example]
+ssh_targets = ["example-login"]
+user = "agent"
+provision_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "provision"]
+close_command = ["bash", "/shared/computemcp-slurm/computemcp-provision.sh", "stop"]
+provision_timeout = 960.0
+
+[targets.example.node]
+cpus = 24
+gpus = 4
+memory = "378000M"
+
+[targets.example.allocation]
+default-gpus = 1
+single-node = "gpu-proportional"
+
+[targets.example.slurm.sbatch]
+partition = "gpu"
+time = "02:00:00"
+
+[targets.example.slurm.srun]
+ntasks-per-node = 1
+cpu-bind = "none"
+
+[targets.example.container]
+runtime = "apptainer"          # or "docker"
+storage-root = "/scratch/agent/computemcp"
+image = "docker://ubuntu:24.04"
+gpus = ["nvidia"]              # subset of nvidia, amd, intel
+host-home = "/scratch/agent/computemcp/home"
+sandbox = true
+```
+
+`provision_command` and `close_command` must point at the same bundle.  Replace
+the placeholder target, partition, and paths with site values.
+
+### Gateway keys to behavior
+
+| `[targets.X.container]` key | Behavior |
+| --- | --- |
+| `runtime` | Selects the Apptainer or Docker code path |
+| `storage-root` | Base for the system state, sandbox, and home directories |
+| `image` | Base image; `docker://` for Apptainer, plain reference for Docker |
+| `gpus` | GPU vendors to expose; missing devices are reported and skipped |
+| `host-home` | Directory whose `.ssh/authorized_keys` the container trusts |
+| `sandbox` | Informational request flag; the helper reads the actual path |
+
+The gateway exports the resolved values as `COMPUTEMCP_SYSTEM`,
+`COMPUTEMCP_STORAGE_ROOT`, `COMPUTEMCP_IMAGE`, `COMPUTEMCP_GPU_VENDORS`,
+`COMPUTEMCP_HOST_HOME`, `COMPUTEMCP_CONTAINER_RUNTIME`, and
+`COMPUTEMCP_SANDBOX`.  It also exports `COMPUTEMCP_NODES`,
+`COMPUTEMCP_CPUS_PER_NODE`, `COMPUTEMCP_GPUS_PER_NODE`,
+`COMPUTEMCP_MEMORY_PER_NODE_MIB`, `COMPUTEMCP_EXCLUSIVE`, `COMPUTEMCP_MODE`,
+`COMPUTEMCP_SBATCH_ARGS`, and `COMPUTEMCP_SRUN_ARGS`.
+
+`COMPUTEMCP_SBATCH_ARGS` and `COMPUTEMCP_SRUN_ARGS` hold one complete argument
+per line, with no trailing newline.  An empty value means no arguments.  The
+helper parses both with `mapfile -t` into Bash arrays and never uses `eval` or
+unquoted expansion.  `sbatch` and `srun` stay separate stages: the helper never
+copies submission options into the job step.
+
+## Storage layout
+
+By default the helper uses
+`$COMPUTEMCP_STORAGE_ROOT/$COMPUTEMCP_SYSTEM`, and the gateway default root is
+`$HOME/.local/share/computemcp`.  Under the system directory:
+
+| Path | Contents |
+| --- | --- |
+| `sandbox/` | Writable Apptainer sandbox (Apptainer runtime) |
+| `home/` | Persistent container home and `.ssh/authorized_keys` |
+| `state/` | Job ID, cluster, readiness files, per-job settings, locks, logs, relay state |
+
+Set `storage-root` on a filesystem reachable from login and compute nodes.
+Avoid a small home quota when building images.
+
+## Auto-build and SSH key
+
+The login-node helper checks for the sandbox directory (Apptainer) or the
+derived image `computemcp-<system>:latest` (Docker).  When it is absent, the
+helper builds it on the login node and then configures the SSH public key.  The
+build never runs inside the Slurm batch job.  When the container exists, the
+helper only configures it.
+
+The SSH public key comes from `COMPUTEMCP_SSH_PUBLIC_KEY`, then
+`COMPUTEMCP_SSH_PUBLIC_KEY_FILE`, then an existing
+`$COMPUTEMCP_HOST_HOME/.ssh/authorized_keys`.  The gateway should inject one of
+the first two.  Public-key-only access, per-user UID checks, and symlink-safe
+config writes are preserved from the reference scripts.
+
+## SBATCH and SRUN argument transport
+
+The helper parses `COMPUTEMCP_SBATCH_ARGS` into `SBATCH_ARGS` and appends only
+protocol options it owns (`--parsable`, `--job-name`, and output/error when the
+deck has none).  It submits with:
+
+```bash
+sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS"
+```
+
+`COMPUTEMCP_SRUN_ARGS` reaches the batch job through a per-job settings file
+whose path is passed as a positional argument to the batch script.  Slurm
+delivers positional arguments verbatim even under `--export=NONE`, so the
+helper does not touch the user's `--export` policy.  An `--export`-based bridge
+was rejected because it can silently override or be overridden by that policy,
+which the design forbids.  The settings file also carries the resolved container
+configuration.  `computemcp-job.sh` sources it and launches the container step
+with `srun "${SRUN_ARGS[@]}"`, so the step receives exactly the rendered
+`SRUN_ARGS` and nothing from the submission stage.
+
+## GPU vendors
+
+`gpus` is a comma list drawn from `nvidia`, `amd`, `intel`.  The Apptainer path
+adds `--nv` for NVIDIA and binds `/dev/kfd` (AMD) and `/dev/dri` (AMD/Intel).
+The Docker path adds `--gpus all` for NVIDIA, `/dev/kfd` plus
+`seccomp=unconfined` for AMD, and `/dev/dri` for AMD/Intel.  The helper reports
+and skips a vendor whose device node is missing.  Devices are shared; these
+flags do not reserve GPUs.
+
+## Manual and legacy use
+
+The helper works with an empty gateway environment.  When
+`COMPUTEMCP_SBATCH_ARGS` is empty it fills `SBATCH_ARGS` from the manual
+override variables of the reference scripts: `COMPUTEMCP_PARTITION`,
+`COMPUTEMCP_ACCOUNT`, `COMPUTEMCP_CPUS`, `COMPUTEMCP_GPUS`, `COMPUTEMCP_MEMORY`,
+and `COMPUTEMCP_TIME_LIMIT`.  The fallback never reads the plan variables, so
+the calculated plan is not silently submitted.  When both are empty, Slurm
+defaults apply.
+
+Useful variables when running by hand: `COMPUTEMCP_CONTAINER_PORT` (container
+SSH port, default 2222), `COMPUTEMCP_FORWARD_PORT` (login-node relay port,
+default 2200), `COMPUTEMCP_WAIT_SECONDS` (job wait, default 900), and
+`COMPUTEMCP_SSH_WAIT_SECONDS` (banner wait, default 120).
+
+## Lifecycle
+
+`provision` reuses a tracked `PENDING`, `RUNNING`, or `CONFIGURING` job.
+`stop` and `close` run `scancel` for the exact tracked job ID and stop the
+relay; container files remain.  On a timeout the job stays tracked so the next
+call can reuse it.  When a run fails after submission, the helper prints the
+job ID and cluster so a half-started allocation is never silent.  `status`
+reports the tracked job, its state, the ready node, and the relay endpoint.
+Multi-node requests fail with `multi-node not yet supported`.
+
+## Connect-time overrides
+
+The gateway accepts `--set` overrides before it renders the argument lists, for
+example `--set gpus-per-node=2` or `--set nodes=2`.  Overrides feed the mappings
+and never the other way around.  A `nodes` value above one fails in the helper
+until multi-node support lands.

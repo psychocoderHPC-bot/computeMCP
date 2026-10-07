@@ -673,3 +673,55 @@ async def test_open_for_route_forward_failure_releases_port(monkeypatch):
         await mgr.connect(target)
     assert conn.is_closed()
     assert mgr.reserved == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# format_provision_env: shell-quoted export statements
+# ---------------------------------------------------------------------------
+
+def test_format_provision_env_none_empty_and_plain_values():
+    from compute_mcp.tunnel import format_provision_env
+
+    assert format_provision_env(None) == ""
+    assert format_provision_env({}) == ""
+    text = format_provision_env(
+        {"COMPUTEMCP_SYSTEM": "hal", "COMPUTEMCP_NODES": "1"}
+    )
+    # Simple word-safe values need no quoting (shlex.quote is a no-op for them).
+    assert text == "export COMPUTEMCP_SYSTEM=hal; export COMPUTEMCP_NODES=1;"
+
+
+def test_format_provision_env_quotes_values_with_spaces_newlines_and_shell_words():
+    from compute_mcp.tunnel import format_provision_env
+
+    # The SBATCH args value is one complete argument per line (no trailing
+    # newline) plus shell metacharacters: the whole value must survive as a
+    # single quoted word so the provision command sees it verbatim.
+    value = "--gres=gpu:2\n--mem=378000M --job-name='my job' $(reboot) ;"
+    text = format_provision_env({"COMPUTEMCP_SBATCH_ARGS": value})
+    assert text.count("export ") == 1
+    assert text.startswith("export COMPUTEMCP_SBATCH_ARGS=")
+    assert text.endswith(";")
+    # The quoted value must reproduce the exact byte sequence.
+    quoted = text[len("export COMPUTEMCP_SBATCH_ARGS=") : -1]
+    assert quoted.startswith("'") and quoted.endswith("'")
+    # shlex.quote: a raw newline embedded inside a single-quoted value.
+    assert "\n" in quoted and "$" in quoted
+
+
+def test_format_provision_env_empty_value_is_quoted_empty():
+    from compute_mcp.tunnel import format_provision_env
+
+    text = format_provision_env(
+        {"COMPUTEMCP_SBATCH_ARGS": "", "COMPUTEMCP_SANDBOX": "false"}
+    )
+    assert text == "export COMPUTEMCP_SBATCH_ARGS=''; export COMPUTEMCP_SANDBOX=false;"
+
+
+def test_format_provision_env_rejects_nul():
+    from compute_mcp.tunnel import TunnelError, format_provision_env
+
+    with pytest.raises(TunnelError, match="NUL"):
+        format_provision_env({"COMPUTEMCP_X": "a\x00b"})
+    with pytest.raises(TunnelError, match="NUL"):
+        format_provision_env({"COMPUTEMCP_X\x00": "a"})

@@ -2379,3 +2379,323 @@ async def test_factor_not_leaked_on_route_dial_failure(monkeypatch, caplog):
     assert gw.runtimes["hal"].last_error is not None
     assert "TOP-SECRET" not in gw.runtimes["hal"].last_error
     assert "TOP-SECRET" not in json.dumps(gw.public_status("hal"))
+
+
+# ============================================================================
+# Slurm allocation: provision env, plan signature, preview, refresh gating
+# ============================================================================
+
+def _allocation_target(name="hal", **overrides):
+    from compute_mcp.config import (
+        AllocationConfig,
+        ContainerConfig,
+        NodeConfig,
+        SlurmConfig,
+        SlurmStageConfig,
+    )
+
+    kwargs = {
+        "name": name,
+        "user": "agent",
+        "transport": TransportConfig(
+            kind="direct", remote_host="127.0.0.1", remote_port=9
+        ),
+        "host_key_sha256": "SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+        "node": NodeConfig(cpus=24, gpus=4, memory="378000M"),
+        "allocation": AllocationConfig(single_node="gpu-proportional"),
+        "slurm": SlurmConfig(
+            sbatch=SlurmStageConfig(
+                options={"ntasks-per-node": 1},
+                mapping={"nodes": "nodes", "gpus-per-node": "gres"},
+            ),
+            srun=SlurmStageConfig(),
+        ),
+        "container": ContainerConfig(
+            runtime="apptainer",
+            image="docker://ubuntu:24.04",
+            gpus=("nvidia",),
+            sandbox=True,
+        ),
+    }
+    kwargs.update(overrides)
+    return TargetConfig(**kwargs)
+
+
+def _allocation_gateway(**target_overrides):
+    """Gateway whose `hal` carries a full allocation/container description."""
+    gw = make_gateway()
+    target = _allocation_target(**target_overrides)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    return gw, target
+
+
+def test_build_provision_env_exact_contract():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target()
+    plan = compute_plan(target, {"gpus-per-node": 2})
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_SYSTEM"] == "hal"
+    assert env["COMPUTEMCP_NODES"] == "1"
+    assert env["COMPUTEMCP_CPUS_PER_NODE"] == "12"
+    assert env["COMPUTEMCP_GPUS_PER_NODE"] == "2"
+    assert env["COMPUTEMCP_MEMORY_PER_NODE_MIB"] == "189000"
+    assert env["COMPUTEMCP_EXCLUSIVE"] == "false"
+    assert env["COMPUTEMCP_MODE"] == "gpu-proportional"
+    assert env["COMPUTEMCP_SBATCH_ARGS"] == "\n".join(sbatch)
+    assert env["COMPUTEMCP_SRUN_ARGS"] == ""
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == "apptainer"
+    assert env["COMPUTEMCP_IMAGE"] == "docker://ubuntu:24.04"
+    assert env["COMPUTEMCP_STORAGE_ROOT"] == ""
+    assert env["COMPUTEMCP_GPU_VENDORS"] == "nvidia"
+    assert env["COMPUTEMCP_HOST_HOME"] == ""
+    assert env["COMPUTEMCP_SANDBOX"] == "true"
+
+
+def test_build_provision_env_empty_args_and_missing_plan_values():
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    plan = ResolvedPlan(nodes=1)
+    env = build_provision_env(target, plan, (), ())
+    assert env["COMPUTEMCP_SYSTEM"] == "bare"
+    assert env["COMPUTEMCP_NODES"] == "1"
+    assert env["COMPUTEMCP_CPUS_PER_NODE"] == ""
+    assert env["COMPUTEMCP_GPUS_PER_NODE"] == ""
+    assert env["COMPUTEMCP_MEMORY_PER_NODE_MIB"] == ""
+    assert env["COMPUTEMCP_EXCLUSIVE"] == "false"
+    assert env["COMPUTEMCP_SBATCH_ARGS"] == ""
+    assert env["COMPUTEMCP_SRUN_ARGS"] == ""
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == ""
+    assert env["COMPUTEMCP_STORAGE_ROOT"] == ""
+    assert env["COMPUTEMCP_IMAGE"] == ""
+    assert env["COMPUTEMCP_GPU_VENDORS"] == ""
+    assert env["COMPUTEMCP_HOST_HOME"] == ""
+    assert env["COMPUTEMCP_SANDBOX"] == "false"
+
+
+def test_plan_signature_stability_and_none():
+    from compute_mcp.gateway import plan_signature
+
+    summary = {
+        "plan": {
+            "nodes": 2,
+            "cpus_per_node": 16,
+            "gpus_per_node": 1,
+            "memory_per_node_mib": 94500,
+            "exclusive": False,
+            "mode": "full",
+        }
+    }
+    assert plan_signature(summary) == (2, 16, 1, 94500, False, "full")
+    assert plan_signature(summary) == plan_signature(dict(summary))
+    assert plan_signature(None) is None
+    assert plan_signature({"plan": {}}) == (None, None, None, None, None, None)
+
+
+def test_preview_target_without_override_on_disconnected_target():
+    gw, target = _allocation_gateway()
+    assert gw.runtimes["hal"].state == "disconnected"
+    result = gw.preview_target("hal")
+    assert result["target"] == "hal"
+    assert result["connected"] is False
+    assert "needs_refresh" not in result
+    planned = result["planned"]["plan"]
+    assert planned["gpus_per_node"] == 1
+    assert planned["cpus_per_node"] == 6
+    assert planned["memory_per_node_mib"] == 94500
+    assert result["sbatch_args"]
+    assert result["srun_args"] == []
+    assert result["provision_env"]["COMPUTEMCP_NODES"] == "1"
+
+
+def test_preview_connected_target_with_differing_override_needs_refresh():
+    """A preview that differs from the active allocation requires a refresh."""
+    gw, target = _allocation_gateway()
+
+    # Manually wire a connected runtime via the real resolution path:
+    rt = gw.runtimes["hal"]
+    from compute_mcp.allocation import plan_summary
+
+    plan, _ = gw._resolve_allocation(target, None)
+    rt.state = "connected"
+    rt.resolved_plan = plan_summary(target, plan)
+    rt.resolved_overrides = dict(plan.overrides)
+
+    # Same effective settings: no refresh flag.
+    result = gw.preview_target("hal")
+    assert result["connected"] is True
+    assert "needs_refresh" not in result
+
+    # Differing settings: flagged.
+    result = gw.preview_target("hal", overrides={"gpus-per-node": 2})
+    assert result["needs_refresh"] is True
+    assert "target-refresh" in result["warning"]
+    assert result["planned"]["plan"]["gpus_per_node"] == 2
+
+    # The preview must never disturb the retained allocation.
+    assert rt.state == "connected"
+    assert rt.resolved_plan["plan"]["gpus_per_node"] == 1
+
+def test_validate_config_allocations_rejects_conflicting_config():
+    """A gateway must not start with a mapping/manual conflict in any target."""
+    from compute_mcp.config import ConfigError
+    from compute_mcp.config import (
+        GatewayConfig as GwCfg,
+        ServerConfig,
+        SessionConfig,
+        SSHConfig as SshCfg,
+        SlurmConfig,
+        SlurmStageConfig,
+    )
+    from compute_mcp.gateway import validate_config_allocations
+
+    base = GwCfg(
+        server=ServerConfig(),
+        ssh=SshCfg(),
+        sessions=SessionConfig(),
+        targets={
+            "hal": TargetConfig(
+                name="hal",
+                user="agent",
+                transport=TransportConfig(
+                    kind="direct", remote_host="127.0.0.1", remote_port=9
+                ),
+                host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+            )
+        },
+        clients={
+            "admin": ClientConfig(
+                client_id="admin", token_sha256=hash_token("admin-token"),
+                allow_all=True,
+            )
+        },
+    )
+    validate_config_allocations(base)
+
+    bad_target = dataclasses.replace(
+        base.targets["hal"],
+        slurm=SlurmConfig(
+            sbatch=SlurmStageConfig(
+                options={"mem": "64G"}, mapping={"memory-per-node": "mem"}
+            ),
+            srun=SlurmStageConfig(),
+        ),
+    )
+    bad = dataclasses.replace(base, targets={"hal": bad_target})
+    with pytest.raises(ConfigError, match="conflicts"):
+        validate_config_allocations(bad)
+    # Gateway construction fails closed on the same config.
+    with pytest.raises(ConfigError, match="conflicts"):
+        Gateway(bad)
+
+
+async def test_http_preview_endpoint_returns_plan_and_needs_refresh(monkeypatch):
+    gw, target = _allocation_gateway()
+    rt = gw.runtimes["hal"]
+    from compute_mcp.allocation import plan_summary
+
+    plan, _ = gw._resolve_allocation(target, None)
+    rt.state = "connected"
+    rt.resolved_plan = plan_summary(target, plan)
+    rt.resolved_overrides = dict(plan.overrides)
+
+    client = await make_client(gw)
+    try:
+        # Plain preview of the active settings: no refresh required.
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": {"gpus-per-node": 1}
+            }
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        assert body["connected"] is True
+        assert "needs_refresh" not in body
+        assert body["planned"]["plan"]["gpus_per_node"] == 1
+
+        # A different effective request flags the refresh.
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": {"gpus-per-node": 2}
+            }
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        assert body["needs_refresh"] is True
+        assert "COMPUTEMCP_SBATCH_ARGS" in body["provision_env"]
+
+        # Unknown override keys are a 400 (allocation layer validation).
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": {"bogus": 1}
+            }
+        )
+        assert resp.status == 400
+
+        # A non-object "set" is a 400.
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": [1]
+            }
+        )
+        assert resp.status == 400
+    finally:
+        await client.close()
+
+
+async def test_connect_with_overrides_on_connected_target_warns_and_keeps_allocation(monkeypatch):
+    """connect with differing overrides on a live target must not swap it."""
+    gw, target = _allocation_gateway()
+    rec = {"dials": 0, "teardowns": 0}
+
+    class _Tunnel:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def is_alive(self):
+            return True
+
+        async def stop(self):
+            rec["teardowns"] += 1
+
+    async def fake_connect(t, on_route=None, transport=None, factor=None, **kwargs):
+        rec["dials"] += 1
+        raise AssertionError("a connect on a live target must not dial")
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    rt = gw.runtimes["hal"]
+    rt.tunnel = _Tunnel(connection=object())
+    rt.active_route = "hal"
+    rt.local_port = 31990
+    from compute_mcp.allocation import plan_summary
+
+    plan, _ = gw._resolve_allocation(target, None)
+    rt.state = "connected"
+    rt.resolved_plan = plan_summary(target, plan)
+    rt.resolved_overrides = dict(plan.overrides)
+
+    # Same effective settings: plain no-op (defaults_used is not stable per
+    # request, but the effective request tuple is, so no refresh is flagged).
+    result = await gw.connect_target("hal", overrides={"gpus-per-node": 1})
+    assert result["state"] == "connected"
+    assert result["needs_refresh"] is False
+
+    # Different settings: warning, no dial, no teardown.
+    result = await gw.connect_target("hal", overrides={"gpus-per-node": 2})
+    assert result["state"] == "connected"
+    assert result["needs_refresh"] is True
+    assert "target-refresh" in result.get("warning", "")
+    assert rec == {"dials": 0, "teardowns": 0}
+

@@ -59,6 +59,30 @@ _ENDPOINT_RE = re.compile(
 )
 
 
+def format_provision_env(provision_env: dict[str, str] | None) -> str:
+    """Render ``provision_env`` as quoted ``export`` statements for one command.
+
+    The gateway cannot rely on SSH ``AcceptEnv`` (a site may not forward an
+    arbitrary variable), so the resolved values are shipped as shell-quoted
+    ``export NAME='value';`` statements prepended to the trusted provision
+    command.  ``shlex.quote`` protects embedded whitespace and newlines; the
+    command itself is still executed as a shell command string over the route
+    connection, exactly as before.  Every value is validated to contain no NUL,
+    which a shell string cannot carry safely.
+    """
+    if not provision_env:
+        return ""
+    statements: list[str] = []
+    for name, value in provision_env.items():
+        text = "" if value is None else str(value)
+        if "\x00" in name or "\x00" in text:
+            raise TunnelError(
+                f"provisioning environment {name!r} contains a NUL byte"
+            )
+        statements.append(f"export {name}={shlex.quote(text)};")
+    return " ".join(statements)
+
+
 def parse_provision_endpoint(output: str) -> tuple[str, int] | None:
     """Return the first ``host:port`` line from provisioning stdout.
 
@@ -443,6 +467,7 @@ class TunnelManager:
         *,
         factor: str | None = None,
         provision: bool = True,
+        provision_env: dict[str, str] | None = None,
     ) -> RouteTunnel:
         """Open a route connection and forward ``local_port`` to the endpoint.
 
@@ -452,6 +477,12 @@ class TunnelManager:
         that command runs on the freshly opened route connection and its
         ``host:port`` output replaces the endpoint; the parsed value is exposed
         as :attr:`RouteTunnel.provisioned_endpoint`.
+
+        ``provision_env`` is the resolved allocation/container environment
+        contract (see gateway).  When set, shell-quoted ``export NAME='value';``
+        statements are prepended to the provision command string, before the
+        trusted argv.  The argv itself is unchanged; SSH ``AcceptEnv`` is never
+        relied on.
         """
         transport = transport or target.transport
 
@@ -504,7 +535,9 @@ class TunnelManager:
         dest_host = transport.remote_host
         dest_port = transport.remote_port
         if provision and target.provision_command:
-            command = " ".join(shlex.quote(p) for p in target.provision_command)
+            argv = " ".join(shlex.quote(p) for p in target.provision_command)
+            prefix = format_provision_env(provision_env)
+            command = f"{prefix} {argv}" if prefix else argv
             log.info(
                 "target %s: provisioning on route %s: %s",
                 target.name, route, " ".join(target.provision_command),
@@ -690,6 +723,7 @@ class TunnelManager:
         transport: TransportConfig | None = None,
         *,
         factor: str | None = None,
+        provision_env: dict[str, str] | None = None,
     ) -> RouteTunnel:
         """Try each configured route in order; return the first working tunnel.
 
@@ -699,14 +733,21 @@ class TunnelManager:
         is not run again; otherwise a target ``provision_command`` runs on the
         route connection.  Failover always follows the target's own
         ``transport.ssh_targets``.
+
+        ``provision_env`` is forwarded verbatim to :meth:`open_for_route` so the
+        resolved allocation/container export statements reach the provision
+        command.
         """
 
         override = transport is not None
         transport = transport or target.transport
+        # Only forward ``provision_env`` when set, so the existing call shape
+        # for a target without an allocation/container description is unchanged.
+        env_kwargs = {"provision_env": provision_env} if provision_env is not None else {}
         if transport.kind == "direct":
             return await self.open_for_route(
                 target, "direct", transport.remote_port, transport,
-                factor=factor, provision=False,
+                factor=factor, provision=False, **env_kwargs,
             )
 
         last_error: Exception | None = None
@@ -716,6 +757,7 @@ class TunnelManager:
                 tunnel = await self.open_for_route(
                     target, route, local_port, transport,
                     factor=factor, provision=not override,
+                    **env_kwargs,
                 )
                 log.info("target %s connected via route %s on 127.0.0.1:%d",
                          target.name, route, local_port)
