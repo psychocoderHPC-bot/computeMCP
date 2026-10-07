@@ -2567,6 +2567,45 @@ def test_build_provision_env_omits_public_key_without_bundle(tmp_path):
     assert "COMPUTEMCP_SSH_PUBLIC_KEY" not in env
 
 
+def test_build_provision_env_joins_bundle_provision_env(tmp_path):
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.config import BundleConfig, ContainerConfig
+    from compute_mcp.config import TransportConfig as TR
+    from compute_mcp.gateway import build_provision_env
+
+    key = tmp_path / "id_ed25519"
+    key.write_text("PRIVATE\n")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA test@host\n")
+    target = _allocation_target(
+        client_key=str(key),
+        transport=TR(kind="tunnel", ssh_targets=("hal",), remote_port=2222),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(
+            source="computemcp-slurm",
+            provision_env=("module load apptainer", "source /etc/profile.d/spack.sh"),
+        ),
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_PROVISION_ENV"] == (
+        "module load apptainer\nsource /etc/profile.d/spack.sh"
+    )
+
+
+def test_build_provision_env_provision_env_absent_without_bundle():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target()
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert "COMPUTEMCP_PROVISION_ENV" not in env
+
+
 def test_env_configured_includes_bundle_only_target():
     from compute_mcp.config import BundleConfig, ContainerConfig
     from compute_mcp.config import TargetConfig as TC

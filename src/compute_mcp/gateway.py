@@ -124,6 +124,10 @@ def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> d
             raise ConfigError(str(exc)) from exc
         if public_key:
             env["COMPUTEMCP_SSH_PUBLIC_KEY"] = public_key
+        # Pre-provision hooks run on the remote before the container runtime is
+        # used.  The joined lines carry no trailing newline; an empty tuple
+        # yields an empty string, which the helper treats as a no-op.
+        env["COMPUTEMCP_PROVISION_ENV"] = "\n".join(target.bundle.provision_env)
     # A shell string cannot carry NUL or carriage return; refuse both here
     # (HTTP 400 at the edge) rather than let them reach the trusted provision
     # command (a CR in a value could smuggle an extra shell line).  LF stays

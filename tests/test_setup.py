@@ -200,6 +200,7 @@ def _bootstrap_answers():
         "n",                                   # no 2FA
         "y", "apptainer", "/scratch/u/computemcp", "docker://ubuntu:24.04", "nvidia",
         "y",                                   # bundle
+        "",                                    # pre-provision environment (none)
         "y",                                   # slurm description
         "24", "4", "378000M", "gpu-proportional", "exclusive", "4", "gpu", "02:00:00", "none",
         "n",                                   # no more targets
@@ -522,6 +523,32 @@ def test_no_slurm_question_without_bundle():
     answers = collect_target(w, set())
     assert answers.node_cpus is None
     assert answers.container_storage_root == "$HOME/computemcp"
+
+
+def test_collect_target_bundle_provision_env_comma_separated():
+    from compute_mcp.setup import collect_target
+
+    # name, transport, aliases, user, key, fingerprint, 2FA, container n, bundle y,
+    # provision-env, slurm n
+    w = _wizard(
+        [
+            "rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n",
+            "y", "apptainer", "$HOME/computemcp", "docker://ubuntu:24.04", "",
+            "y",  # bundle yes
+            "module load apptainer, source /etc/profile.d/spack.sh",
+            "n",  # no Slurm questions
+        ]
+    )
+    answers = collect_target(w, set())
+    assert answers.bundle_provision_env == (
+        "module load apptainer",
+        "source /etc/profile.d/spack.sh",
+    )
+    parsed = tomllib.loads(render_target_block(answers))
+    assert parsed["targets"]["rosi"]["bundle"]["provision-env"] == [
+        "module load apptainer",
+        "source /etc/profile.d/spack.sh",
+    ]
 
 
 def test_bootstrap_writes_readable_operator_token(tmp_path):

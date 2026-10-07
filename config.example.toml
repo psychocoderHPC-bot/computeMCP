@@ -296,10 +296,15 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # and defaults to <container.storage-root>/bundle.  auto-deploy = true
 # # (default) uploads when the content marker differs; set it to false to pin
 # # the copy already deployed on the login node, even after a gateway upgrade.
+# # provision-env is an optional array of shell lines run on the remote before
+# # the container runtime is used (once on the login/route node before build and
+# # again inside the container-start path on the job node); an empty array is a
+# # no-op.  With a bundle block, provision_command is not required.
 # [targets.rosi.bundle]
 # source = "computemcp-slurm"
 # # deploy-dir = "/scratch/USER/computemcp/bundle"
 # # auto-deploy = true
+# # provision-env = ["module load apptainer", "source /etc/profile.d/spack.sh"]
 #
 # # Allocatable resources of one compute node (descriptions, not constraints;
 # # all fields are optional).  cpus are Slurm CPUs under the site/SMT policy,
@@ -428,3 +433,32 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # storage-root = "/scratch/USER/computemcp"
 # image = "ubuntu:24.04"               # plain reference for the Docker path
 # # `gpus` unset: no GPU vendor is exposed, so the helper adds no device flags.
+
+# ---------------------------------------------------------------------------
+# Non-Slurm target: a Docker host that uses the provisioning bundle
+#
+# The shipped bundle is not Slurm-specific: on a host without a scheduler the
+# helper skips sbatch/srun, builds or reuses the container on the route node,
+# and starts it there.  There is no node/allocation/slurm block, and
+# provision_command is not required: a [targets.X.bundle] block supplies the
+# provisioning path.  provision-env runs the site setup before the runtime is
+# used.
+# ---------------------------------------------------------------------------
+# [targets.hal-docker]
+# ssh_targets = ["hal"]                 # a plain SSH route, no scheduler
+# user = "agent"
+# client_key = "/home/USER/.ssh/computemcp_container"
+# host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+# host_key_algorithms = ["ssh-ed25519"]
+# auto_connect = true
+#
+# [targets.hal-docker.bundle]
+# source = "computemcp-slurm"
+# deploy-dir = "$HOME/computemcp/bundle"
+# # provision-env = ["source /etc/profile.d/docker.sh"]
+#
+# [targets.hal-docker.container]
+# runtime = "docker"
+# storage-root = "/scratch/USER/computemcp"
+# image = "ubuntu:24.04"
+# gpus = ["nvidia"]

@@ -942,14 +942,17 @@ container's authorized public key is derived from `client_key`.
 | `source` | string | Bundled identifier. Currently `computemcp-slurm` |
 | `deploy-dir` | string | Remote absolute directory on shared storage. Defaults to `<container.storage-root>/bundle` |
 | `auto-deploy` | boolean | Default `true`: upload when the remote content marker differs. `false` pins the already-deployed copy, even after a gateway upgrade |
+| `provision-env` | string array | Shell lines run on the remote before the container runtime is used: once on the login/route node before the build, and again inside the container-start path on the job node. Empty (default) is a no-op |
 
 The deploy directory must be visible to the login node (which runs
 `computemcp-provision.sh` and builds the container) and to the compute node
 (which runs `computemcp-job.sh` and starts the container). On most clusters
 `/tmp` is per-node and not shared, so the default lives under `storage-root`.
 The gateway writes files atomically and never touches `authorized_keys`,
-allocation state, or a running job. Set `provision_command`/`close_command`
-explicitly to manage the bundle by hand instead.
+allocation state, or a running job. With a `[targets.X.bundle]` block,
+`provision_command` is not required: the gateway runs the deployed helper
+itself. Set `provision_command`/`close_command` explicitly only to manage the
+bundle by hand instead.
 
 ### Worked example: GPU target with Apptainer (ROSI illustration)
 
@@ -981,6 +984,7 @@ provision_timeout = 960.0
 source = "computemcp-slurm"
 # deploy-dir = "/scratch/USER/computemcp/bundle"
 # auto-deploy = true          # false pins the copy already on the login node
+# provision-env = ["module load apptainer", "source /etc/profile.d/spack.sh"]
 
 # Node capacities.  The numbers mirror the reviewed ROSI PIConGPU template,
 # not current verified cluster hardware:
@@ -1109,6 +1113,36 @@ memory (the full 128 GiB node capacity). A `--set cpus-per-node=8` override
 scales memory to the same ratio (half the node) and renders
 `--cpus-per-task=8 --mem=65536M`.
 
+### Worked example: non-Slurm Docker host with the bundle
+
+The shipped bundle is not Slurm-specific. On a host without a scheduler the
+helper skips `sbatch`/`srun`, builds or reuses the container on the route node,
+and starts it there. There is no `node`, `allocation`, or `slurm` block, and
+`provision_command` is not required: the `[targets.X.bundle]` block supplies
+the provisioning path. `provision-env` runs the site setup before the container
+runtime is used.
+
+```toml
+[targets.hal-docker]
+ssh_targets = ["hal"]
+user = "agent"
+client_key = "/home/USER/.ssh/computemcp_container"
+host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+host_key_algorithms = ["ssh-ed25519"]
+auto_connect = true
+
+[targets.hal-docker.bundle]
+source = "computemcp-slurm"
+deploy-dir = "$HOME/computemcp/bundle"
+provision-env = ["source /etc/profile.d/docker.sh"]
+
+[targets.hal-docker.container]
+runtime = "docker"
+storage-root = "/scratch/USER/computemcp"
+image = "ubuntu:24.04"
+gpus = ["nvidia"]
+```
+
 ### Connect-time overrides, refresh, and dry-run preview
 
 `computeMCP-gatewayctl target-connect <t>` and `target-refresh <t>` accept
@@ -1175,6 +1209,12 @@ The gateway exports the resolved allocation and container description as
   `COMPUTEMCP_GPU_VENDORS`, `COMPUTEMCP_HOST_HOME`,
   `COMPUTEMCP_SANDBOX`: the container description from
   `[targets.X.container]`.
+- `COMPUTEMCP_PROVISION_ENV`: emitted only for a target with a
+  `[targets.X.bundle]` block. It carries the `provision-env` lines joined with
+  a single newline and no trailing newline; an empty array yields an empty
+  value, which the helper treats as a no-op. The helper runs the lines on the
+  remote before the container runtime is used: once on the login/route node
+  before the build, and again inside the container-start path on the job node.
 
 `sbatch` and `srun` remain separate stages: the helper submits
 `sbatch "${SBATCH_ARGS[@]}" …`; the batch job launches

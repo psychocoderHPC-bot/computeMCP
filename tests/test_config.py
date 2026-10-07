@@ -1164,6 +1164,95 @@ def test_bundle_requires_tunnel_transport():
         parse_config(raw)
 
 
+def test_bundle_provision_env_parse():
+    default = parse_config(
+        base_raw(
+            client_key="/home/user/.ssh/key",
+            container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+            bundle={"source": "computemcp-slurm"},
+        )
+    ).targets["hal"].bundle
+    assert default.provision_env == ()
+    parsed = parse_config(
+        base_raw(
+            client_key="/home/user/.ssh/key",
+            container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+            bundle={
+                "source": "computemcp-slurm",
+                "provision-env": ["module load apptainer", "source /etc/profile"],
+            },
+        )
+    ).targets["hal"].bundle
+    assert parsed.provision_env == (
+        "module load apptainer",
+        "source /etc/profile",
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [""],
+        ["   "],
+        ["ok", ""],
+        ["a\0b"],
+        ["a\rb"],
+        [1],
+    ],
+)
+def test_bundle_provision_env_reject_bad_line(bad):
+    with pytest.raises(ConfigError, match="provision-env"):
+        parse_config(
+            base_raw(
+                client_key="/home/user/.ssh/key",
+                container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+                bundle={"source": "computemcp-slurm", "provision-env": bad},
+            )
+        )
+
+
+def test_bundle_provision_env_not_array_rejected():
+    with pytest.raises(ConfigError, match="provision-env"):
+        parse_config(
+            base_raw(
+                client_key="/home/user/.ssh/key",
+                container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+                bundle={"source": "computemcp-slurm", "provision-env": "x"},
+            )
+        )
+
+
+def test_bundle_provision_env_requires_tunnel():
+    raw = {
+        "server": {"listen": "127.0.0.1", "port": 2222},
+        "clients": {"alpaka": {"token": "secret", "targets": ["h"]}},
+        "targets": {
+            "h": {
+                "transport": "direct",
+                "user": "agent",
+                "bundle": {
+                    "source": "computemcp-slurm",
+                    "provision-env": ["module load apptainer"],
+                },
+            }
+        },
+    }
+    with pytest.raises(ConfigError, match="provision-env requires tunnel"):
+        parse_config(raw)
+
+
+def test_bundle_without_provision_command_loads():
+    cfg = parse_config(
+        base_raw(
+            client_key="/home/user/.ssh/key",
+            container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+            bundle={"source": "computemcp-slurm"},
+        )
+    )
+    assert cfg.targets["hal"].bundle is not None
+    assert cfg.targets["hal"].provision_command == ()
+
+
 # -- append_include ----------------------------------------------------------
 
 def _include_base(tmp_path, include_text=""):

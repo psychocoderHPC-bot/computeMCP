@@ -76,6 +76,7 @@ class TargetAnswers:
     container_host_home: str | None = None
     bundle: bool = False
     bundle_deploy_dir: str | None = None
+    bundle_provision_env: tuple[str, ...] = ()
     node_cpus: int | None = None
     node_gpus: int | None = None
     node_memory: str | None = None
@@ -333,6 +334,10 @@ def render_target_block(answers: TargetAnswers) -> str:
         lines.append('source = "computemcp-slurm"')
         if answers.bundle_deploy_dir:
             lines.append(f"deploy-dir = {_toml_str(answers.bundle_deploy_dir)}")
+        if answers.bundle_provision_env:
+            lines.append(
+                f"provision-env = {_toml_array(answers.bundle_provision_env)}"
+            )
     if answers.container_runtime:
         lines.append("")
         lines.append(f"[targets.{answers.name}.container]")
@@ -687,6 +692,16 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
                     default="$HOME/computemcp/bundle",
                     validator=_validate_remote_path,
                 )
+            raw_provision_env = wizard.ask(
+                "Pre-provision environment (comma-separated shell lines)",
+                description="lines run on the remote before the container runtime "
+                "is used, e.g. 'module load apptainer'; empty is a no-op",
+                default=None,
+                required=False,
+            )
+            answers.bundle_provision_env = tuple(
+                line.strip() for line in raw_provision_env.split(",") if line.strip()
+            )
 
     # -- Slurm allocation (only for a Slurm target) ------------------------
     # These keys describe the cluster scheduler.  A target without the Slurm

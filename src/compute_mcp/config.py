@@ -258,12 +258,15 @@ class BundleConfig:
     compute nodes; the gateway derives a default from the container
     ``storage_root`` when it is unset.  ``auto_deploy`` controls whether the
     gateway uploads the bundle when the remote hash marker differs; setting it
-    to false pins whatever copy is already deployed.
+    to false pins whatever copy is already deployed.  ``provision_env`` holds
+    shell lines that run on the remote before the container runtime is used;
+    an empty tuple is a no-op.
     """
 
     source: str
     deploy_dir: str | None = None
     auto_deploy: bool = True
+    provision_env: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.source not in KNOWN_BUNDLES:
@@ -271,6 +274,16 @@ class BundleConfig:
                 f"bundle.source must be one of {', '.join(KNOWN_BUNDLES)}, "
                 f"got {self.source!r}"
             )
+        for line in self.provision_env:
+            if not isinstance(line, str) or not line.strip():
+                raise ConfigError(
+                    "bundle.provision-env entries must be non-empty strings"
+                )
+            if "\x00" in line or "\r" in line:
+                raise ConfigError(
+                    "bundle.provision-env entries must not contain a NUL byte "
+                    "or carriage return"
+                )
         if self.deploy_dir is not None:
             if not isinstance(self.deploy_dir, str) or not self.deploy_dir.strip():
                 raise ConfigError("bundle.deploy_dir must be a non-empty string")
@@ -486,16 +499,22 @@ def _load_bundle_config(name: str, value: dict | None) -> BundleConfig | None:
     key = f"[targets.{name}.bundle]"
     if not isinstance(value, dict):
         raise ConfigError(f"{key} must be a table")
-    unknown = sorted(set(value) - {"source", "deploy-dir", "auto-deploy"})
+    unknown = sorted(
+        set(value) - {"source", "deploy-dir", "auto-deploy", "provision-env"}
+    )
     if unknown:
         raise ConfigError(f"{key} has unknown key(s): {', '.join(unknown)}")
     source = value.get("source")
     if source is None:
         raise ConfigError(f"{key} requires 'source'")
+    raw_env = value.get("provision-env", ())
+    if not isinstance(raw_env, (list, tuple)):
+        raise ConfigError(f"{key}.provision-env must be an array of strings")
     return BundleConfig(
         source=source,
         deploy_dir=value.get("deploy-dir"),
         auto_deploy=value.get("auto-deploy", True),
+        provision_env=tuple(raw_env),
     )
 
 
@@ -588,6 +607,13 @@ class TargetConfig:
         if self.connect_command and self.transport.kind != "tunnel":
             raise ConfigError(
                 f"target {self.name!r} connect_command requires tunnel transport"
+            )
+        if self.bundle is not None and self.bundle.provision_env and (
+            self.transport.kind != "tunnel"
+        ):
+            raise ConfigError(
+                f"target {self.name!r} bundle.provision-env requires tunnel "
+                "transport"
             )
         if self.bundle is not None and self.transport.kind != "tunnel":
             raise ConfigError(
