@@ -26,18 +26,17 @@ A short set of commands brings a fresh host to a working gateway. Run them as
 the normal (user, non-root) host account that will own the gateway.
 
 ```bash
-python3 -m venv ~/.local/share/computeMCP-gateway/venv
-~/.local/share/computeMCP-gateway/venv/bin/pip install .
+pipx install .                        # puts all four commands on PATH
+pipx ensurepath                       # once, if ~/.local/bin is not yet on PATH
 
-source ~/.local/share/computeMCP-gateway/venv/bin/activate
 computeMCP-gateway --bootstrap        # interactive: questions below
 computeMCP-gateway                    # start; config + tokens already written
 ```
 
-Activating the venv puts `computeMCP-gateway`, `computeMCP-gatewayctl` and
-`computeMCP-handshake` on `PATH`; no `ln -s` into `~/.local/bin` is needed. If
-you prefer not to activate, call the venv paths directly
-(`~/.local/share/computeMCP-gateway/venv/bin/computeMCP-gateway`).
+pipx creates an isolated environment per application and exposes the commands
+on `PATH`, so `computeMCP-gateway`, `computeMCP-gatewayctl`, `computeMCP-handshake`
+and `computeMCP-mcp` are ready to call directly. There is no virtualenv to
+activate and no symlink to create.
 
 `--bootstrap` asks for the server address, one client (your Terok project) and
 optionally a first target, writes `~/.config/computeMCP-gateway/config.toml` and
@@ -91,17 +90,15 @@ systemd/compute-mcp-gateway.service
 ## Install (gateway on the host, not as root)
 
 ```bash
-python3 -m venv ~/.local/share/computeMCP-gateway/venv
-~/.local/share/computeMCP-gateway/venv/bin/pip install -U pip
-~/.local/share/computeMCP-gateway/venv/bin/pip install .
-source ~/.local/share/computeMCP-gateway/venv/bin/activate
-mkdir -p ~/.config/computeMCP-gateway
-cp config.example.toml ~/.config/computeMCP-gateway/config.toml
+pipx install .                        # isolated env, commands on PATH
+pipx ensurepath                       # once, if ~/.local/bin is not yet on PATH
+computeMCP-gateway --bootstrap        # or copy config.example.toml by hand
 ```
 
 `--bootstrap` (see [Quick start](#quick-start)) writes `config.toml` and
-`tokens.toml` for you; the manual `cp` above is the alternative when you prefer
-to start from the fully commented template.
+`tokens.toml` for you. The manual alternative is `mkdir -p
+~/.config/computeMCP-gateway` and copying `config.example.toml` there, then
+replacing its `/home/USER` placeholders with real paths.
 
 ### Configure the gateway interactively
 
@@ -661,19 +658,16 @@ Do these steps once per Terok task, after the gateway is running. The task
 installs the MCP bridge and asks the gateway for a token; **the approval itself
 happens on the host, never inside the container** (see step 3).
 
-1. **Install the MCP bridge in the task** (not on the host), then activate the
-   venv as usual:
+1. **Install the MCP bridge in the task** (not on the host):
 
    ```bash
-   python3 -m venv /home/dev/.local/share/computeMCP/venv
-   /home/dev/.local/share/computeMCP/venv/bin/pip install <this-package>
-   source /home/dev/.local/share/computeMCP/venv/bin/activate
+   pipx install <this-package>       # isolated env, commands on PATH
+   pipx ensurepath                   # once, if ~/.local/bin is not yet on PATH
    ```
 
-   Activating puts `computeMCP-mcp` and `computeMCP-handshake` on `PATH`; no
-   `ln -s` into `~/.local/bin` is needed. The MCP entry below can also call the
-   venv binary directly
-   (`/home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp`).
+   pipx exposes `computeMCP-mcp` and `computeMCP-handshake` on `PATH`, so there
+   is no virtualenv to activate and no symlink to create. The MCP entry below
+   calls `computeMCP-mcp` directly.
 
 2. **Allow the gateway through the Terok Shield** (default-deny). See
    [Allow the gateway in the Terok Shield](#allow-the-gateway-in-the-terok-shield);
@@ -690,7 +684,7 @@ happens on the host, never inside the container** (see step 3).
    ```
 
    The task prints a request id and waits. Switch to the **host** and approve it
-   there (a shell with the gateway venv activated, or the console of a running
+   there (via `computeMCP-gatewayctl`, or the console of a running
    `computeMCP-gateway`):
 
    ```bash
@@ -713,7 +707,7 @@ happens on the host, never inside the container** (see step 3).
      "mcp": {
        "compute": {
          "type": "local",
-         "command": ["/home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp"],
+         "command": ["computeMCP-mcp"],
          "enabled": true,
          "environment": {
            "COMPUTEMCP_GATEWAY": "http://host.containers.internal:2222",

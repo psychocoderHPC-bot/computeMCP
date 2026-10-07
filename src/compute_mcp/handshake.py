@@ -143,7 +143,7 @@ def _mcp_snippet(url: str, token: str) -> str:
     return (
         '  "compute": {\n'
         '    "type": "local",\n'
-        '    "command": ["/home/dev/.local/share/computeMCP/venv/bin/computeMCP-mcp"],\n'
+        '    "command": ["computeMCP-mcp"],\n'
         '    "enabled": true,\n'
         '    "environment": {\n'
         f'      "COMPUTEMCP_GATEWAY": {json.dumps(url)},\n'
