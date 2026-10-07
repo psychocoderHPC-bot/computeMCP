@@ -462,3 +462,51 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # storage-root = "/scratch/USER/computemcp"
 # image = "ubuntu:24.04"
 # gpus = ["nvidia"]
+
+# ---------------------------------------------------------------------------
+# Copy-paste skeleton blocks for a Slurm target.
+#
+# The blocks below are commented-out but valid TOML once the leading `# ` is
+# removed.  They are the same keys the loader validates; no key here is
+# invented.  Replace X with a real target name, set the string values, then
+# delete the blocks you do not need.  `bundle` needs `client_key` (on the
+# target) and, unless `deploy-dir` is set, a `container.storage-root` to
+# derive the deployment directory from.  `node`/`allocation`/`slurm` are all
+# optional; without them a target is a plain container host.
+# ---------------------------------------------------------------------------
+# [targets.X.bundle]
+# source = "computemcp-container"
+# deploy-dir = "/scratch/USER/computemcp/bundle"
+# auto-deploy = true
+# provision-env = ["module load apptainer", "source /etc/profile.d/spack.sh"]
+#
+# [targets.X.container]
+# runtime = "apptainer"
+# storage-root = "/scratch/USER/computemcp"
+# image = "docker://ubuntu:24.04"
+# gpus = ["nvidia"]
+# host-home = "/scratch/USER/computemcp/home"
+# sandbox = true
+#
+# [targets.X.node]
+# cpus = 24
+# gpus = 4
+# memory = "378000M"
+#
+# [targets.X.allocation]
+# default-gpus = 1
+# default-cpus = 4
+# single-node = "gpu-proportional"
+# multi-node = "exclusive"
+# max-nodes = 4
+#
+# [targets.X.slurm.sbatch]
+# partition = "REPLACE_WITH_PARTITION_NAME"
+# time = "02:00:00"
+# ntasks-per-node = 1
+#
+# [targets.X.slurm.sbatch-map]
+# nodes = "nodes"
+# gpus-per-node = "gres"
+# cpus-per-node = "cpus-per-task"
+

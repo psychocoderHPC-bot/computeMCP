@@ -75,6 +75,34 @@ log = logging.getLogger("compute_mcp.gateway")
 RECOVERY_POLL_SECONDS = 5.0
 
 
+def _container_env_fields(target: TargetConfig) -> dict[str, str]:
+    """The container-description fields of the gateway->provisioner contract.
+
+    Shared by :func:`build_provision_env` (plan/argv path) and
+    ``Gateway._target_provision_env`` (best-effort path) so the two cannot
+    drift.  ``COMPUTEMCP_SSH_USER`` is emitted only when a container or bundle
+    block is present, matching the dialable-account rule.
+    """
+    container = target.container
+    fields = {
+        "COMPUTEMCP_CONTAINER_RUNTIME": container.runtime if container else "",
+        "COMPUTEMCP_STORAGE_ROOT": (container.storage_root or "") if container else "",
+        "COMPUTEMCP_IMAGE": (container.image or "") if container else "",
+        "COMPUTEMCP_GPU_VENDORS": ",".join(container.gpus) if container else "",
+        "COMPUTEMCP_HOST_HOME": (container.host_home or "") if container else "",
+        "COMPUTEMCP_SANDBOX": (
+            "true" if container is not None and container.sandbox else "false"
+        ),
+    }
+    if target.container is not None or target.bundle is not None:
+        # The container sshd allows only its own login account (default
+        # ``agent``); the helper creates it and AllowUsers it.  The gateway
+        # dials the container as the same account, resolved through the single
+        # ``container_login_user`` source of truth so the two cannot drift.
+        fields["COMPUTEMCP_SSH_USER"] = container_login_user(target)
+    return fields
+
+
 def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> dict[str, str]:
     """Build the gateway -> provisioner environment contract.
 
@@ -106,22 +134,7 @@ def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> d
         "COMPUTEMCP_MODE": plan.mode,
         "COMPUTEMCP_SYSTEM": target.name,
     }
-    container = target.container
-    env["COMPUTEMCP_CONTAINER_RUNTIME"] = container.runtime if container else ""
-    env["COMPUTEMCP_STORAGE_ROOT"] = (container.storage_root or "") if container else ""
-    env["COMPUTEMCP_IMAGE"] = (container.image or "") if container else ""
-    env["COMPUTEMCP_GPU_VENDORS"] = ",".join(container.gpus) if container else ""
-    env["COMPUTEMCP_HOST_HOME"] = (container.host_home or "") if container else ""
-    env["COMPUTEMCP_SANDBOX"] = (
-        "true" if container is not None and container.sandbox else "false"
-    )
-    if target.container is not None or target.bundle is not None:
-        # The container sshd allows only its own login account (default
-        # ``agent``); the helper creates it and AllowUsers it.  The gateway
-        # dials the container as the same account, resolved through the single
-        # ``container_login_user`` source of truth so the two cannot drift.
-        # Emitted together with the container/bundle fields.
-        env["COMPUTEMCP_SSH_USER"] = container_login_user(target)
+    env.update(_container_env_fields(target))
     # A deployed bundle target gets the container's authorized public key derived
     # from the target's SSH client key, so no per-site key placement is needed.
     # An explicit provision_command target keeps the previous environment.
@@ -399,22 +412,7 @@ class Gateway:
         except (ConfigError, ValueError):
             pass
         env: dict[str, str] = {"COMPUTEMCP_SYSTEM": target.name}
-        container = target.container
-        env["COMPUTEMCP_CONTAINER_RUNTIME"] = (
-            container.runtime if container else ""
-        )
-        env["COMPUTEMCP_STORAGE_ROOT"] = (
-            container.storage_root or "" if container else ""
-        )
-        env["COMPUTEMCP_IMAGE"] = container.image or "" if container else ""
-        env["COMPUTEMCP_GPU_VENDORS"] = ",".join(container.gpus) if container else ""
-        env["COMPUTEMCP_HOST_HOME"] = (
-            container.host_home or "" if container else ""
-        )
-        env["COMPUTEMCP_SANDBOX"] = (
-            "true" if container is not None and container.sandbox else "false"
-        )
-        env["COMPUTEMCP_SSH_USER"] = container_login_user(target)
+        env.update(_container_env_fields(target))
         return env
 
     # -- state machine -----------------------------------------------------

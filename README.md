@@ -133,7 +133,7 @@ them, and a default appears in brackets (press Enter to accept it).
 | Auto-connect | Connect the target automatically on gateway start; defaults to yes, and is forced off (and skipped) for a 2FA target |
 | Container runtime / storage / image / GPU vendors | Drives the provisioning bundle. `Storage root` accepts `$HOME`/`~`, expanded on the target (default `$HOME/computemcp`). `GPU vendors` is a subset of `nvidia, amd, intel` |
 | Should the gateway build and start this container? | Enables the `[targets.X.bundle]` block (source is always the canonical `computemcp-container`); asked only for a tunnel target that has a client key |
-| Bundle deploy directory / Pre-provision environment | Deploy directory; defaults to `<storage-root>/bundle`, and is asked automatically when the container storage root is not set. `provision-env` is comma-separated shell lines run on the remote before the container runtime is used (empty is a no-op) |
+| Bundle deploy directory / Pre-provision environment | Deploy directory; defaults to `<storage-root>/bundle`, and is asked automatically when the container storage root is not set. `provision-env` is a string array whose entries each become one shell line run on the remote before the container runtime is used (empty is a no-op) |
 | Is this target behind a Slurm scheduler? | Asked only when a bundle is configured; a plain container host answers no and gets no `node`/`allocation`/`slurm` block |
 | Slurm node capacities / allocation / sbatch | Asked only for a Slurm target; optional, needed for `--set` overrides and dry-run previews |
 
@@ -975,7 +975,7 @@ legacy alias and resolves to the same shipped bundle.
 | `source` | string | Bundled identifier. `computemcp-container` is the generic provisioner; `computemcp-slurm` is the legacy alias and resolves to the same bundle |
 | `deploy-dir` | string | Remote absolute directory on shared storage. Defaults to `<container.storage-root>/bundle` |
 | `auto-deploy` | boolean | Default `true`: upload when the remote content marker differs. `false` pins the already-deployed copy, even after a gateway upgrade |
-| `provision-env` | string array | Shell lines run on the remote before the container runtime is used: once on the login/route node before the build, and again inside the container-start path on the job node. Empty (default) is a no-op |
+| `provision-env` | string array | Each array entry becomes one shell line, run on the remote before the container runtime is used: once on the login/route node before the build, and again inside the container-start path on the job node. Empty (default) is a no-op |
 
 A `[targets.X.bundle]` block requires tunnel transport (`ssh_targets`); with
 `transport = "direct"` there is no route connection to deploy over, so use a
