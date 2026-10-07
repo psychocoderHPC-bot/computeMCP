@@ -5,6 +5,8 @@ import asyncio
 
 import pytest
 
+import asyncssh
+
 from compute_mcp.ssh_backend import InteractiveSSHClient
 
 
@@ -258,3 +260,148 @@ async def test_empty_route_user_uses_asyncssh_sentinel(monkeypatch):
     )
     assert seen["username"] == ()
     assert seen["username"] is not None
+
+
+# -- container hop uses the container login user, not the route user ---------
+
+def _container_target(**overrides):
+    from compute_mcp.config import TargetConfig, TransportConfig
+
+    kwargs = dict(
+        name="hal",
+        user="rwidera",
+        transport=TransportConfig(
+            kind="direct", remote_host="127.0.0.1", remote_port=2222
+        ),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    kwargs.update(overrides)
+    return TargetConfig(**kwargs)
+
+
+async def _capture_container_dial(monkeypatch, target):
+    seen = {}
+
+    async def fake_connect(host, **connect_kwargs):
+        seen["host"] = host
+        seen.update(connect_kwargs)
+        return _FakeSSHClient()
+
+    monkeypatch.setattr("compute_mcp.ssh_backend.asyncssh.connect", fake_connect)
+    from compute_mcp.ssh_backend import SSHBackend
+
+    await SSHBackend()._dial(target, "127.0.0.1", 2222)
+    return seen
+
+
+async def test_container_dial_defaults_to_agent(monkeypatch):
+    """The container hop dials ``agent`` by default, not the route login user.
+
+    This is the bug fix: the route account (``target.user``, here ``rwidera``)
+    authenticates the gateway -> login hop, but the container sshd's
+    ``AllowUsers`` only accepts the container account.  Dialing ``target.user``
+    inside the container failed with ``Permission denied``.
+    """
+    seen = await _capture_container_dial(monkeypatch, _container_target())
+    assert seen["username"] == "agent"
+    assert seen["username"] != "rwidera"
+
+
+async def test_container_dial_uses_container_user_override(monkeypatch):
+    """An explicit ``container_user`` is dialed inside the container."""
+    seen = await _capture_container_dial(
+        monkeypatch, _container_target(container_user="dev")
+    )
+    assert seen["username"] == "dev"
+
+
+async def test_container_dial_honors_env_override(monkeypatch):
+    """``COMPUTEMCP_SSH_USER`` is honored when ``container_user`` is unset."""
+    monkeypatch.setenv("COMPUTEMCP_SSH_USER", "siteagent")
+    seen = await _capture_container_dial(monkeypatch, _container_target())
+    assert seen["username"] == "siteagent"
+
+
+# -- in-process container acceptance: the wrong account fails, the container
+#    account succeeds.  This stands up a real asyncssh server whose
+#    ``validate_public_key`` mirrors the container sshd's ``AllowUsers``.
+_container_server_support = hasattr(asyncssh, "listen") and hasattr(
+    asyncssh, "SSHServer"
+)
+
+
+class _ContainerServer(asyncssh.SSHServer):
+    def __init__(self, allowed_user: str, key) -> None:
+        self.allowed_user = allowed_user
+        self.key = key
+
+    def public_key_auth_supported(self) -> bool:
+        return True
+
+    async def validate_public_key(self, username, key) -> bool:
+        # Mirror ``AllowUsers $SSH_USER``: only the container account is allowed.
+        return username == self.allowed_user
+
+
+@pytest.mark.skipif(
+    not _container_server_support, reason="asyncssh server support unavailable"
+)
+async def test_container_dial_wrong_account_fails_but_container_account_ok(
+    tmp_path_factory,
+):
+    import asyncio
+    import os
+
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+    host_key = asyncssh.generate_private_key("ssh-ed25519")
+    client_key = asyncssh.generate_private_key("ssh-ed25519")
+    tmp = tmp_path_factory.mktemp("container")
+    host_path = os.path.join(str(tmp), "host_key")
+    client_path = os.path.join(str(tmp), "client_key")
+    host_key.write_private_key(host_path)
+    client_key.write_private_key(client_path)
+
+    server = await asyncssh.listen(
+        "127.0.0.1",
+        0,
+        server_host_keys=[host_path],
+        server_factory=lambda: _ContainerServer("agent", client_key),
+        encoding=None,
+    )
+    port = server.get_port()
+    pin = host_key.get_fingerprint("sha256")
+
+    def target(container_user):
+        return TargetConfig(
+            name="c",
+            user="rwidera",
+            container_user=container_user,
+            transport=TransportConfig(
+                kind="direct", remote_host="127.0.0.1", remote_port=port
+            ),
+            client_key=client_path,
+            host_key_sha256=pin,
+        )
+
+    backend = SSHBackend()
+    try:
+        # The container sshd allows only ``agent``; dialing the route account
+        # (container_user unset would still resolve to ``agent``, so use an
+        # explicit wrong account) is refused -> the 502 root cause.
+        with pytest.raises(SSHError):
+            await asyncio.wait_for(
+                backend.open_connection(target("dev"), "127.0.0.1", port), 10.0
+            )
+        # The container account succeeds.
+        conn = await asyncio.wait_for(
+            backend.open_connection(target("agent"), "127.0.0.1", port), 10.0
+        )
+        assert not conn.is_closed()
+        await SSHBackend.close_connection(conn)
+    finally:
+        server.close()
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            await server.wait_closed()

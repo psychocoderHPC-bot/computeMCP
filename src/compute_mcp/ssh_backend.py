@@ -22,7 +22,7 @@ from typing import Awaitable, Protocol
 
 import asyncssh
 
-from .config import TargetConfig
+from .config import TargetConfig, container_login_user
 
 log = logging.getLogger("compute_mcp.ssh")
 
@@ -304,7 +304,17 @@ class SSHBackend:
         port: int,
         prompter: _Prompter | None = None,
         passphrase: str | None = None,
+        username: str | tuple | None = None,
     ) -> asyncssh.SSHClientConnection:
+        # This dials the CONTAINER hop.  The container sshd accepts only its own
+        # login account (``container_user``, default ``agent``), which is a
+        # different account from ``target.user`` (the gateway -> login/route
+        # account).  When no explicit username is threaded through, resolve the
+        # container user here.  The direct-transport case reaches the container
+        # directly, so it too must use the container user rather than the route
+        # user.
+        if username is None:
+            username = container_login_user(target) or ()
         # Only pass the interactive prompter when the target opts in; otherwise
         # authentication stays key/agent-only and no secret can be injected.
         active_prompter = prompter if target.interactive_auth else None
@@ -341,7 +351,7 @@ class SSHBackend:
             return await asyncssh.connect(
                 host,
                 port=port,
-                username=target.user or (),
+                username=username,
                 client_keys=client_keys,
                 passphrase=passphrase,
                 known_hosts=known_hosts,

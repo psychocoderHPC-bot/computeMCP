@@ -36,6 +36,7 @@ from .config import (
     TargetConfig,
     append_client,
     append_token_hash,
+    container_login_user,
     default_config_path,
     default_token_path,
     load_config,
@@ -114,6 +115,13 @@ def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> d
     env["COMPUTEMCP_SANDBOX"] = (
         "true" if container is not None and container.sandbox else "false"
     )
+    if target.container is not None or target.bundle is not None:
+        # The container sshd allows only its own login account (default
+        # ``agent``); the helper creates it and AllowUsers it.  The gateway
+        # dials the container as the same account, resolved through the single
+        # ``container_login_user`` source of truth so the two cannot drift.
+        # Emitted together with the container/bundle fields.
+        env["COMPUTEMCP_SSH_USER"] = container_login_user(target)
     # A deployed bundle target gets the container's authorized public key derived
     # from the target's SSH client key, so no per-site key placement is needed.
     # An explicit provision_command target keeps the previous environment.
@@ -289,6 +297,14 @@ class Gateway:
     def _endpoint(self, runtime: TargetRuntime) -> tuple[str, int]:
         target = self.config.targets[runtime.name]
         if target.transport.kind == "direct":
+            # The gateway dials ``remote_host:remote_port`` itself.  A loopback
+            # remote_host here therefore points at the gateway's OWN loopback,
+            # which can only work when the container really runs next to the
+            # gateway.  For a tunnel target the same loopback value is valid and
+            # is intentionally NOT rejected: the forward target host:port is
+            # resolved REMOTELY at the route host, so ``127.0.0.1`` means the
+            # container on that remote host.  Runtime behavior is unchanged; the
+            # distinction is documented here so the two cases are not confused.
             return target.transport.remote_host, target.transport.remote_port
         if runtime.local_port is None:
             raise TunnelError(f"target {runtime.name!r} has no active tunnel")
@@ -398,6 +414,7 @@ class Gateway:
         env["COMPUTEMCP_SANDBOX"] = (
             "true" if container is not None and container.sandbox else "false"
         )
+        env["COMPUTEMCP_SSH_USER"] = container_login_user(target)
         return env
 
     # -- state machine -----------------------------------------------------

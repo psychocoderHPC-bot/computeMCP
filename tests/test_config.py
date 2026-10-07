@@ -302,6 +302,31 @@ def test_invalid_target_name_rejected():
         parse_config(raw)
 
 
+def test_container_user_defaults_to_none():
+    cfg = parse_config(base_raw())
+    assert cfg.targets["hal"].container_user is None
+
+
+def test_container_user_parsed():
+    cfg = parse_config(base_raw(container_user="dev"))
+    assert cfg.targets["hal"].container_user == "dev"
+
+
+@pytest.mark.parametrize("bad", ["", "root", "Root", "1bad", "bad name", "a/b", "A"])
+def test_container_user_invalid_rejected(bad):
+    with pytest.raises(ConfigError):
+        parse_config(base_raw(container_user=bad))
+
+
+def test_container_user_direct_default_none():
+    target = TargetConfig(
+        name="h",
+        user="rwidera",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=1),
+    )
+    assert target.container_user is None
+
+
 def test_unknown_client_target_rejected():
     raw = base_raw()
     raw["clients"]["alpaka"]["targets"] = ["does-not-exist"]

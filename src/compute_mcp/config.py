@@ -18,6 +18,12 @@ from pathlib import Path
 
 TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
+# The login account inside the container.  The helper bundle enforces the same
+# shape (``computemcp-container.sh``): a lowercase shell identifier that is not
+# ``root``.  ``root`` is a valid SSH login on many systems but the bundle refuses
+# to create a root login, so accepting it here would only defer the failure.
+CONTAINER_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
+
 VALID_STATES = ("disconnected", "connecting", "connected", "failed")
 
 # Default location used when the operator does not point at a file explicitly.
@@ -58,6 +64,25 @@ def validate_target_name(name: str) -> str:
     if not isinstance(name, str) or not TARGET_NAME_RE.match(name):
         raise ConfigError(f"invalid target name {name!r}")
     return name
+
+
+def container_login_user(target: "TargetConfig") -> str:
+    """The account the gateway logs into INSIDE the container.
+
+    ``container_user`` is the source of truth.  When it is unset the explicit
+    ``COMPUTEMCP_SSH_USER`` environment override is honored (so an operator who
+    already exports it keeps working), otherwise the helper default ``agent`` is
+    used.  Both the container dial (``ssh_backend``) and the provision
+    environment (``gateway``) resolve through this one function so they cannot
+    drift: if the gateway dials one account but tells the helper another, the
+    container sshd's ``AllowUsers`` rejects the login.
+    """
+    if target.container_user:
+        return target.container_user
+    override = os.environ.get("COMPUTEMCP_SSH_USER")
+    if override:
+        return override
+    return "agent"
 
 
 @dataclass(frozen=True)
@@ -526,6 +551,12 @@ class TargetConfig:
     name: str
     user: str
     transport: TransportConfig
+    # Account the gateway logs into INSIDE the container.  ``user`` is the
+    # LOGIN/ROUTE account (e.g. the site account used for the gateway -> login
+    # hop); the container sshd only accepts this dedicated account, which the
+    # provisioning helper creates (default ``agent``).  An unset value resolves
+    # to ``agent`` at dial time, matching ``COMPUTEMCP_SSH_USER``.
+    container_user: str | None = None
     client_key: str | None = None
     known_hosts: str | None = None
     host_key_sha256: str | None = None
@@ -646,6 +677,20 @@ class TargetConfig:
         # supplies the login user.  Only a non-string is rejected.
         if not isinstance(self.user, str):
             raise ConfigError(f"target {self.name!r} user must be a string")
+        # ``container_user`` is the account dialed INSIDE the container.  Unset
+        # (None) is allowed and resolves to ``agent`` at dial time.  When set it
+        # must match the helper's own validation: a lowercase shell identifier
+        # that is not ``root`` (the bundle refuses to create a root login).
+        if self.container_user is not None:
+            if (
+                not isinstance(self.container_user, str)
+                or not CONTAINER_USER_RE.match(self.container_user)
+                or self.container_user == "root"
+            ):
+                raise ConfigError(
+                    f"target {self.name!r} container_user must match "
+                    "'^[a-z_][a-z0-9_-]*$' and must not be 'root'"
+                )
         if self.connect_mode not in ("shared", "dedicated"):
             raise ConfigError(
                 f"target {self.name!r} connect_mode must be 'shared' or 'dedicated'"
@@ -836,6 +881,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         name=name,
         user=user,
         transport=transport,
+        container_user=value.get("container_user"),
         client_key=value.get("client_key"),
         known_hosts=value.get("known_hosts"),
         host_key_sha256=value.get("host_key_sha256"),

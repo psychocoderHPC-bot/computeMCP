@@ -2656,6 +2656,55 @@ def test_build_provision_env_exact_contract():
     assert env["COMPUTEMCP_GPU_VENDORS"] == "nvidia"
     assert env["COMPUTEMCP_HOST_HOME"] == ""
     assert env["COMPUTEMCP_SANDBOX"] == "true"
+    # The container hop dials this account; the helper creates/AllowUsers it.
+    assert env["COMPUTEMCP_SSH_USER"] == "agent"
+
+
+def test_build_provision_env_emits_container_user_override():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target(container_user="dev")
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_SSH_USER"] == "dev"
+
+
+def test_build_provision_env_omits_container_user_without_container():
+    """A plain target with no container/bundle does not emit the key."""
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="rwidera",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    env = build_provision_env(target, ResolvedPlan(nodes=1), (), ())
+    assert "COMPUTEMCP_SSH_USER" not in env
+
+
+def test_target_provision_env_emits_container_user():
+    """The fallback helper emits the same key/value as build_provision_env."""
+    gw = make_gateway()
+
+    def _boom(target, overrides):
+        raise ValueError("no allocation")
+
+    gw._resolve_allocation = _boom
+    assert (
+        gw._target_provision_env(_allocation_target(container_user="dev"))[
+            "COMPUTEMCP_SSH_USER"
+        ]
+        == "dev"
+    )
+    assert (
+        gw._target_provision_env(_allocation_target())["COMPUTEMCP_SSH_USER"]
+        == "agent"
+    )
 
 
 def test_build_provision_env_empty_args_and_missing_plan_values():
