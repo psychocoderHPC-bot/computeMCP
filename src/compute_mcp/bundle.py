@@ -152,12 +152,6 @@ def public_key_for(target: TargetConfig) -> str | None:
     return result.stdout.strip() or None
 
 
-def provision_argv(target: TargetConfig, action: str) -> tuple[str, ...]:
-    """Provisioning argv for ``action`` ('provision'/'stop').
-
-    An explicit ``provision_command``/``close_command`` always wins; a bundle
-    target without one uses the deployed helper.
-    """
 def provision_argv(
     target: TargetConfig, action: str, *, deploy_dir: str | None = None
 ) -> tuple[str, ...]:

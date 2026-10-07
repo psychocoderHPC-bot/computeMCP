@@ -121,32 +121,6 @@ def _shell_quote(text: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
 
 
-def _assert_direct_path(path_text: str, stub_dir: Path) -> None:
-    """Assert that the slurm stubs are NOT on this PATH (hermeticity check).
-
-    The stub's ``sbatch`` and ``srun`` are the only slurm tools a test can
-    possibly see, so if either is on PATh the helper would mis-detect the
-    mode.  This catches a fixture regression before the test body runs.
-    """
-    for name in ("sbatch", "srun"):
-        for entry in path_text.split(os.pathsep):
-            if entry == str(stub_dir) or (STUBS_SLURM_FILES / name).exists():
-                if entry in path_text.split(os.pathsep) and entry == str(stub_dir):
-                    pytest.fail(
-                        f"slurm stub dir {stub_dir!r} is on the direct PATH "
-                        f"{path_text!r}: the helper would mis-mode"
-                    )
-    # The two slurm stubs must NOT be present in the stub dir that IS on PATH.
-    for name in ("sbatch", "srun"):
-        candidates = [Path(e) / name for e in path_text.split(os.pathsep)]
-        for candidate in candidates:
-            if candidate.exists():
-                pytest.fail(
-                    f"slurm stub {name!r} found at {candidate}: the direct "
-                    f"test's PATH is not hermetic: {path_text!r}"
-                )
-
-
 # --- stub scripts ----------------------------------------------------------
 
 
