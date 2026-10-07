@@ -29,6 +29,7 @@ from .auth import hash_token, new_token
 from .config import (
     ALLOCATION_MODES,
     MULTI_NODE_MODES,
+    OPERATOR_TOKEN_NAME,
     ConfigError,
     _atomic_write,
     append_include,
@@ -833,6 +834,7 @@ def run_bootstrap(
     path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         path.parent.chmod(0o700)
+    operator_token_path = path.parent / OPERATOR_TOKEN_NAME
     written_targets: list[Path] = []
     try:
         # Write the token hash first: the config names token_file explicitly,
@@ -840,19 +842,18 @@ def run_bootstrap(
         append_token_hash(token_path, client_id, token)
         with contextlib.suppress(OSError):
             token_path.chmod(0o600)
+        # A host-local plaintext operator token so computeMCP-gatewayctl can
+        # authenticate from the config alone, without an exported env token.
+        _atomic_write(operator_token_path, token + "\n", mode=0o600)
         for target in targets:
             written_targets.append(write_target_file(path.parent, target))
         _atomic_write(path, text, mode=0o600)
         load_config(path, token_file=None)
     except (ConfigError, OSError) as exc:
         # Remove everything a failed bootstrap wrote, so no partial state stays.
-        with contextlib.suppress(OSError):
-            path.unlink()
-        with contextlib.suppress(OSError):
-            token_path.unlink()
-        for target_path in written_targets:
+        for cleanup in (path, token_path, operator_token_path, *written_targets):
             with contextlib.suppress(OSError):
-                target_path.unlink()
+                Path(cleanup).unlink()
         reason = (
             f"generated configuration did not validate: {exc}"
             if isinstance(exc, ConfigError)
@@ -863,19 +864,20 @@ def run_bootstrap(
     wizard.section("Done")
     wizard.say(f"  config: {path}")
     wizard.say(f"  tokens: {token_path} (hashes only)")
+    wizard.say(f"  operator token: {operator_token_path} (0600, for gatewayctl)")
     if written_targets:
         wizard.say("  target files:")
         for target_path in written_targets:
             wizard.say(f"    {target_path}")
     wizard.say("")
-    wizard.say(f"  operator client {client_id!r} token (shown once, store it safely):")
+    wizard.say(f"  operator client {client_id!r} token (also stored on the host):")
     wizard.say(f"    {token}")
     wizard.say("")
     wizard.say("  Next steps:")
     wizard.say(f"    1. start the gateway:  computeMCP-gateway --config {path}")
-    wizard.say("    2. use the token above for computeMCP-gatewayctl, e.g.")
-    wizard.say("         export COMPUTEMCP_TOKEN=<token>")
+    wizard.say("    2. operate it; the CLI reads the operator token from the config:")
     wizard.say(f"         computeMCP-gatewayctl --config {path} status")
+    wizard.say("       (or export COMPUTEMCP_TOKEN=<token> to override)")
     wizard.say("    3. inside each Terok task run the handshake, then approve it:")
     wizard.say(f"         computeMCP-handshake <project-id> --port {port}")
     wizard.say("         computeMCP-gatewayctl approve <request-id>   # on the host")

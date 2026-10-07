@@ -422,3 +422,37 @@ def test_missing_command_is_usage_error():
 
     with pytest.raises(SystemExit):
         control_mod.main(["--config", "x.toml"])
+
+
+# -- operator token resolution -----------------------------------------------
+
+def test_resolve_token_prefers_operator_token_over_env(tmp_path, monkeypatch):
+    from compute_mcp.config import OPERATOR_TOKEN_NAME
+    from compute_mcp.control import _resolve_token
+
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    (tmp_path / OPERATOR_TOKEN_NAME).write_text("operator-secret\n")
+    monkeypatch.setenv("COMPUTEMCP_TOKEN", "stale-env-token")
+    # The config-local operator token must win over a stray ambient token.
+    assert _resolve_token(str(config), None, "admin", None) == "operator-secret"
+
+
+def test_resolve_token_flag_beats_operator_token(tmp_path, monkeypatch):
+    from compute_mcp.config import OPERATOR_TOKEN_NAME
+    from compute_mcp.control import _resolve_token
+
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    (tmp_path / OPERATOR_TOKEN_NAME).write_text("operator-secret\n")
+    monkeypatch.setenv("COMPUTEMCP_TOKEN", "stale-env-token")
+    assert _resolve_token(str(config), None, "admin", "flag-token") == "flag-token"
+
+
+def test_resolve_token_falls_back_to_env_without_operator_token(tmp_path, monkeypatch):
+    from compute_mcp.control import _resolve_token
+
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    monkeypatch.setenv("COMPUTEMCP_TOKEN", "env-token")
+    assert _resolve_token(str(config), None, "admin", None) == "env-token"

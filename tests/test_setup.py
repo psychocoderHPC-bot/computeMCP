@@ -522,3 +522,33 @@ def test_no_slurm_question_without_bundle():
     answers = collect_target(w, set())
     assert answers.node_cpus is None
     assert answers.container_storage_root == "$HOME/computemcp"
+
+
+def test_bootstrap_writes_readable_operator_token(tmp_path):
+    from compute_mcp.config import OPERATOR_TOKEN_NAME
+    from compute_mcp.control import _resolve_token
+
+    config_path = tmp_path / "config.toml"
+    run_bootstrap(config_path, wizard=_wizard(_bootstrap_answers()))
+    operator = tmp_path / OPERATOR_TOKEN_NAME
+    assert operator.exists()
+    assert (operator.stat().st_mode & 0o777) == 0o600
+    token = operator.read_text().strip()
+    assert token
+    # The operator CLI can resolve it straight from the config directory.
+    assert _resolve_token(str(config_path), None, "admin", None) == token
+
+
+def test_bootstrap_failure_removes_operator_token(tmp_path, monkeypatch):
+    import compute_mcp.setup as setup_module
+    from compute_mcp.config import OPERATOR_TOKEN_NAME
+
+    def bad_load(path, token_file=None):
+        raise ConfigError("injected failure")
+
+    monkeypatch.setattr(setup_module, "load_config", bad_load)
+    with pytest.raises(WizardAbort):
+        run_bootstrap(tmp_path / "config.toml", wizard=_wizard(_bootstrap_answers()))
+    assert not (tmp_path / OPERATOR_TOKEN_NAME).exists()
+    assert not (tmp_path / "tokens.toml").exists()
+    assert not (tmp_path / "config.toml").exists()

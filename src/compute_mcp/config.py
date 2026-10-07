@@ -25,6 +25,10 @@ VALID_STATES = ("disconnected", "connecting", "connected", "failed")
 DEFAULT_CONFIG_DIR = "computeMCP-gateway"
 DEFAULT_CONFIG_NAME = "config.toml"
 DEFAULT_TOKEN_NAME = "tokens.toml"
+# Host-local plaintext operator token written by --bootstrap (mode 0600).  It is
+# separate from tokens.toml, which holds hashes only, so the operator CLI can
+# authenticate without the operator exporting anything.
+OPERATOR_TOKEN_NAME = "operator.token"
 
 
 class ConfigError(ValueError):
@@ -43,6 +47,11 @@ def default_config_path() -> Path:
 def default_token_path() -> Path:
     """Return the default ``tokens.toml`` path (used when --token-file is omitted)."""
     return _xdg_config_home() / DEFAULT_CONFIG_DIR / DEFAULT_TOKEN_NAME
+
+
+def default_operator_token_path() -> Path:
+    """Return the default operator token path next to the default config."""
+    return _xdg_config_home() / DEFAULT_CONFIG_DIR / OPERATOR_TOKEN_NAME
 
 
 def validate_target_name(name: str) -> str:

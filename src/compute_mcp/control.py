@@ -25,10 +25,12 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import aiohttp
 
 from .config import (
+    OPERATOR_TOKEN_NAME,
     ConfigError,
     GatewayConfig,
     default_config_path,
@@ -57,8 +59,18 @@ def _resolve_gateway(config: GatewayConfig, override: str | None) -> str:
 
 def _resolve_token(config_path: str, token_file: str | None,
                    client: str, token: str | None) -> str:
+    # Explicit flag wins; then a plaintext operator token written by --bootstrap
+    # next to the config; then COMPUTEMCP_TOKEN; then a plaintext token in the
+    # tokens file.  The config-local token outranks the environment so a stray
+    # ambient token (e.g. one exported for a MCP client) cannot shadow the
+    # gateway this command was pointed at.
     if token:
         return token
+    operator_token = Path(config_path).parent / OPERATOR_TOKEN_NAME
+    if operator_token.is_file():
+        text = operator_token.read_text().strip()
+        if text:
+            return text
     env = os.environ.get("COMPUTEMCP_TOKEN")
     if env:
         return env
@@ -81,8 +93,9 @@ def _resolve_token(config_path: str, token_file: str | None,
             if key == client:
                 return str(value)
     raise SystemExit(
-        "no token available: set COMPUTEMCP_TOKEN, pass --token, or keep a "
-        "plaintext token in the tokens file (hashes cannot be used by the CLI)"
+        "no token available: run --bootstrap (writes an operator token next to "
+        f"the config), set COMPUTEMCP_TOKEN, pass --token, or keep a plaintext "
+        "token in the tokens file (hashes cannot be used by the CLI)"
     )
 
 

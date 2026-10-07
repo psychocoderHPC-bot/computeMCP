@@ -39,10 +39,12 @@ and `computeMCP-mcp` are ready to call directly. There is no virtualenv to
 activate and no symlink to create.
 
 `--bootstrap` asks for the server address and optionally a first target, writes
-`~/.config/computeMCP-gateway/config.toml` and `tokens.toml` (hashes only, mode
-0600), and prints the operator token once. Add more systems later with
-`computeMCP-gatewayctl --add-target`. To write elsewhere, pass `--config-dir
-DIR` (or `--config FILE`); `--force` overwrites an existing config.
+`~/.config/computeMCP-gateway/config.toml`, `tokens.toml` (hashes only, mode
+0600) and `operator.token` (plaintext, mode 0600), and prints the operator token
+once. `computeMCP-gatewayctl` reads `operator.token` automatically, so no export
+is needed. Add more systems later with `computeMCP-gatewayctl --add-target`. To
+write elsewhere, pass `--config-dir DIR` (or `--config FILE`); `--force`
+overwrites an existing config.
 
 ### Every gateway start: what to do
 
@@ -1226,8 +1228,11 @@ adding or rotating a project token is a reload away.
 
 Under systemd the gateway runs `--no-console`, so use the
 `computeMCP-gatewayctl` operator CLI. It talks to the running gateway's
-authenticated API (nothing needs to be stopped or restarted) and reads the
-plaintext token from `[auth] token_file` or `COMPUTEMCP_TOKEN`.
+authenticated API (nothing needs to be stopped or restarted). Token resolution
+is: `--token`, then the `operator.token` file next to `--config` (written by
+`--bootstrap`), then `COMPUTEMCP_TOKEN`, then a plaintext token in
+`[auth] token_file`. The config-local file outranks the environment, so a stray
+`COMPUTEMCP_TOKEN` cannot shadow the gateway you point the CLI at.
 
 ### Refresh the configuration
 
