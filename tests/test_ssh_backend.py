@@ -343,6 +343,143 @@ class _ContainerServer(asyncssh.SSHServer):
         return username == self.allowed_user
 
 
+# -- connection cache: endpoint-keyed invalidation --------------------------
+#
+# The container's published SSH port can change between container restarts
+# (docker/podman re-publish a fresh ephemeral port on `-p/tcp:2222`).  A
+# gateway-level refresh re-provisions to the new endpoint; the SSHBackend's
+# per-target cache must follow the endpoint, not just the target name, or
+# exec/files/sessions keep dialing the stale port (502).
+
+class _FakeSessionConn:
+    """Minimal stand-in for an orchestrator-level asyncssh.SSHClientConnection."""
+
+    def __init__(self) -> None:
+        self._closed = False
+
+    def is_closed(self):
+        return self._closed
+
+    def close(self):
+        self._closed = True
+
+    async def wait_closed(self):
+        return None
+
+
+def _tunnel_target_for_cache(name="hal", endpoint=("127.0.0.1", 2222)):
+    from compute_mcp.config import TargetConfig, TransportConfig
+
+    host, port = endpoint
+    return TargetConfig(
+        name=name,
+        user="agent",
+        transport=TransportConfig(
+            kind="direct", remote_host=host, remote_port=port
+        ),
+    )
+
+
+async def test_connection_cache_reuses_same_endpoint(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = _tunnel_target_for_cache(endpoint=("127.0.0.1", 2222))
+    dialed = []
+    conns = []
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _FakeSessionConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+
+    backend = SSHBackend()
+    c1 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c1 is conns[0]
+
+    # Same endpoint: reuse the cached connection (no redial).
+    c1b = await backend.connection(target, "127.0.0.1", 2222)
+    assert c1b is c1
+    assert dialed == [("127.0.0.1", 2222)]
+
+
+async def test_connection_cache_invalidated_on_endpoint_change(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = _tunnel_target_for_cache(endpoint=("127.0.0.1", 2222))
+    dialed = []
+    conns = []
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _FakeSessionConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+
+    backend = SSHBackend()
+    c0 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c0 is conns[0]
+
+    # Re-provision changed the published port to 3001: MUST NOT reuse.
+    c1 = await backend.connection(target, "127.0.0.1", 3001)
+    assert c1 is not c0
+    assert c1 is conns[1]
+    assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 3001)]
+
+    # Route change (host, port unchanged) also invalidates: the connection
+    # was opened toward a specific (host, port) on the old route.
+    c2 = await backend.connection(target, "10.0.0.5", 3001)
+    assert c2 is not c1
+    assert c2 is conns[2]
+    assert dialed == [
+        ("127.0.0.1", 2222),
+        ("127.0.0.1", 3001),
+        ("10.0.0.5", 3001),
+    ]
+
+    # Restore the second endpoint: the top-of-stack cache is the 10.0.0.5 one,
+    # so this still redials (no entry is indexed by a separate key).
+    c3 = await backend.connection(target, "127.0.0.1", 3001)
+    assert c3 is not c2
+    assert c3 is conns[3]
+    assert len(dialed) == 4
+
+
+async def test_disconnect_drops_endpoint_keyed_cache(monkeypatch):
+    """Even when the endpoint did not change, an explicit `disconnect` from the
+    gateway's refresh path must empty the cache so the redial happens."""
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = _tunnel_target_for_cache(endpoint=("127.0.0.1", 2222))
+    dialed = []
+    conns = []
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _FakeSessionConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+
+    backend = SSHBackend()
+    c0 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c0 is conns[0]
+
+    await backend.disconnect("hal")
+    assert backend.known_targets() == []
+
+    # Redial, even for the same endpoint we just disconnected from.
+    c1 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c1 is conns[1]
+    assert c1 is not c0
+    assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 2222)]
+
+
 @pytest.mark.skipif(
     not _container_server_support, reason="asyncssh server support unavailable"
 )

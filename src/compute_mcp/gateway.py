@@ -475,6 +475,13 @@ class Gateway:
         runtime.tunnel = tunnel
         runtime.active_route = tunnel.route
         runtime.local_port = tunnel.local_port
+        # Endpoint lifecycle: after a successful provision (or a static direct
+        # transport) the freshly resolved endpoint is authoritative for this
+        # connect.  A re-provision on refresh/recovery re-resolves it here, so
+        # ``runtime.provisioned_endpoint`` always mirrors the latest successful
+        # provision rather than a stale port from a previous allocation.  The
+        # cached container connection is keyed to the endpoint and dropped by
+        # the backend when the port changes (see SSHBackend.connection).
         if tunnel.provisioned_endpoint is not None:
             host, port = tunnel.provisioned_endpoint
             runtime.provisioned_endpoint = f"{host}:{port}"
@@ -500,6 +507,10 @@ class Gateway:
         runtime.state = "disconnected"
         runtime.active_route = None
         runtime.local_port = None
+        # Drop the endpoint so a recovery that skips re-provision (static
+        # transport) does not dial a no-longer-published port; a re-provision
+        # re-resolves it in ``_connect_locked``.
+        runtime.provisioned_endpoint = None
         runtime.last_error = reason
         runtime.connected_since = None
 
@@ -579,6 +590,14 @@ class Gateway:
             # route connection is still alive here, so the command can run.
             await self._run_close_command(name)
             await self._stop_locked(name)
+            # The old allocation is released.  Drop the gateway-side cached
+            # container connection so the next exec/session dials the freshly
+            # provisioned endpoint; the provider is not even called until the
+            # new tunnel is up.  ``_connect_locked`` re-resolves the endpoint
+            # from ``tunnel.provisioned_endpoint`` and makes the new value
+            # authoritative.  A plain connect while connected would have kept
+            # the stale endpoint (idempotent early return); the explicit
+            # refresh is the guaranteed re-provision point.
             await self.backend.disconnect(name)
             await self.sessions.close_for_target(name, reason="refresh")
             await self._connect_locked(
@@ -720,6 +739,12 @@ class Gateway:
         runtime.state = "disconnected"
         runtime.active_route = None
         runtime.local_port = None
+        # The allocation is gone, so the endpoint provisioned for it is stale.
+        # Clear it here (the one place every teardown/refresh/removal passes
+        # through); a reconnect re-resolves it from a fresh provision in
+        # ``_connect_locked``.  This is what keeps a refresh from dialing the
+        # previous container port.
+        runtime.provisioned_endpoint = None
         runtime.connected_since = None
         runtime.awaiting_factor = False
 

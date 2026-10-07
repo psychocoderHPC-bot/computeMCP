@@ -504,6 +504,118 @@ async def test_provision_on_route_sets_endpoint(monkeypatch):
         mgr.release(tunnel)
 
 
+async def test_open_for_route_forwards_provisioned_when_provisioning_ran(monkeypatch):
+    """When provisioning ran, the forward targets the PROVISIONED endpoint,
+    not the value in the target's static transport.
+
+    The static transport (remote_host:remote_port) is the placeholder the
+    config author wrote; provisioning resolves the container's real published
+    port, which can differ (and does, after a container restart).
+    """
+    mgr = TunnelManager(SSHConfig(internal_port_min=31550, internal_port_max=31560))
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    # A static endpoint that differs from what provisioning will report, so we
+    # can prove provisioning wins.
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("hal",), remote_host="127.0.0.1", remote_port=2299
+        ),
+        provision_command=("printf", "cn7:4321\n"),
+    )
+
+    class _SessionConn(_FakeConn):
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(0, b"cn7:4321\n", b"")
+
+    conn = _SessionConn(("127.0.0.1", 22))
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target)
+    try:
+        assert tunnel.provisioned_endpoint == ("cn7", 4321)
+        # Forward uses the provisioned endpoint, NOT the static 127.0.0.1:2299.
+        assert conn.forwarded == [
+            ("127.0.0.1", tunnel.local_port, "cn7", 4321)
+        ]
+        dests = {(h, p) for (_, _, h, p) in conn.forwarded}
+        assert ("127.0.0.1", 2299) not in dests
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
+async def test_open_for_route_forwards_static_when_no_provisioning(monkeypatch):
+    """Without a provision command (and no bundle) the forward targets the
+    target's STATIC transport, and no endpoint is reported as provisioned."""
+    mgr = TunnelManager(SSHConfig(internal_port_min=31560, internal_port_max=31570))
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("hal",), remote_host="10.0.0.4", remote_port=2244
+        ),
+    )
+    # No provision_command, no bundle: provisioning never runs.
+
+    conn = _FakeConn(("127.0.0.1", 22))
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target)
+    try:
+        # No provisioning ran, so nothing was "provisioned".
+        assert tunnel.provisioned_endpoint is None
+        # The forward targets the static transport endpoint from config.
+        assert conn.forwarded == [
+            ("127.0.0.1", tunnel.local_port, "10.0.0.4", 2244)
+        ]
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
 async def test_bundle_target_deploys_and_runs_derived_argv(monkeypatch):
     """A bundle target deploys over the route, then runs the deployed helper."""
     import dataclasses
