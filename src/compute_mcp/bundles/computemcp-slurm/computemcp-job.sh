@@ -38,6 +38,18 @@ if [ -n "${COMPUTEMCP_SRUN_ARGS:-}" ]; then
     mapfile -t SRUN_ARGS <<< "$COMPUTEMCP_SRUN_ARGS"
 fi
 
+# Apply the provision hook again on the compute node: a login-node ``module
+# load`` / ``source`` does not propagate into the allocation.  The settings file
+# carries COMPUTEMCP_PROVISION_ENV (newline-joined, no trailing newline), and we
+# run each line in THIS shell before the job step starts.  Absent/empty is a
+# strict no-op; set -euo pipefail aborts on any failing line.
+if [ -n "${COMPUTEMCP_PROVISION_ENV:-}" ]; then
+    while IFS= read -r LINE; do
+        [ -n "$LINE" ] || continue
+        eval "$LINE"
+    done <<< "$COMPUTEMCP_PROVISION_ENV"
+fi
+
 mkdir -p "$STATE"
 exec 8>"$STATE/job-run.lock"
 flock -n 8 || { echo 'Another job is already using this state directory.' >&2; exit 1; }

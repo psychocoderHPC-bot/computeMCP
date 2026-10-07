@@ -48,6 +48,7 @@ elif [[ "$STORAGE_ROOT" =~ ^~(/|$) ]]; then
     STORAGE_ROOT="$HOME${STORAGE_ROOT#\~}"
 fi
 SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
+NAME="computemcp-$SYSTEM"
 STATE="${COMPUTEMCP_STATE_DIR:-$SYSTEM_DIR/state}"
 SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"
 HOST_HOME="${COMPUTEMCP_HOST_HOME:-$SYSTEM_DIR/home}"
@@ -59,6 +60,33 @@ SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 PORT="${COMPUTEMCP_FORWARD_PORT:-2200}"
 WAIT_SECONDS="${COMPUTEMCP_WAIT_SECONDS:-900}"
 NODES="${COMPUTEMCP_NODES:-1}"
+
+# --- Slurm detection --------------------------------------------------------
+# SLURM mode keeps the allocation/srun/relay path; DIRECT mode (no Slurm on the
+# box) runs the container on this login/remote node and exposes its loopback
+# port.  A configured provision_command is chosen by the gateway before this
+# bundle helper runs, so it still takes precedence.  Detection uses sbatch and
+# srun and never hard-fails a box that lacks them.
+HAVE_SLURM=0
+if command -v sbatch >/dev/null 2>&1 && command -v srun >/dev/null 2>&1; then
+    HAVE_SLURM=1
+fi
+
+# --- Pre-provision environment hook -----------------------------------------
+# The gateway exports COMPUTEMCP_PROVISION_ENV as the configured ``module load``
+# / ``source`` lines joined by newlines (no trailing newline).  Each line runs in
+# THIS shell so the hook takes effect here; set -euo pipefail aborts on failure.
+# The same helper is applied inside computemcp-job.sh, because a login-node
+# module load does not propagate to the compute node.
+apply_provision_env() {
+    [ -n "${COMPUTEMCP_PROVISION_ENV:-}" ] || return 0
+    local LINE
+    while IFS= read -r LINE; do
+        [ -n "$LINE" ] || continue
+        eval "$LINE"
+    done <<< "$COMPUTEMCP_PROVISION_ENV"
+}
+# Invoked below on the provision path, before any runtime/container use.
 
 # Re-export the resolved layout so computemcp-container.sh uses the same paths
 # on the login node and the compute node.
@@ -156,10 +184,17 @@ done
 }
 [ "$PORT" != "$CONTAINER_PORT" ] || { echo 'Forward and container ports must differ.' >&2; exit 2; }
 
-for CMD in sbatch squeue scancel python3 flock; do command -v "$CMD" >/dev/null; done
-for FILE in "$CONTAINER_SCRIPT" "$RELAY" "$JOB_SCRIPT"; do
-    [ -r "$FILE" ] || { echo "Missing/unreadable helper: $FILE" >&2; exit 1; }
-done
+# The relay and batch script are only needed in Slurm mode; direct mode neither
+# submits an allocation nor starts a relay.
+if [ "$HAVE_SLURM" = 1 ]; then
+    for CMD in sbatch squeue scancel python3 flock; do command -v "$CMD" >/dev/null; done
+    for FILE in "$RELAY" "$JOB_SCRIPT"; do
+        [ -r "$FILE" ] || { echo "Missing/unreadable helper: $FILE" >&2; exit 1; }
+    done
+else
+    for CMD in python3 flock; do command -v "$CMD" >/dev/null; done
+fi
+[ -r "$CONTAINER_SCRIPT" ] || { echo "Missing/unreadable helper: $CONTAINER_SCRIPT" >&2; exit 1; }
 
 mkdir -p "$STATE"
 
@@ -169,8 +204,13 @@ flock -w "$WAIT_SECONDS" 9
 
 JOBID="$(cat "$STATE/jobid" 2>/dev/null || true)"
 CLUSTER="$(cat "$STATE/cluster" 2>/dev/null || true)"
+MODE="$(cat "$STATE/mode" 2>/dev/null || true)"
 [[ -z "$JOBID" || "$JOBID" =~ ^[0-9]+$ ]] || { echo 'Invalid tracked job ID.' >&2; exit 1; }
 [[ -z "$CLUSTER" || "$CLUSTER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'Invalid tracked cluster.' >&2; exit 1; }
+[[ -z "$MODE" || "$MODE" = slurm || "$MODE" = direct ]] || { echo 'Invalid tracked mode.' >&2; exit 1; }
+# A previously tracked direct target stays direct for stop/status even if Slurm
+# appears on PATH later; freshly provisioned targets use current detection.
+[ -n "$MODE" ] || { [ "$HAVE_SLURM" = 1 ] && MODE=slurm || MODE=direct; }
 
 SQUEUE_ARGS=(--noheader --user "$(id -un)" --format '%i|%T')
 [ -z "$CLUSTER" ] || SQUEUE_ARGS+=(--clusters="$CLUSTER")
@@ -196,6 +236,12 @@ stop_relay() {
 
 # --- Non-provision actions --------------------------------------------------
 if [ "$ACTION" = stop ] || [ "$ACTION" = close ]; then
+    if [ "$MODE" = direct ]; then
+        # Direct mode: stop the container that runs on this remote node.
+        bash "$CONTAINER_SCRIPT" stop
+        echo "Stopped direct container ${SYSTEM}; files remain." >&2
+        exit 0
+    fi
     SCANCEL_ARGS=("$JOBID")
     [ -z "$CLUSTER" ] || SCANCEL_ARGS=(--clusters="$CLUSTER" "$JOBID")
     if [ -n "$JOBID" ] && [ -n "$(job_state)" ]; then
@@ -207,6 +253,12 @@ if [ "$ACTION" = stop ] || [ "$ACTION" = close ]; then
 fi
 
 if [ "$ACTION" = status ]; then
+    if [ "$MODE" = direct ]; then
+        printf 'mode: direct\nstate: %s\nendpoint: 127.0.0.1:%s\n' \
+            "$([ -s "$STATE/container.endpoint" ] && echo running || echo stopped)" \
+            "$CONTAINER_PORT"
+        exit 0
+    fi
     printf 'jobid: %s\ncluster: %s\nstate: %s\n' \
         "${JOBID:-none}" "${CLUSTER:-none}" "$(job_state || true)"
     if [ -s "$STATE/ready-$JOBID" ]; then
@@ -251,6 +303,45 @@ ensure_container() {
     fi
 }
 
+# --- Direct (non-Slurm) mode helpers ---------------------------------------
+# return 0 when the container runs on THIS node, 1 when it is present but
+# stopped, 2 when it does not exist.
+container_state() {
+    case "$RUNTIME" in
+        apptainer)
+            if apptainer instance list 2>/dev/null | awk -v NAME="$NAME" '$1 == NAME {FOUND=1} END {exit !FOUND}'; then
+                return 0
+            fi
+            [ -d "$SANDBOX" ] && return 1
+            return 2
+            ;;
+        docker)
+            if docker container inspect "$NAME" >/dev/null 2>&1; then
+                [ "$(docker container inspect --format '{{.State.Running}}' "$NAME")" = true ] && return 0
+                return 1
+            fi
+            return 2
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+# Idempotent direct-mode provision: build when missing, start when stopped,
+# reuse when running; then re-emit the container's own loopback endpoint so the
+# gateway can forward to it.  A login-node module load does not propagate to a
+# compute node, but direct mode runs the container right here.
+direct_provision() {
+    # ensure_container already built/configured the container above, so here a
+    # stopped container is started and a running one reused (no rebuild).
+    if container_state; then
+        echo "Reusing running container $NAME." >&2
+    else
+        echo "Starting container $NAME on the remote node." >&2
+        bash "$CONTAINER_SCRIPT" start
+    fi
+    printf 'ENDPOINT 127.0.0.1:%s\n' "$CONTAINER_PORT"
+}
+
 # --- Per-job SRUN settings file --------------------------------------------
 write_settings() {
     local FILE="$1" ARG
@@ -273,14 +364,33 @@ write_settings() {
         printf 'export COMPUTEMCP_SSH_PUBLIC_KEY=%q\n' "${COMPUTEMCP_SSH_PUBLIC_KEY:-}"
         printf 'export COMPUTEMCP_CPU_BIND=%q\n' "$CPU_BIND"
         printf 'export COMPUTEMCP_SRUN_ARGS=%q\n' "${COMPUTEMCP_SRUN_ARGS:-}"
+        # The login-node hook must run again on the compute node; %q transports
+        # the newline-joined lines verbatim through this settings file.
+        printf 'export COMPUTEMCP_PROVISION_ENV=%q\n' "${COMPUTEMCP_PROVISION_ENV:-}"
     } > "$FILE.tmp"
     mv -- "$FILE.tmp" "$FILE"
     chmod 600 "$FILE"
 }
 
-# --- Submit the allocation --------------------------------------------------
+# --- Provision: direct mode or Slurm allocation ----------------------------
 if [ "$ACTION" = provision ]; then
+    # Run the pre-provision hook in this shell before any runtime/container use,
+    # so ``module load`` and ``source`` are in effect for ensure_container and
+    # the runtime checks that follow.
+    apply_provision_env
+
+    # Build/configure the container on this login/remote node in both modes:
+    # Slurm starts it later inside the allocation, direct mode starts it here.
     ensure_container
+
+    if [ "$HAVE_SLURM" != 1 ]; then
+        # DIRECT mode: no sbatch/srun/relay; run the container on this node and
+        # expose its own loopback port, so the gateway forwards to it.
+        printf '%s\n' direct > "$STATE/mode"
+        direct_provision "$@"
+        exit 0
+    fi
+    printf '%s\n' slurm > "$STATE/mode"
 
     case "$(job_state)" in
         PENDING|RUNNING|CONFIGURING) echo "Reusing tracked job $JOBID ($(job_state))." >&2 ;;
