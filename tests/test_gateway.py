@@ -1382,6 +1382,73 @@ async def test_enroll_rejects_existing_client_and_unknown_target(tmp_path, monke
         await client.close()
 
 
+async def test_enroll_approve_include_based_config_succeeds(tmp_path, monkeypatch):
+    """Targets living in an included file must approve through /enroll."""
+    from compute_mcp.config import load_config
+    from compute_mcp.gateway import Gateway
+
+    cfg = tmp_path / "config.toml"
+    included = tmp_path / "systems" / "hal.toml"
+    included.parent.mkdir(parents=True, exist_ok=True)
+    included.write_text(
+        """
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    cfg.write_text(
+        """
+        include = ["systems/hal.toml"]
+
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+        """
+    )
+    gw = Gateway(load_config(cfg))
+    before_included = included.read_text()
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/enroll", json={"client_id": "newci", "targets": ["hal"]}
+        )
+        assert resp.status == 200, await resp.text()
+        rid = (await resp.json())["request_id"]
+        resp = await client.post(
+            f"/v1/enroll-requests/{rid}/approve", headers=auth("admin-token")
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        assert body["client_id"] == "newci"
+        assert body["targets"] == ["hal"]
+        assert "[clients.newci]" in cfg.read_text()
+        # Only the entry file was written to; the include file is untouched.
+        assert included.read_text() == before_included
+        loaded = load_config(cfg)
+        assert loaded.clients["newci"].may_access("hal")
+    finally:
+        await client.close()
+
+
+async def test_enroll_approve_unknown_request_id_returns_404(tmp_path, monkeypatch):
+    """A stale/unknown id must yield 404, not a 500 from the middleware."""
+    gw, _ = await _enroll_flow(tmp_path, monkeypatch)
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/enroll-requests/00000000000/approve", headers=auth("admin-token")
+        )
+        assert resp.status == 404
+        assert resp.status != 500
+        assert "unknown enrollment request" in await resp.text()
+    finally:
+        await client.close()
+
+
 async def test_enroll_disabled_returns_403(tmp_path):
     from compute_mcp.config import load_config
     from compute_mcp.gateway import Gateway

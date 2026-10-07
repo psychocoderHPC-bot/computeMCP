@@ -531,6 +531,80 @@ def test_append_client_duplicate_rejected(tmp_path):
         append_client(cfg, "ci", ("hal",))
 
 
+def _include_entry_with_target_included(tmp_path, target_file="systems/hal.toml"):
+    """Entry file whose targets live in an included file, like after the
+    include refactor (no [targets.*] table in the entry itself)."""
+    halo = tmp_path / target_file
+    halo.parent.mkdir(parents=True, exist_ok=True)
+    halo.write_text(
+        """
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    entry = tmp_path / "gateway.toml"
+    entry.write_text(
+        f'include = ["{target_file}"]\n\n[clients.ci]\ntoken = "ci-secret"\ntargets = ["hal"]\n'
+    )
+    return entry, halo
+
+
+def test_append_client_accepts_target_defined_in_include(tmp_path):
+    from compute_mcp.config import append_client, append_token_hash
+
+    entry, halo = _include_entry_with_target_included(tmp_path)
+    tok = tmp_path / "tokens.toml"
+    append_token_hash(tok, "newci", "plain", create=True)
+    before = halo.read_text()
+    append_client(entry, "newci", ("hal",))
+    assert "[clients.newci]" in entry.read_text()
+    assert halo.read_text() == before
+    loaded = load_config(entry, token_file=str(tok))
+    assert set(loaded.targets) == {"hal"}
+    assert loaded.clients["newci"].may_access("hal")
+
+
+def test_append_client_rejects_target_not_in_any_include(tmp_path):
+    from compute_mcp.config import append_client
+
+    entry, _ = _include_entry_with_target_included(tmp_path)
+    with pytest.raises(ConfigError, match="known targets") as excinfo:
+        append_client(entry, "newci", ("nope",))
+    assert "hal" in str(excinfo.value)
+    assert "[clients.newci]" not in entry.read_text()
+
+
+def test_append_client_rejects_duplicate_client_defined_in_include(tmp_path):
+    from compute_mcp.config import append_client
+
+    _include_entry_with_target_included(tmp_path)
+    included = tmp_path / "systems" / "hal.toml"
+    included.write_text(
+        """
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+
+        [clients.ci]
+        token = "ci-secret"
+        targets = ["hal"]
+        """
+    )
+    entry = tmp_path / "gateway.toml"
+    entry.write_text('include = ["systems/hal.toml"]\n')
+    before = entry.read_text()
+    with pytest.raises(ConfigError, match="already exists"):
+        append_client(entry, "ci", ("hal",))
+    assert entry.read_text() == before
+
+
 def test_append_client_empty_acl(tmp_path):
     from compute_mcp.config import append_client, append_token_hash
 

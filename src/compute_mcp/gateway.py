@@ -1442,7 +1442,13 @@ class Gateway:
     async def h_enroll_approve(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         client.require_admin()
-        pending = await self.approve_enrollment(request.match_info["request"])
+        try:
+            pending = await self.approve_enrollment(request.match_info["request"])
+        except EnrollmentError as exc:
+            # An unknown or expired id, and a request already consumed, all
+            # share one message after _expire(), so 404 is the honest status
+            # here, mirroring h_enroll_deny.
+            raise web.HTTPNotFound(text=str(exc)) from exc
         return web.json_response(
             {
                 "request_id": pending.request_id,

@@ -1275,18 +1275,22 @@ def append_client(
     """Append a ``[clients.<id>]`` block to the config, then re-validate it.
 
     The block is only ever *appended*; existing content (including operator
-    comments) is preserved.  The whole file is re-parsed afterwards, and the
-    caller should only rely on it once that validation passes.  A duplicate
-    client id is refused.
+    comments) is preserved.  The whole file (merged across its include chain)
+    is re-parsed afterwards, and the caller should only rely on it once that
+    validation passes.  A duplicate client id is refused.
+
+    Duplicate and target checks consult the merged include graph, not only the
+    entry file: after targets moved into included files, an entry file with
+    ``include = [...]`` can reference a target while defining no
+    ``[targets.*]`` table of its own.  Only the entry file is ever written.
     """
     validate_target_name(client_id)
     path = Path(config_path)
-    with path.open("rb") as handle:
-        raw = tomllib.load(handle)
-    if client_id in raw.get("clients", {}):
+    merged, _ordered = _load_toml_files(path)
+    if client_id in merged.get("clients", {}):
         raise ConfigError(f"client {client_id!r} already exists in {path}")
 
-    known = set(raw.get("targets", {}))
+    known = set(merged.get("targets", {}))
     for target in targets:
         if target != "*" and target not in known:
             raise ConfigError(
