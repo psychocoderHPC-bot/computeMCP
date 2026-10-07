@@ -618,7 +618,12 @@ class Gateway:
         and must not release the allocation.
         """
         target = self.config.targets.get(name)
-        if target is None or not target.close_command:
+        if target is None:
+            return
+        # A bundle target without an explicit close_command releases the
+        # allocation through the deployed helper's `stop` action, so do not
+        # skip it merely because close_command is empty.
+        if not target.close_command and target.bundle is None:
             return
         runtime = self.runtimes[name]
         connection = runtime.tunnel.connection if runtime.tunnel else None

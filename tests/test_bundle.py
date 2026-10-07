@@ -140,7 +140,7 @@ def _bundle_target(tmp_path, **bundle_kwargs):
         transport=TransportConfig(
             kind="tunnel", ssh_targets=("rosi",), remote_port=2222
         ),
-        client_key=None,
+        client_key="/home/user/.ssh/key",
         host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
         container=ContainerConfig(
             runtime="apptainer", storage_root="/scratch/agent/computemcp"
@@ -250,6 +250,33 @@ async def test_ensure_deployed_falls_back_to_base64(tmp_path):
     digest = load_bundle("computemcp-slurm").digest
     marker_path = posixpath.join(resolve_deploy_dir(target), marker_name(digest))
     assert any(digest in command for command in conn.commands)
+
+
+@pytest.mark.asyncio
+async def test_shell_fallback_refuses_symlink(monkeypatch):
+    """The base64 fallback must not write through a planted symlink."""
+    from compute_mcp import bundle as bundle_module
+
+    commands: list[str] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            commands.append(command)
+            return _Result(0)
+
+    async def fake_run(conn, command, timeout=120.0):
+        return await conn.run(command)
+
+    contents = load_bundle("computemcp-slurm")
+    # The generated write command must contain a symlink guard.
+    await bundle_module._deploy_shell(
+        _Conn(), "/scratch/agent/computemcp/bundle", contents,
+        marker_name(contents.digest), fake_run,
+    )
+    writes = [c for c in commands if "base64 -d" in c]
+    assert writes and all("[ -L " in command for command in writes)
+    # No write command may bypass the guard.
+    assert all("refusing symlink" in command for command in writes)
 
 
 def test_public_key_for_reads_pub_file(tmp_path):

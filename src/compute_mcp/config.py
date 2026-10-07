@@ -587,6 +587,13 @@ class TargetConfig:
                         f"target {self.name!r} bundle needs 'deploy-dir' or a "
                         "container 'storage-root' to derive it from"
                     )
+            if not self.client_key:
+                # The gateway derives the container's authorized key from
+                # client_key; without it the container would accept no key and
+                # the failure would only surface after provisioning starts.
+                raise ConfigError(
+                    f"target {self.name!r} bundle requires 'client_key'"
+                )
         if self.connect_command_mode not in ("on_failure", "always"):
             raise ConfigError(
                 f"target {self.name!r} connect_command_mode must be "

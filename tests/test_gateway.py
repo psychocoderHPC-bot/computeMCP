@@ -2247,7 +2247,6 @@ async def test_stop_target_runs_close_command_before_teardown(monkeypatch):
 
 async def test_refresh_target_runs_close_command(monkeypatch):
     gw, target = _close_gateway()
-    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
     monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
     rec = {"calls": []}
     _install_fake_connect(monkeypatch, gw, rec)
@@ -2281,6 +2280,38 @@ async def test_refresh_interactive_no_factor_does_not_run_close(monkeypatch):
     assert calls == []
     assert result["awaiting_factor"] is True
     assert gw.runtimes["hal"].tunnel is not None
+
+
+async def test_stop_target_runs_bundle_stop_when_close_command_unset(monkeypatch):
+    """A bundle target with no close_command still releases on stop.
+
+    Regression: `_run_close_command` used to return early when close_command was
+    empty, so a deployed-bundle allocation leaked on stop/refresh.
+    """
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    gw = make_gateway()
+    target = _tunnel_target(
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    conn = object()
+    _connect_fake_tunnel(gw, target, conn)
+    calls = _record_close(gw, monkeypatch)
+
+    await gw.stop_target("hal")
+
+    assert len(calls) == 1
+    assert calls[0]["route"] == "hal"
+    assert calls[0]["tunnel_alive"] is True
+    assert gw.runtimes["hal"].tunnel is None
 
 
 async def test_gateway_stop_runs_close_command_for_connected_target(monkeypatch):
@@ -2478,6 +2509,7 @@ def test_env_configured_includes_bundle_only_target():
         name="b",
         user="agent",
         transport=TR(kind="tunnel", ssh_targets=("b",)),
+        client_key="/home/user/.ssh/key",
         host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
         container=ContainerConfig(runtime="apptainer", storage_root="/scratch/b"),
         bundle=BundleConfig(source="computemcp-slurm"),

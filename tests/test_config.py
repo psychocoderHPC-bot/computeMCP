@@ -1001,6 +1001,7 @@ def test_back_compat_config_without_new_tables_loads():
 def test_bundle_block_defaults():
     cfg = parse_config(
         base_raw(
+            client_key="/home/user/.ssh/key",
             container={"runtime": "apptainer", "storage-root": "/scratch/x"},
             bundle={"source": "computemcp-slurm"},
         )
@@ -1014,11 +1015,12 @@ def test_bundle_block_defaults():
 def test_bundle_block_parsed():
     cfg = parse_config(
         base_raw(
+            client_key="/home/user/.ssh/key",
             bundle={
                 "source": "computemcp-slurm",
                 "deploy-dir": "/scratch/agent/bundle",
                 "auto-deploy": False,
-            }
+            },
         )
     )
     bundle = cfg.targets["hal"].bundle
@@ -1048,6 +1050,16 @@ def test_bundle_deploy_dir_must_be_absolute():
 def test_bundle_needs_deploy_dir_or_storage_root():
     with pytest.raises(ConfigError, match="deploy-dir"):
         parse_config(base_raw(bundle={"source": "computemcp-slurm"}))
+
+
+def test_bundle_requires_client_key():
+    with pytest.raises(ConfigError, match="client_key"):
+        parse_config(
+            base_raw(
+                container={"runtime": "apptainer", "storage-root": "/scratch/x"},
+                bundle={"source": "computemcp-slurm"},
+            )
+        )
 
 
 def test_bundle_auto_deploy_must_be_bool():

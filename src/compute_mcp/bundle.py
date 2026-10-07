@@ -258,7 +258,10 @@ async def _deploy_shell(conn, deploy_dir: str, contents: BundleContents, marker:
         payload = base64.b64encode(data).decode("ascii")
         path = shlex.quote(posixpath.join(deploy_dir, name))
         mode = "700" if name in _EXECUTABLE else "600"
+        # Refuse a planted symlink before writing, matching the SFTP path.
+        # `> path` would otherwise follow it outside the deploy directory.
         command = (
+            f'[ -L {path} ] && {{ echo "refusing symlink: " {path} >&2; exit 1; }}; '
             f"printf %s {shlex.quote(payload)} | base64 -d > {path} && "
             f"chmod {mode} {path}"
         )
