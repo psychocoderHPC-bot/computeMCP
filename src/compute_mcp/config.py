@@ -1196,8 +1196,14 @@ def append_include(config_path: str | Path, include_entry: str) -> None:
 
     lines = original.splitlines()
     quote = _toml_quote(include_entry)
+    # Match only a root-level key (column 0), never a nested table's key that
+    # happens to start with "include".
     start = next(
-        (i for i, line in enumerate(lines) if line.lstrip().startswith("include")),
+        (
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("include") and line[len("include") :].lstrip().startswith("=")
+        ),
         None,
     )
     if start is None:
@@ -1211,31 +1217,34 @@ def append_include(config_path: str | Path, include_entry: str) -> None:
             break
         lines[insert_at:insert_at] = ["", f"include = [{quote}]"]
     else:
+        # Find the closing bracket, ignoring comment-only lines that contain ']'.
         end = start
-        while "]" not in lines[end]:
+        while True:
+            stripped = lines[end].strip()
+            if "]" in lines[end] and not stripped.startswith("#"):
+                break
             end += 1
             if end >= len(lines):
                 raise ConfigError(f"{path}: unterminated include array")
+        indent = "    "
         if start == end:
-            # Single-line form: rewrite as a multi-line array.
-            inner_start = lines[start].index("[") + 1
-            inner = lines[start][inner_start : lines[start].rindex("]")]
-            entries = [e.strip() for e in inner.split(",") if e.strip()]
-            indent = "    "
-            rebuilt = [lines[start][: inner_start], *[indent + e + "," for e in entries]]
+            # Single-line form: rebuild from the parsed values, so a bracket in
+            # a trailing comment cannot confuse the rewrite.
+            rebuilt = ["include = ["]
+            rebuilt += [indent + _toml_quote(entry) + "," for entry in current]
             rebuilt.append(indent + quote + ",")
             rebuilt.append("]")
             lines[start : start + 1] = rebuilt
         else:
             closing = lines[end]
-            indent = closing[: len(closing) - len(closing.lstrip())] or "    "
+            indent = closing[: len(closing) - len(closing.lstrip())] or indent
             lines.insert(end, indent + quote + ",")
 
     updated = "\n".join(lines).rstrip("\n") + "\n"
     _atomic_write(path, updated)
     try:
         load_config(path, token_file=None)
-    except ConfigError:
+    except (ConfigError, tomllib.TOMLDecodeError):
         _atomic_write(path, original)
         raise
 

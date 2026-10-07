@@ -1154,3 +1154,42 @@ def test_append_include_reverts_on_invalid(tmp_path):
     with pytest.raises(ConfigError):
         append_include(path, "systems/missing.toml")
     assert path.read_text() == before
+
+
+def test_append_include_handles_bracket_on_last_entry_line(tmp_path):
+    from compute_mcp.config import append_include, load_config
+
+    path = _include_base(tmp_path, 'include = [\n    "systems/a.toml"]\n\n')
+    append_include(path, "systems/b.toml")
+    assert set(load_config(path).targets) == {"a", "b"}
+
+
+def test_append_include_ignores_bracket_in_comment(tmp_path):
+    from compute_mcp.config import append_include, load_config
+
+    path = _include_base(
+        tmp_path, 'include = [\n    "systems/a.toml",  # see ]\n]\n\n'
+    )
+    append_include(path, "systems/b.toml")
+    assert set(load_config(path).targets) == {"a", "b"}
+
+
+def test_append_include_ignores_nested_include_like_key(tmp_path):
+    from compute_mcp.config import ConfigError, append_include
+
+    tokens = tmp_path / "tokens.toml"
+    tokens.write_text('[tokens]\n"c" = "sha256:' + "a" * 64 + '"\n')
+    path = tmp_path / "config.toml"
+    # A nested key that starts with "include" must not be mistaken for the
+    # root-level array; the edit fails cleanly and the file is left untouched.
+    path.write_text(
+        "[server]\n"
+        'include = "nested-not-the-array"\n'
+        "port = 2222\n\n"
+        f'[auth]\ntoken_file = "{tokens}"\n\n'
+        '[clients.c]\ntargets = ["*"]\n'
+    )
+    before = path.read_text()
+    with pytest.raises(ConfigError):
+        append_include(path, "systems/a.toml")
+    assert path.read_text() == before
