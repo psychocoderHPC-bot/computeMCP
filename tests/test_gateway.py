@@ -3041,3 +3041,88 @@ def test_bootstrap_abort_returns_2(monkeypatch, tmp_path):
     monkeypatch.setattr(setup_mod, "run_bootstrap", fake_run_bootstrap)
     rc = gateway_mod.main(["--bootstrap", "--config-dir", str(tmp_path)])
     assert rc == 2
+
+
+# ============================================================================
+# Bundle target provisioning idempotency ("setup if needed / start if not
+# running / connect")
+# ============================================================================
+def _bundle_target(**overrides):
+    """A bundle-only target with a container block: no provision_command."""
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    base = _tunnel_target(
+        container=ContainerConfig(runtime="docker", storage_root="/scratch/hal"),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    if overrides:
+        base = dataclasses.replace(base, **overrides)
+    return base
+
+
+def test_bundle_target_without_provision_command_uses_helper_argv():
+    """A bundle target needs no provision_command: the argv is the deployed helper."""
+    from compute_mcp.bundle import provision_argv, public_key_for
+
+    target = _bundle_target()
+    assert target.provision_command == ()
+    argv = provision_argv(target, "provision")
+    assert argv and argv[0] == "bash"
+    assert argv[-1] == "provision"
+    assert "computemcp-provision.sh" in argv[1]
+    # It is the helper, not an empty argv, that makes the tunnel gate run.
+    assert argv != (
+        target.provision_command
+    )
+
+
+def test_bundle_only_target_resolves_allocation_without_node_block():
+    """Container+bundle with no node/allocation/slurm still resolves an env."""
+    from compute_mcp.gateway import Gateway, build_provision_env
+
+    gw = make_gateway()
+    target = _bundle_target()
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    assert Gateway._env_configured(target) is True
+    plan, env = gw._resolve_allocation(target, None)
+    assert plan is not None
+    # An empty provision-env is a no-op, but the key is present for a bundle.
+    assert env["COMPUTEMCP_PROVISION_ENV"] == ""
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == "docker"
+
+
+async def test_target_connect_provisions_then_reuses(monkeypatch):
+    """connect_target provisions once; a second call reuses the live tunnel.
+
+    This is the build-if-needed / start-if-not-running / connect contract: the
+    first connect goes through the provision path (which runs the helper), a
+    second connect while still connected must not re-run provisioning.
+    """
+    gw = make_gateway()
+    target = _bundle_target()
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    calls = {"connect": 0}
+
+    async def fake_connect(target, on_route=None, factor=None, **kwargs):
+        calls["connect"] += 1
+        return _FakeTunnel(
+            target, route="hal", local_port=32000,
+            provisioned_endpoint=("127.0.0.1", 2222),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+
+    first = await gw.connect_target("hal")
+    assert first["state"] == "connected"
+    assert calls["connect"] == 1
+
+    second = await gw.connect_target("hal")
+    assert second["state"] == "connected"
+    # Reuse: an already-connected target must not be provisioned again.
+    assert calls["connect"] == 1
+
+    assert gw.public_status("hal")["provisioned_endpoint"] == "127.0.0.1:2222"
