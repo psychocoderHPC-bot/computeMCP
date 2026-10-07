@@ -26,6 +26,8 @@ A short set of commands brings a fresh host to a working gateway. Run them as
 the normal (user, non-root) host account that will own the gateway.
 
 ```bash
+ssh-keygen -t ed25519 -f ~/.ssh/computemcp_container -C computeMCP-gateway  # once, the gateway->container key
+
 pipx install .                        # puts all four commands on PATH
 pipx ensurepath                       # once, if ~/.local/bin is not yet on PATH
 
@@ -36,7 +38,8 @@ computeMCP-gateway                    # start; config + tokens already written
 pipx creates an isolated environment per application and exposes the commands
 on `PATH`, so `computeMCP-gateway`, `computeMCP-gatewayctl`, `computeMCP-handshake`
 and `computeMCP-mcp` are ready to call directly. There is no virtualenv to
-activate and no symlink to create.
+activate and no symlink to create. `--bootstrap` is interactive and needs a
+terminal; for scripts, the gateway refuses prompts under `--non-interactive`.
 
 `--bootstrap` asks for the server address and optionally a first target, writes
 `~/.config/computeMCP-gateway/config.toml`, `tokens.toml` (hashes only, mode
@@ -83,7 +86,10 @@ src/compute_mcp/
   mcp_server.py   MCP server (stdio) exposing computeMCP_* tools
   control.py      computeMCP-gatewayctl operator CLI
 tests/            unit tests (see `pytest -q`)
-scripts/computemcp-slurm/  generic container provisioning bundle (legacy dir name; packaged under src, symlinked; see its README)
+scripts/ensure-container.sh  reference `connect_command` script (starts a stopped container)
+scripts/computemcp-slurm/  symlink to the shipped provisioning bundle
+                         (packaged under src/compute_mcp/bundles/computemcp-slurm;
+                         legacy dir name, canonical source `computemcp-container`; see its README)
 config.example.toml
 systemd/compute-mcp-gateway.service
 ```
@@ -91,10 +97,17 @@ systemd/compute-mcp-gateway.service
 ## Install (gateway on the host, not as root)
 
 ```bash
-pipx install .                        # isolated env, commands on PATH
-pipx ensurepath                       # once, if ~/.local/bin is not yet on PATH
+# Terok container: `~/.local` is owned by root there, so pipx cannot create its
+# venvs and `pipx install .` fails with a permission error. Fix it once:
+sudo chown -R dev:dev ~/.local        # one-time fix for this container
+
+pipx install .                        # install from the current folder
+pipx ensurepath                       # once; makes ~/.local/bin available in new shells
 computeMCP-gateway --bootstrap        # or copy config.example.toml by hand
 ```
+
+On a normal host the `chown` line is unnecessary; `pipx install .` works as
+is.
 
 `--bootstrap` (see [Quick start](#quick-start)) writes `config.toml` and
 `tokens.toml` for you. The manual alternative is `mkdir -p
@@ -114,11 +127,15 @@ them, and a default appears in brackets (press Enter to accept it).
 | Set up a target | Whether to configure a remote system now |
 | Target name | Internal label, e.g. `hal` |
 | Transport | `tunnel` (SSH alias, recommended) or `direct` (host:port) |
-| SSH alias / Remote user / Private key | Route connection; the alias accepts a comma-separated priority list (e.g. `hal,ex_hal`), tried in order for failover. `Remote user` defaults to the current user; type `-` to leave it unset and let the SSH config decide. Key default `~/.ssh/computemcp_container` |
+| SSH alias / Remote user / Private key | Route connection; the alias accepts a comma-separated priority list (e.g. `hal,ex_hal`), tried in order for failover. `Remote user` is the login/ROUTE account (the gateway -> login-node hop, written as `[targets.X] user`); it defaults to the current user; type `-` to leave it unset and let the SSH config decide. Key default `~/.ssh/computemcp_container` |
 | Container host-key fingerprint | `SHA256:...` pin. Leave blank to disable verification (`host_key_check = "off"`); a pin also asks for the accepted host-key algorithms (default `ssh-ed25519`, comma list) |
-| Second factor | Whether the login node needs a password/OTP |
+| Second factor | Whether the login node needs a password/OTP; written as `interactive_auth`. A 2FA target is never auto-connected |
+| Auto-connect | Connect the target automatically on gateway start; defaults to yes, and is forced off (and skipped) for a 2FA target |
 | Container runtime / storage / image / GPU vendors | Drives the provisioning bundle. `Storage root` accepts `$HOME`/`~`, expanded on the target (default `$HOME/computemcp`). `GPU vendors` is a subset of `nvidia, amd, intel` |
-| Slurm node capacities / allocation / sbatch | Asked only for a target that uses the Slurm bundle; optional, needed for `--set` overrides and dry-run previews |
+| Should the gateway build and start this container? | Enables the `[targets.X.bundle]` block (source is always the canonical `computemcp-container`); asked only for a tunnel target that has a client key |
+| Bundle deploy directory / Pre-provision environment | Deploy directory; defaults to `<storage-root>/bundle`, and is asked automatically when the container storage root is not set. `provision-env` is comma-separated shell lines run on the remote before the container runtime is used (empty is a no-op) |
+| Is this target behind a Slurm scheduler? | Asked only when a bundle is configured; a plain container host answers no and gets no `node`/`allocation`/`slurm` block |
+| Slurm node capacities / allocation / sbatch | Asked only for a Slurm target; optional, needed for `--set` overrides and dry-run previews |
 
 Bootstrap does not ask for a project id. It creates the single **operator**
 client `admin` (`targets = ["*"]`) and prints that token once; it is the token
@@ -143,10 +160,15 @@ Create a dedicated gateway-to-container key (never the user's normal key):
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/computemcp_container -C computeMCP-gateway
-# install the .pub half in the remote development container as the
-# `authorized_keys` of the container login user (the bundle uses "agent"):
-ssh-copy-id -i ~/.ssh/computemcp_container.pub agent@<container-host>
 ```
+
+For a bundle target this key does the whole job: the gateway reads the `.pub`
+half (or `ssh-keygen -y`) from `client_key` and configures the container's
+`authorized_keys` for you, including inside the Slurm job. For a hand-built
+container, install the `.pub` half into the container's `authorized_keys` of
+`container_user` (default `agent`) yourself, e.g.
+`ssh-copy-id -i ~/.ssh/computemcp_container.pub agent@<container-host>`; the
+`.pub` file is what you paste here, never the private key.
 
 > **Replace every `/home/USER` placeholder.** `config.example.toml` uses
 > `/home/USER/...` so it is obviously a template; a target that keeps the
@@ -506,12 +528,15 @@ label = "operator"
 targets = ["*"]
 
 # A target reached through an SSH tunnel. `ssh_targets` are aliases from the
-# gateway user's SSH config, tried in order.
+# gateway user's SSH config, tried in order.  `user` is the SSH/login account
+# on the remote host; `container_user` (default `agent`) is the account the
+# gateway dials INSIDE the development container.
 [targets.hal]
 ssh_targets = ["hal", "ex_hal"]
 remote_host = "127.0.0.1"
 remote_port = 2222
 user = "agent"
+container_user = "agent"
 client_key = "/home/USER/.ssh/computemcp_container"
 # Mandatory: pin the container host key (see "Configuration notes").
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
@@ -525,6 +550,7 @@ transport = "direct"
 remote_host = "host.containers.internal"
 remote_port = 2222
 user = "agent"
+container_user = "agent"
 client_key = "/home/USER/.ssh/computemcp_container"
 known_hosts = "/home/USER/.ssh/known_hosts"
 
@@ -534,6 +560,7 @@ ssh_targets = ["fwk394", "ex_fwk394"]
 remote_host = "127.0.0.1"
 remote_port = 2222
 user = "agent"
+container_user = "agent"
 client_key = "/home/USER/.ssh/computemcp_container"
 host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 ```
@@ -950,9 +977,12 @@ legacy alias and resolves to the same shipped bundle.
 | `auto-deploy` | boolean | Default `true`: upload when the remote content marker differs. `false` pins the already-deployed copy, even after a gateway upgrade |
 | `provision-env` | string array | Shell lines run on the remote before the container runtime is used: once on the login/route node before the build, and again inside the container-start path on the job node. Empty (default) is a no-op |
 
-The deploy directory must be visible to the login node (which runs
-`computemcp-provision.sh` and builds the container) and to the compute node
-(which runs `computemcp-job.sh` and starts the container). On most clusters
+A `[targets.X.bundle]` block requires tunnel transport (`ssh_targets`); with
+`transport = "direct"` there is no route connection to deploy over, so use a
+manual `provision_command` instead. The deploy directory must be visible to the
+login node (which runs `computemcp-provision.sh` and builds the container) and
+to the compute node (which runs `computemcp-job.sh` and starts the container).
+On most clusters
 `/tmp` is per-node and not shared, so the default lives under `storage-root`.
 The gateway writes files atomically and never touches `authorized_keys`,
 allocation state, or a running job. With a `[targets.X.bundle]` block,
@@ -1121,12 +1151,17 @@ scales memory to the same ratio (half the node) and renders
 
 ### Worked example: non-Slurm Docker host with the bundle
 
-The shipped bundle is not Slurm-specific. On a host without a scheduler the
-helper skips `sbatch`/`srun`, builds or reuses the container on the route node,
-and starts it there. There is no `node`, `allocation`, or `slurm` block, and
-`provision_command` is not required: the `[targets.X.bundle]` block supplies
-the provisioning path. `provision-env` runs the site setup before the container
-runtime is used.
+The shipped bundle is not Slurm-specific: on a host without a scheduler (like
+`hal`) the helper skips `sbatch`/`srun`, builds or reuses the container on the
+login/route node, and starts it directly there. The `[targets.X.bundle]` block
+is the provisioner in this case: the gateway deploys the bundle over the route
+connection and runs it, so `provision_command` is not required. `provision-env`
+runs the site setup before the container runtime is used.
+
+`user` is the SSH/login account on the host; `container_user` (default
+`agent`) is the account inside the container that the gateway dials. If the
+container runs under a different account, set `container_user` to it, or every
+`exec`/file call fails with `502`.
 
 ```toml
 [targets.hal-docker]
@@ -1163,6 +1198,8 @@ computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2
 computeMCP-gatewayctl target-connect rosi --set nodes=2 --set cpus-per-node=12 --set mem-per-node=100G
 # Dry-run: print the plan without connecting or allocating
 computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2 --dry-run
+# target-refresh also accepts --set and --dry-run (same preview)
+computeMCP-gatewayctl target-refresh rosi --set gpus-per-node=2
 ```
 
 The preview prints the planned intent (mode, nodes, per-node calculations,
@@ -1214,13 +1251,23 @@ The gateway exports the resolved allocation and container description as
   `COMPUTEMCP_STORAGE_ROOT`, `COMPUTEMCP_IMAGE`,
   `COMPUTEMCP_GPU_VENDORS`, `COMPUTEMCP_HOST_HOME`,
   `COMPUTEMCP_SANDBOX`: the container description from
-  `[targets.X.container]`.
+  `[targets.X.container]`, with empty values when the block is absent.
+- `COMPUTEMCP_SSH_USER`: emitted whenever the target has a `container` or
+  `bundle` block. It is the account the container sshd must allow (`AllowUsers`):
+  `[targets.X] container_user`, else the `COMPUTEMCP_SSH_USER` environment
+  override, else `agent`. The helper creates that account inside the container
+  and points it at the container home.
+- `COMPUTEMCP_SSH_PUBLIC_KEY`: emitted for a `[targets.X.bundle]` target. The
+  gateway derives it from `client_key` (the `.pub` half, or `ssh-keygen -y`),
+  so no manual `authorized_keys` placement is needed. An explicit
+  `provision_command` target does not get it.
 - `COMPUTEMCP_PROVISION_ENV`: emitted only for a target with a
   `[targets.X.bundle]` block. It carries the `provision-env` lines joined with
   a single newline and no trailing newline; an empty array yields an empty
   value, which the helper treats as a no-op. The helper runs the lines on the
   remote before the container runtime is used: once on the login/route node
-  before the build, and again inside the container-start path on the job node.
+  before the build, and again inside the container-start path on the job node
+  (a login-node `module load` does not propagate to the compute node).
 
 `sbatch` and `srun` remain separate stages: the helper submits
 `sbatch "${SBATCH_ARGS[@]}" …`; the batch job launches
@@ -1260,7 +1307,8 @@ computeMCP-gateway --config /path/to/config.toml
 Console commands: `targets`, `status [target]`, `connect`, `refresh`,
 `reconnect`, `stop`, `connect-all`, `stop-all`, `reload`, `clients`,
 `client <name>`, `client-refresh|connect|stop <name> [target]`,
-`client-kill <name>`, `sessions [target]`, `close-session <id>`, `quit`.
+`client-kill <name>`, `sessions [target]`, `close-session <id>`,
+`enrollments`, `approve <request-id>`, `deny <request-id>`, `quit`.
 `connect` and `refresh` accept `--2fa SECRET` for an interactive target, for
 example `connect --2fa SECRET hal`.
 
@@ -1269,6 +1317,48 @@ configuration; on failure the old configuration is retained. Unchanged
 connected targets keep their tunnels, removed targets are stopped, and changed
 targets are marked `needs_refresh`. `reload` also re-reads the token file, so
 adding or rotating a project token is a reload away.
+
+## Operator workflow
+
+The typical day-to-day sequence on the host:
+
+```bash
+# 1. Add a system (wizard; no running gateway needed); see the table above.
+computeMCP-gatewayctl --add-target
+
+# 2. Make a running gateway pick up new/changed files (config, tokens, systems/).
+computeMCP-gatewayctl reload
+
+# 3. Connect a target and watch its state.
+computeMCP-gatewayctl target-connect hal
+computeMCP-gatewayctl status
+
+# 4. Preview an allocation change before committing it to a live target.
+computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2 --dry-run
+
+# 5. Re-apply corrected settings to an already-connected target (releases the
+#    old allocation via close_command, then provisions a new one).
+computeMCP-gatewayctl target-refresh rosi --set gpus-per-node=2
+
+# 6. Stop a target, releasing its allocation (runs close_command on the remote).
+computeMCP-gatewayctl target-stop rosi
+
+# 7. Manage enrollment from inside a Terok task: the task runs the handshake,
+#    you approve or deny the request on the host.
+computeMCP-gatewayctl enrollments
+computeMCP-gatewayctl approve <request-id>
+computeMCP-gatewayctl deny <request-id>
+```
+
+The interactive console of a running `computeMCP-gateway` offers the same
+verbs (`connect`, `refresh`, `reconnect`, `stop`, `connect-all`, `stop-all`,
+`reload`, `clients`, `sessions`, `close-session`, `quit`) without a separate
+CLI call; see [Run the gateway](#run-the-gateway).
+
+Adding a target with `--add-target` writes the file and appends the include on
+its own; `reload` is what a *running* gateway needs to see it. `--add-target`
+itself needs no gateway and no token, and it re-validates the whole include
+graph (rolling back on failure).
 
 ## Operator terminal: refresh config and manage API keys
 
@@ -1462,6 +1552,18 @@ targets = ["hal", "fwk394"]
   gateway> connect --2fa SECRET hal
   {'name': 'hal', 'state': 'connected', ...}
   ```
+
+- `user` vs `container_user`: `user` is the SSH/login account for the route
+  connection (the gateway -> login-node hop); it may be empty, in which case
+  the SSH config alias or the local account decides. `container_user` is the
+  account the gateway logs into INSIDE the development container, default
+  `agent`. The container's sshd is key-only and accepts only that account (the
+  provisioning helper creates it and its `authorized_keys` from `client_key`),
+  so a `user`/`container_user` mismatch is the usual cause of a target that
+  connects but then fails every `exec` and file call with `502`
+  ("Bad Gateway") because the container rejects the login. Keep `container_user`
+  in sync with the account the container was built for; the gateway exports it
+  to the bundle as `COMPUTEMCP_SSH_USER`.
 
 - Route loss, and how targets recover:
   - Non-interactive targets auto-reconnect with backoff. Reconnection re-runs
@@ -1749,6 +1851,62 @@ shown as `provisioned_endpoint` in `status`/`GET /v1/targets/{name}`.
 - Command execution supports `env` (exported in the remote shell, so it works
   even when the container sshd does not accept env) and `stdin`. Persistent
   reads accept `wait=<seconds>` to block for new output instead of polling.
+
+## Troubleshooting
+
+Symptoms mapped to the most likely cause and the fix. The gateway logs the
+target's `last_error` (visible in `computeMCP-gatewayctl status`, the console,
+and `GET /v1/targets/{name}`), and the MCP layer surfaces the gateway's status
+code, so `502 Bad Gateway` in `computeMCP_exec`/`computeMCP_file_*` output
+always maps to a gateway-side dial failure below.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Target is `connected` but every `exec`/file call fails with `502` | The container dial is refused by the container's sshd. The bundle enforces `AllowUsers <container_user>` (key-only), so an explicit `container_user` that does not name the account the container was built for is rejected; the dialed account is `container_user`, or `COMPUTEMCP_SSH_USER`, or `agent`, never the `user` login | Make `container_user` name the in-container account (the bundle default is `agent`); unset it to get the helper default. Then `target-refresh <t>`. No `proxycommand`/tunnel misconfig needed; `user` (login) is fine as is; see [Configuration notes](#configuration-notes) for the distinction |
+| `connected` + `502`, or the dial cannot reach the container at all | Stale endpoint: on a Slurm target the allocation was recycled/lost a node, or the container's published/fetched port changed after a recreate | `computeMCP-gatewayctl target-refresh <t>` re-runs provisioning and follows the new node/port; on recreate, also update `host_key_sha256` (see "Recreating a container changes its host key") |
+| Target fails to connect: "no host-key verification" / `Host key is not trusted` | Missing pin or stale pin: the container was recreated (new sshd host keys), or `host_key_sha256` is still a placeholder | Read the new fingerprint from the container and set `host_key_sha256` (+ `host_key_algorithms`), then refresh |
+| Target fails to connect: `Host key is not trusted for host` | Route or container key pin mismatch after recreate, or the alias now reaches a different sshd | Same as above; verify with `ssh-keygen -lf` on the key the gateway dials |
+| Route connects, but the container never starts ("container not built") | Missing `[targets.X.bundle]` block (and no manual `provision_command`): the gateway connected the route but is not told to build the container | Add the `[targets.X.bundle]` block (with `container.storage-root` or `bundle.deploy-dir`), `reload`, then `target-connect <t>` |
+| Bundle target fails to deploy: `bundle requires 'client_key'` / `bundle needs 'deploy-dir' or a container 'storage-root'` | Bundle validation is strict: it needs `client_key` (source of the container's authorized key) and a specific deploy location | Set `client_key` and either `bundle.deploy-dir` or `container.storage-root`; the deploy location must be visible to login and compute nodes |
+| "Route works but nothing listens" (provisioned endpoint never answers) | Container is not running (a stopped Docker container keeps its files but no listener), or the published/fetched port no longer matches the state the helper recorded after a start | Check on the remote: `docker ps -a` / `apptainer instance list`. To bring the container back up automatically, set `connect_command` (see "Recovering a stopped container"; the bundle or a manual `ensure-container.sh` both work), or rerun `target-refresh <t>` after starting it by hand |
+| `multi-node not yet supported` | `--set nodes=N` with `N > 1`: the gateway computes the plan, but the shipped helper rejects multi-node today | Use `nodes = 1` until multi-node support lands (see "Requirements and validation") |
+| Handshake cannot reach the gateway (connection refused/timeout from inside a Terok task) | Terok Shield is default-deny: the task cannot open the gateway endpoint until the project allows it | Add `COMPUTEMCP_GATEWAY`'s host:port to the project's `project.toml` `shield.allow`/`override` and create a new task; see [Allow the gateway in the Terok Shield](#allow-the-gateway-in-the-terok-shield) |
+| MCP tools fail with "COMPUTEMCP_GATEWAY is not set" / "COMPUTEMCP_TOKEN is not set" / "invalid token" | `COMPUTEMCP_GATEWAY`/`COMPUTEMCP_TOKEN` are missing from the MCP process environment, or a stale/rotated token | Re-run the handshake (or set the token per project); a running agent does not see later `export`s, so paste the `environment` block into the MCP entry or start the agent from a fresh shell |
+| `pipx install .` fails with a permission error in a fresh Terok container | `~/.local` is owned by root in Terok containers | `sudo chown -R dev:dev ~/.local` once (see [Install](#install-gateway-on-the-host-not-as-root)) |
+
+### Using the `compute` MCP from inside a Terok container
+
+The container-side entry points, in order:
+
+```bash
+# 1. Discover the systems the gateway serves and, if needed, ask for access:
+computeMCP-handshake picongpu-bot-dev2 --port 2222 --system hal,fwk394
+#    (operator then runs `computeMCP-gatewayctl approve <id>` on the host)
+```
+
+Once the gateway is reachable and the token is set (via the handshake write or
+the MCP `environment` block), the MCP tools resolve within the agent:
+
+- `computeMCP_targets()` lists the authorized targets, their `sharing` label,
+  `node_info` hints, and any configured `agent` list. `node_info` is
+  operator-authored data; verify the actual hardware.
+- `computeMCP_status("hal")` returns state, active route, local forward port,
+  and detailed `last_error` for diagnostics.
+- `computeMCP_exec(target="hal", command="...", cwd=..., timeout=...,
+  env=..., stdin=...)` runs a short command; `env` is exported in the remote
+  shell (works even when the container sshd does not accept env). For long
+  builds or tests use a persistent session instead:
+  `computeMCP_session_create(target, cwd, columns, rows)` returns a
+  `session_id`, then `computeMCP_session_read(session_id, wait=...)` blocks for
+  new output until the timeout or the prompt returns, which is cheaper than
+  polling in a loop.
+- File moves: `computeMCP_file_*` (read/write are inline bytes;
+  upload/download stream over SFTP and never place file bytes in the tool
+  response; `file_upload_tree` mirrors a directory; `file_stat`/`chmod` for
+  metadata).
+- Choose the target by the `target` argument; the gateway enforces the
+  client's ACL, and an unauthorized target produces `403` without revealing
+  whether it exists.
 
 ## HTTP API (all requests require `Authorization: Bearer <token>`)
 
