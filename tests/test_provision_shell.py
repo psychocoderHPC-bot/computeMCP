@@ -655,6 +655,22 @@ def test_slurm_mode_submits_job_and_reports_relay_endpoint(tmp_path, stubs):
         settings = state_dir / "srun-casetest.settings"
         assert settings.exists()
         assert "COMPUTEMCP_PROVISION_ENV" in settings.read_text()
+        # The compute node may run the job step with HOME stripped, so the
+        # settings file must carry the already-resolved ABSOLUTE storage root.
+        # Read it back through bash's own parser to avoid depending on ``%q``
+        # quoting details.
+        storage_line = next(
+            line for line in settings.read_text().splitlines()
+            if line.startswith("export COMPUTEMCP_STORAGE_ROOT=")
+        )
+        resolved = subprocess.run(
+            ["bash", "-c", f"{storage_line}; printf '%s' \"$COMPUTEMCP_STORAGE_ROOT\""],
+            capture_output=True,
+            text=True,
+        )
+        assert resolved.returncode == 0, resolved.stderr
+        assert resolved.stdout == str(storage), resolved.stdout
+        assert resolved.stdout.startswith("/"), resolved.stdout
         # The relay must be listening on the reported forward port so that
         # the "provisioned endpoint" exposed to the gateway is real.
         assert _wait_port(forward_port, timeout=15), (
@@ -1700,3 +1716,133 @@ def test_job_sh_relocated_without_bundle_dir_reports_missing_script(tmp_path):
     assert result.returncode == 1, result
     assert "Missing container script" in result.stderr, result.stderr
     assert str(spool) in result.stderr, result.stderr
+
+
+# --- HOME-less compute-node regression ------------------------------------
+#
+# Slurm can submit the batch job with ``--export=NONE`` (or a custom export
+# policy), so the job step -- and thus computemcp-container.sh -- runs with
+# HOME stripped.  The container script previously referenced a bare ``$HOME``
+# in its STORAGE_ROOT fallback under ``set -u`` and crashed with
+# "HOME: unbound variable" on the compute node.  The per-job settings file now
+# carries the absolute login-node COMPUTEMCP_STORAGE_ROOT, and the script
+# guards every HOME reference so it neither crashes nor needs HOME when the
+# absolute value is present.
+
+
+def _container_env_without_home(
+    root: Path, system: str, *, storage_root: str | None
+) -> dict:
+    """A minimal container-script environment with HOME explicitly removed."""
+    env = {
+        "PATH": str(root / "bin") + os.pathsep + os.environ.get("PATH", ""),
+        "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+        "COMPUTEMCP_SYSTEM": system,
+        "COMPUTEMCP_SANDBOX_DIR": str(root / "sandbox"),
+        "COMPUTEMCP_HOST_HOME": str(root / "hosthome"),
+        "COMPUTEMCP_CONTAINER_PORT": str(_free_port()),
+        "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
+    }
+    if storage_root is not None:
+        env["COMPUTEMCP_STORAGE_ROOT"] = storage_root
+    env.pop("HOME", None)  # the point of the test: Slurm stripped HOME
+    return env
+
+
+def _stub_apptainer(root: Path) -> None:
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "apptainer"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+
+
+def test_container_configure_without_home_uses_absolute_storage_root(tmp_path):
+    """``configure`` with HOME unset must not crash and use the absolute root.
+
+    Regression for the JURECA compute-node failure
+    ``computemcp-container.sh: line 27: HOME: unbound variable``.  With HOME
+    removed but an absolute COMPUTEMCP_STORAGE_ROOT present (the normal
+    compute-node case after the settings file carries it), the script must
+    succeed, create its state directory under the absolute root, and never
+    mention an unbound variable.
+    """
+    root = tmp_path / "nohome"
+    root.mkdir()
+    sandbox = _make_fake_sandbox(root)
+    _stub_apptainer(root)
+    storage = root / "abs-storage"
+
+    env = _container_env_without_home(root, "nohome", storage_root=str(storage))
+    env["COMPUTEMCP_SANDBOX_DIR"] = str(sandbox)
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=root,
+    )
+    assert result.returncode == 0, (
+        f"configure exited {result.returncode}\n"
+        f"stdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    assert "unbound variable" not in result.stderr, result.stderr
+    # The absolute root was used verbatim; STATE lives below it, not under HOME.
+    assert (storage / "nohome" / "state").is_dir(), sorted(storage.rglob("*"))
+    assert ".local/share/computemcp" not in result.stderr
+
+
+def test_container_without_home_and_without_storage_root_fails_clearly(tmp_path):
+    """Neither storage root nor HOME: a clear error, not an unbound variable.
+
+    The old fallback ``${COMPUTEMCP_STORAGE_ROOT:-$HOME/...}`` raised a raw
+    ``HOME: unbound variable`` under ``set -u``.  The script must instead exit
+    non-zero naming the missing input.
+    """
+    root = tmp_path / "nosettings"
+    root.mkdir()
+    _make_fake_sandbox(root)
+    _stub_apptainer(root)
+
+    env = _container_env_without_home(root, "nosettings", storage_root=None)
+    for action in ("configure", "start"):
+        result = subprocess.run(
+            ["bash", str(CONTAINER), action],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+            cwd=root,
+        )
+        assert result.returncode != 0, (action, result.stdout)
+        assert "unbound variable" not in result.stderr, result.stderr
+        assert "COMPUTEMCP_STORAGE_ROOT" in result.stderr, result.stderr
+        assert "HOME" in result.stderr, result.stderr
+
+
+def test_provision_without_home_and_without_storage_root_fails_clearly(tmp_path):
+    """``provision`` likewise rejects an ambiguous HOME-less configuration."""
+    workdir = tmp_path / "provision-nohome"
+    workdir.mkdir()
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "COMPUTEMCP_CONTAINER_RUNTIME": "docker",
+        "COMPUTEMCP_IMAGE": "docker://ubuntu:22.04",
+        "COMPUTEMCP_SYSTEM": "provisionnohome",
+        "COMPUTEMCP_CONTAINER_PORT": str(_free_port()),
+        "COMPUTEMCP_FORWARD_PORT": str(_free_port()),
+    }
+    env.pop("HOME", None)
+    result = subprocess.run(
+        ["bash", str(PROVISION), "provision"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=workdir,
+    )
+    assert result.returncode != 0, result.stdout
+    assert "unbound variable" not in result.stderr, result.stderr
+    assert "COMPUTEMCP_STORAGE_ROOT" in result.stderr, result.stderr
+    assert "HOME" in result.stderr, result.stderr

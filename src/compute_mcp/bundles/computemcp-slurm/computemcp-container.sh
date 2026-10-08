@@ -24,12 +24,34 @@ esac
 
 # --- Configuration from the gateway environment ---------------------------
 SYSTEM="${COMPUTEMCP_SYSTEM:-computemcp}"
-STORAGE_ROOT="${COMPUTEMCP_STORAGE_ROOT:-$HOME/.local/share/computemcp}"
-# Expand a literal $HOME/~ prefix passed by the gateway.
+# Compute nodes may run the job step with HOME stripped (``--export=NONE`` or a
+# custom export policy), so never reference a bare $HOME under ``set -u``.  The
+# normal compute-node case carries an absolute COMPUTEMCP_STORAGE_ROOT from the
+# per-job settings file and is used verbatim.  A literal $HOME/~ prefix from the
+# login node is expanded only when HOME is present; with neither an absolute
+# storage root nor HOME the script fails with a clear message, not an
+# unbound-variable crash.
+STORAGE_ROOT="${COMPUTEMCP_STORAGE_ROOT:-}"
 if [[ "$STORAGE_ROOT" =~ ^\$HOME(/|$) ]]; then
+    [ -n "${HOME:-}" ] || {
+        echo 'COMPUTEMCP_STORAGE_ROOT starts with $HOME but HOME is unset on this node.' >&2
+        exit 2
+    }
     STORAGE_ROOT="$HOME${STORAGE_ROOT#\$HOME}"
 elif [[ "$STORAGE_ROOT" =~ ^~(/|$) ]]; then
+    [ -n "${HOME:-}" ] || {
+        echo 'COMPUTEMCP_STORAGE_ROOT starts with ~ but HOME is unset on this node.' >&2
+        exit 2
+    }
     STORAGE_ROOT="$HOME${STORAGE_ROOT#\~}"
+fi
+if [ -z "$STORAGE_ROOT" ]; then
+    if [ -n "${HOME:-}" ]; then
+        STORAGE_ROOT="$HOME/.local/share/computemcp"
+    else
+        echo 'Neither COMPUTEMCP_STORAGE_ROOT nor HOME is set on this node; provide an absolute COMPUTEMCP_STORAGE_ROOT.' >&2
+        exit 2
+    fi
 fi
 SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
 SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"
