@@ -964,6 +964,36 @@ async def test_open_for_route_forward_failure_releases_port(monkeypatch):
     assert mgr.reserved == frozenset()
 
 
+async def test_open_route_connection_dials_without_provision_or_forward(monkeypatch):
+    """A short-lived route dials the route but must not provision or forward."""
+    class _Conn(_FakeConn):
+        def __init__(self, addr):
+            super().__init__(addr)
+            self.commands = []
+
+        async def run(self, command, **kwargs):
+            self.commands.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(target, provision_command=("provision",))
+    conn = _Conn(("127.0.0.1", 22))
+    mgr = _install_route(monkeypatch, conn, 31640)
+
+    opened = await mgr.open_route_connection(
+        target, "hal", connection_timeout=3.0
+    )
+
+    assert opened is conn
+    # No provisioning command ran and no local port was forwarded.
+    assert conn.commands == []
+    assert conn.forwarded == []
+    assert not conn.is_closed()
+
+
+
 # ---------------------------------------------------------------------------
 # format_provision_env: shell-quoted export statements
 # ---------------------------------------------------------------------------
