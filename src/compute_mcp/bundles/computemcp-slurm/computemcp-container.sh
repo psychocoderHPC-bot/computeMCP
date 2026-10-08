@@ -82,7 +82,7 @@ CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
 SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 
 # Docker-only defaults.  The gateway never needs to know these.
-SSH_USER="${COMPUTEMCP_SSH_USER:-agent}"
+SSH_USER="${COMPUTEMCP_SSH_USER:-ubuntu}"
 if ! { [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && [ "$SSH_USER" != root ]; }; then
     echo "Invalid COMPUTEMCP_SSH_USER: $SSH_USER" >&2
     exit 2
@@ -251,7 +251,7 @@ apptainer_configure() {
     # Edit the actual sandbox files, not Apptainer's runtime /etc/passwd mount.
     # No host account files are changed. Existing Ubuntu UID/GID are retained.
     # The pre-existing ``ubuntu`` account is renamed to the gateway's login
-    # account (``COMPUTEMCP_SSH_USER``, default ``agent``) so the same account
+    # account (``COMPUTEMCP_SSH_USER``, default ``ubuntu``) so the same account
     # the gateway dials exists inside the sandbox.  Keeping one account and
     # renaming it (rather than adding a second) avoids a duplicate UID/GID and
     # every downstream reference (home, shell, authorized_keys, startscript)

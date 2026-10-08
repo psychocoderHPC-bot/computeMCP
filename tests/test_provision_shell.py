@@ -1603,11 +1603,11 @@ def test_apptainer_configure_renames_account_to_ssh_user(tmp_path, ssh_user):
 
     Regression: ``apptainer_configure`` used to keep the sandbox ``ubuntu``
     account and ignore ``COMPUTEMCP_SSH_USER``, so a default target
-    (``container_user = "agent"``) connected but could not exec (502).  The
-    sandbox account is now renamed to the resolved login name (default
-    ``agent``) and every downstream reference follows it.
+    (``container_user = "ubuntu"``) connected but could not exec (502).  The
+    sandbox account is renamed to the resolved login name (default ``ubuntu``)
+    and every downstream reference follows it.
     """
-    expected = ssh_user or "agent"
+    expected = ssh_user or "ubuntu"
     result, sandbox, host_home = _run_apptainer_configure(
         tmp_path, ssh_user, _free_port()
     )
@@ -1617,7 +1617,8 @@ def test_apptainer_configure_renames_account_to_ssh_user(tmp_path, ssh_user):
     )
     accounts = _passwd_account(sandbox)
     assert expected in accounts, accounts
-    assert "ubuntu" not in accounts, f"unexpected sandbox account retained: {accounts}"
+    if expected != "ubuntu":
+        assert "ubuntu" not in accounts, f"unexpected sandbox account retained: {accounts}"
     line = accounts[expected]
     # UID/GID (and the passwd field count) are preserved from the base image.
     assert line[2] == "1000" and line[3] == "1000", line
@@ -1690,6 +1691,44 @@ def test_apptainer_configure_is_idempotent(tmp_path):
     names = [line.split(":")[0] for line in
              (sandbox / "etc/passwd").read_text(encoding="utf-8").splitlines()]
     assert names.count("agent") == 1, names
+    # The original base-image passwd must not be overwritten on a re-run.
+    assert (
+        sandbox / "etc/passwd.computemcp-backup"
+    ).read_bytes() == original_backup
+
+
+def test_apptainer_configure_ubuntu_is_idempotent(tmp_path):
+    """When the resolved login user is ``ubuntu`` the rename is a no-op.
+
+    The base image already ships an ``ubuntu`` account; configuring for
+    ``COMPUTEMCP_SSH_USER=ubuntu`` must accept that single account as the
+    target, reconfigure it in place, and succeed again on a second configure
+    without creating a duplicate or aborting.
+    """
+    port = _free_port()
+    result, sandbox, _ = _run_apptainer_configure(tmp_path, "ubuntu", port)
+    assert result.returncode == 0, (
+        f"first configure exited {result.returncode}\n"
+        f"stdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    original_backup = (sandbox / "etc/passwd.computemcp-backup").read_bytes()
+    accounts = _passwd_account(sandbox)
+    assert accounts["ubuntu"][5] == "/home/ubuntu", accounts
+    assert accounts["ubuntu"][6] == "/usr/local/bin/computemcp-ubuntu-shell", accounts
+
+    second, sandbox2, _ = _run_apptainer_configure(
+        tmp_path, "ubuntu", port, sandbox=sandbox
+    )
+    assert second.returncode == 0, (
+        f"second configure exited {second.returncode}\n"
+        f"stdout:{second.stdout}\nstderr:{second.stderr}"
+    )
+    assert sandbox2 == sandbox
+    accounts = _passwd_account(sandbox)
+    assert "ubuntu" in accounts, accounts
+    names = [line.split(":")[0] for line in
+             (sandbox / "etc/passwd").read_text(encoding="utf-8").splitlines()]
+    assert names.count("ubuntu") == 1, names
     # The original base-image passwd must not be overwritten on a re-run.
     assert (
         sandbox / "etc/passwd.computemcp-backup"

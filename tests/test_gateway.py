@@ -2743,7 +2743,7 @@ def test_build_provision_env_exact_contract():
     assert env["COMPUTEMCP_HOST_HOME"] == ""
     assert env["COMPUTEMCP_SANDBOX"] == "true"
     # The container hop dials this account; the helper creates/AllowUsers it.
-    assert env["COMPUTEMCP_SSH_USER"] == "agent"
+    assert env["COMPUTEMCP_SSH_USER"] == "ubuntu"
 
 
 def test_build_provision_env_emits_container_user_override():
@@ -2789,7 +2789,7 @@ def test_target_provision_env_emits_container_user():
     )
     assert (
         gw._target_provision_env(_allocation_target())["COMPUTEMCP_SSH_USER"]
-        == "agent"
+        == "ubuntu"
     )
 
 

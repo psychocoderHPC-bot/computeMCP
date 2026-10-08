@@ -161,7 +161,7 @@ export COMPUTEMCP_IMAGE="$IMAGE"
 export COMPUTEMCP_GPU_VENDORS="$GPU_VENDORS"
 export COMPUTEMCP_CONTAINER_PORT="$CONTAINER_PORT"
 export COMPUTEMCP_SSH_WAIT_SECONDS="$SSH_WAIT_SECONDS"
-export COMPUTEMCP_SSH_USER="${COMPUTEMCP_SSH_USER:-agent}"
+export COMPUTEMCP_SSH_USER="${COMPUTEMCP_SSH_USER:-ubuntu}"
 # Transport an explicit name override (if any) so computemcp-container.sh uses
 # the same runtime name as this helper in every mode.
 export COMPUTEMCP_CONTAINER_NAME="${COMPUTEMCP_CONTAINER_NAME:-}"
@@ -540,7 +540,7 @@ write_settings() {
         printf 'export COMPUTEMCP_MEMORY_PER_NODE_MIB=%q\n' "${COMPUTEMCP_MEMORY_PER_NODE_MIB:-}"
         printf 'export COMPUTEMCP_CONTAINER_PORT=%q\n' "$CONTAINER_PORT"
         printf 'export COMPUTEMCP_SSH_WAIT_SECONDS=%q\n' "$SSH_WAIT_SECONDS"
-        printf 'export COMPUTEMCP_SSH_USER=%q\n' "${COMPUTEMCP_SSH_USER:-agent}"
+        printf 'export COMPUTEMCP_SSH_USER=%q\n' "${COMPUTEMCP_SSH_USER:-ubuntu}"
         printf 'export COMPUTEMCP_SSH_PUBLIC_KEY=%q\n' "${COMPUTEMCP_SSH_PUBLIC_KEY:-}"
         printf 'export COMPUTEMCP_CPU_BIND=%q\n' "$CPU_BIND"
         printf 'export COMPUTEMCP_SRUN_ARGS=%q\n' "${COMPUTEMCP_SRUN_ARGS:-}"

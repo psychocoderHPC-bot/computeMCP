@@ -10,6 +10,7 @@ from compute_mcp.config import (
     ConfigError,
     TargetConfig,
     TransportConfig,
+    container_login_user,
     load_config,
     load_tokens,
     parse_config,
@@ -305,6 +306,23 @@ def test_invalid_target_name_rejected():
 def test_container_user_defaults_to_none():
     cfg = parse_config(base_raw())
     assert cfg.targets["hal"].container_user is None
+
+
+def test_container_login_user_defaults_to_ubuntu(monkeypatch):
+    monkeypatch.delenv("COMPUTEMCP_SSH_USER", raising=False)
+    cfg = parse_config(base_raw())
+    assert container_login_user(cfg.targets["hal"]) == "ubuntu"
+
+
+def test_container_login_user_honors_explicit_and_env(monkeypatch):
+    explicit = parse_config(base_raw(container_user="dev")).targets["hal"]
+    assert container_login_user(explicit) == "dev"
+    # An explicit value wins even when the env override is set.
+    monkeypatch.setenv("COMPUTEMCP_SSH_USER", "siteagent")
+    assert container_login_user(explicit) == "dev"
+    # With no explicit value the env override is honored over the default.
+    default = parse_config(base_raw()).targets["hal"]
+    assert container_login_user(default) == "siteagent"
 
 
 def test_container_user_parsed():

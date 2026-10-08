@@ -294,8 +294,8 @@ async def _capture_container_dial(monkeypatch, target):
     return seen
 
 
-async def test_container_dial_defaults_to_agent(monkeypatch):
-    """The container hop dials ``agent`` by default, not the route login user.
+async def test_container_dial_defaults_to_ubuntu(monkeypatch):
+    """The container hop dials ``ubuntu`` by default, not the route login user.
 
     This is the bug fix: the route account (``target.user``, here ``rwidera``)
     authenticates the gateway -> login hop, but the container sshd's
@@ -303,7 +303,7 @@ async def test_container_dial_defaults_to_agent(monkeypatch):
     inside the container failed with ``Permission denied``.
     """
     seen = await _capture_container_dial(monkeypatch, _container_target())
-    assert seen["username"] == "agent"
+    assert seen["username"] == "ubuntu"
     assert seen["username"] != "rwidera"
 
 

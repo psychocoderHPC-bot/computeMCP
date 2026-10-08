@@ -166,7 +166,7 @@ For a bundle target this key does the whole job: the gateway reads the `.pub`
 half (or `ssh-keygen -y`) from `client_key` and configures the container's
 `authorized_keys` for you, including inside the Slurm job. For a hand-built
 container, install the `.pub` half into the container's `authorized_keys` of
-`container_user` (default `agent`) yourself, e.g.
+`container_user` (default `ubuntu`) yourself, e.g.
 `ssh-copy-id -i ~/.ssh/computemcp_container.pub agent@<container-host>`; the
 `.pub` file is what you paste here, never the private key.
 
@@ -529,7 +529,7 @@ targets = ["*"]
 
 # A target reached through an SSH tunnel. `ssh_targets` are aliases from the
 # gateway user's SSH config, tried in order.  `user` is the SSH/login account
-# on the remote host; `container_user` (default `agent`) is the account the
+# on the remote host; `container_user` (default `ubuntu`) is the account the
 # gateway dials INSIDE the development container.
 [targets.hal]
 ssh_targets = ["hal", "ex_hal"]
@@ -1192,7 +1192,7 @@ connection and runs it, so `provision_command` is not required. `provision-env`
 runs the site setup before the container runtime is used.
 
 `user` is the SSH/login account on the host; `container_user` (default
-`agent`) is the account inside the container that the gateway dials. If the
+`ubuntu`) is the account inside the container that the gateway dials. If the
 container runs under a different account, set `container_user` to it, or every
 `exec`/file call fails with `502`.
 
@@ -1303,7 +1303,7 @@ The gateway exports the resolved allocation and container description as
 - `COMPUTEMCP_SSH_USER`: emitted whenever the target has a `container` or
   `bundle` block. It is the account the container sshd must allow:
   `[targets.X] container_user`, else the `COMPUTEMCP_SSH_USER` environment
-  override, else `agent`. Docker creates that account inside the container;
+  override, else `ubuntu`. Docker creates that account inside the container;
   Apptainer renames the sandbox's existing account to it and points it at the
   matching home.
 - `COMPUTEMCP_SSH_PUBLIC_KEY`: emitted for a `[targets.X.bundle]` target. The
@@ -1606,7 +1606,7 @@ targets = ["hal", "fwk394"]
   connection (the gateway -> login-node hop); it may be empty, in which case
   the SSH config alias or the local account decides. `container_user` is the
   account the gateway logs into INSIDE the development container, default
-  `agent`. The container's sshd is key-only and accepts only that account (the
+  `ubuntu`. The container's sshd is key-only and accepts only that account (the
   provisioning helper creates it for Docker, or renames the sandbox's existing
   account to it for Apptainer, and installs `authorized_keys` from
   `client_key`), so a `user`/`container_user` mismatch is the usual cause of a
@@ -1912,7 +1912,7 @@ always maps to a gateway-side dial failure below.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Target is `connected` but every `exec`/file call fails with `502` | The container dial is refused by the container's sshd. Docker enforces `AllowUsers <container_user>` (key-only); Apptainer's Dropbear serves the account the sandbox was configured with. An explicit `container_user` that does not name an account the container has is rejected; the dialed account is `container_user`, or `COMPUTEMCP_SSH_USER`, or `agent`, never the `user` login | Make `container_user` name the in-container account (the bundle default is `agent`); unset it to get the helper default. For Apptainer the sandbox account is renamed to it on the next `configure`/`target-refresh`, so an explicit name works there too. Then `target-refresh <t>`. No `proxycommand`/tunnel misconfig needed; `user` (login) is fine as is; see [Configuration notes](#configuration-notes) for the distinction |
+| Target is `connected` but every `exec`/file call fails with `502` | The container dial is refused by the container's sshd. Docker enforces `AllowUsers <container_user>` (key-only); Apptainer's Dropbear serves the account the sandbox was configured with. An explicit `container_user` that does not name an account the container has is rejected; the dialed account is `container_user`, or `COMPUTEMCP_SSH_USER`, or `ubuntu`, never the `user` login | Make `container_user` name the in-container account (the bundle default is `ubuntu`); unset it to get the helper default. For Apptainer the sandbox account is renamed to it on the next `configure`/`target-refresh`, so an explicit name works there too. Then `target-refresh <t>`. No `proxycommand`/tunnel misconfig needed; `user` (login) is fine as is; see [Configuration notes](#configuration-notes) for the distinction |
 | `connected` + `502`, or the dial cannot reach the container at all | Stale endpoint: on a Slurm target the allocation was recycled/lost a node, or a Docker daemon restart re-published the container on a new ephemeral host port | The helper queries the live published port instead of trusting its cached mapping, so `computeMCP-gatewayctl target-refresh <t>` re-runs provisioning, follows the new node/port, and refreshes the recorded endpoint; on recreate, also update `host_key_sha256` (see "Recreating a container changes its host key") |
 | Target fails to connect: "no host-key verification" / `Host key is not trusted` | Missing pin or stale pin: the container was recreated (new sshd host keys), or `host_key_sha256` is still a placeholder | Read the new fingerprint from the container and set `host_key_sha256` (+ `host_key_algorithms`), then refresh |
 | Target fails to connect: `Host key is not trusted for host` | Route or container key pin mismatch after recreate, or the alias now reaches a different sshd | Same as above; verify with `ssh-keygen -lf` on the key the gateway dials |

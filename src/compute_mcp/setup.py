@@ -398,9 +398,9 @@ def render_target_block(answers: TargetAnswers) -> str:
         )
         if present
     }
-    # container_user = "agent" mirrors the dial-time resolution
-    # (TargetConfig.container_user unset -> "agent").
-    root_entries: list[tuple[str, object]] = [("container_user", "agent")]
+    # container_user = "ubuntu" mirrors the dial-time resolution
+    # (TargetConfig.container_user unset -> "ubuntu").
+    root_entries: list[tuple[str, object]] = [("container_user", "ubuntu")]
     if not answers.host_key_sha256:
         root_entries.append(("known_hosts", ""))
     # A format-complete placeholder that passes the loader's route host-key

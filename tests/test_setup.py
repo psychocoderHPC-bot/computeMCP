@@ -528,7 +528,7 @@ def test_commented_bundle_deploy_dir_default():
 def test_commented_default_values_are_valid():
     # The apptainer+bundle discovery target carries the corrected values.
     block = render_target_block(_discovery_target())
-    assert '# container_user = "agent"' in block
+    assert '# container_user = "ubuntu"' in block
     assert '# route_host_key_sha256 = "SHA256:REPLACE_WITH_FINGERPRINT"' in block
     assert '# host-home = "$HOME/computemcp/rosi/home"' in block
     # Runtime-appropriate image per target: docker:// for Apptainer (which
@@ -559,8 +559,8 @@ def test_commented_default_values_are_valid():
     assert f'# host-home = "$HOME/computemcp/hal/home"' in apptainer_block
     assert '# route_host_key_sha256 = "SHA256:REPLACE_WITH_FINGERPRINT"' in docker_block
     assert '# route_host_key_sha256 = "SHA256:REPLACE_WITH_FINGERPRINT"' in apptainer_block
-    assert '# container_user = "agent"' in docker_block
-    assert '# container_user = "agent"' in apptainer_block
+    assert '# container_user = "ubuntu"' in docker_block
+    assert '# container_user = "ubuntu"' in apptainer_block
 
 
 def test_bootstrap_main_config_commented_defaults_parse_and_load(tmp_path):

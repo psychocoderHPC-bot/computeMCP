@@ -71,8 +71,8 @@ def container_login_user(target: "TargetConfig") -> str:
 
     ``container_user`` is the source of truth.  When it is unset the explicit
     ``COMPUTEMCP_SSH_USER`` environment override is honored (so an operator who
-    already exports it keeps working), otherwise the helper default ``agent`` is
-    used.  Both the container dial (``ssh_backend``) and the provision
+    already exports it keeps working), otherwise the helper default ``ubuntu``
+    is used.  Both the container dial (``ssh_backend``) and the provision
     environment (``gateway``) resolve through this one function so they cannot
     drift: if the gateway dials one account but tells the helper another, the
     container sshd's ``AllowUsers`` rejects the login.
@@ -82,7 +82,7 @@ def container_login_user(target: "TargetConfig") -> str:
     override = os.environ.get("COMPUTEMCP_SSH_USER")
     if override:
         return override
-    return "agent"
+    return "ubuntu"
 
 
 @dataclass(frozen=True)
@@ -589,8 +589,8 @@ class TargetConfig:
     # Account the gateway logs into INSIDE the container.  ``user`` is the
     # LOGIN/ROUTE account (e.g. the site account used for the gateway -> login
     # hop); the container sshd only accepts this dedicated account, which the
-    # provisioning helper creates (default ``agent``).  An unset value resolves
-    # to ``agent`` at dial time, matching ``COMPUTEMCP_SSH_USER``.
+    # provisioning helper creates (default ``ubuntu``).  An unset value resolves
+    # to ``ubuntu`` at dial time, matching ``COMPUTEMCP_SSH_USER``.
     container_user: str | None = None
     client_key: str | None = None
     known_hosts: str | None = None
@@ -713,7 +713,7 @@ class TargetConfig:
         if not isinstance(self.user, str):
             raise ConfigError(f"target {self.name!r} user must be a string")
         # ``container_user`` is the account dialed INSIDE the container.  Unset
-        # (None) is allowed and resolves to ``agent`` at dial time.  When set it
+        # (None) is allowed and resolves to ``ubuntu`` at dial time.  When set it
         # must match the helper's own validation: a lowercase shell identifier
         # that is not ``root`` (the bundle refuses to create a root login).
         if self.container_user is not None:

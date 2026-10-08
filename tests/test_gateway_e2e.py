@@ -20,8 +20,8 @@ Covered, with captured request/response JSON:
   *route* user (``target.user``) instead of the container user, the container
   sshd refuses the dial (``AllowUsers agent``) and the gateway returns HTTP
   502 for both exec and files.  With the fix in place (dial the container
-  user, default ``agent``), the same commands return 200.  Both outcomes are
-  asserted so the fix is pinned.
+  user, here the explicit ``container_user = "agent"``), the same commands
+  return 200.  Both outcomes are asserted so the fix is pinned.
 """
 
 from __future__ import annotations

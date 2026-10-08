@@ -338,7 +338,7 @@ class SSHBackend:
         username: str | tuple | None = None,
     ) -> asyncssh.SSHClientConnection:
         # This dials the CONTAINER hop.  The container sshd accepts only its own
-        # login account (``container_user``, default ``agent``), which is a
+        # login account (``container_user``, default ``ubuntu``), which is a
         # different account from ``target.user`` (the gateway -> login/route
         # account).  When no explicit username is threaded through, resolve the
         # container user here.  The direct-transport case reaches the container
