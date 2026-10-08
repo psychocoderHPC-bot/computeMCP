@@ -123,7 +123,7 @@ them, and a default appears in brackets (press Enter to accept it).
 | Question | Meaning |
 | --- | --- |
 | Listen address / Port | Where the gateway serves its HTTP API (default `127.0.0.1:2222`) |
-| Allow interactive enrollment | Written to `[server] allow_enrollment`; default `true`, set `false` to disable the handshake |
+| Allow interactive enrollment | Written to `[server] allow_enrollment`; default `false` (explicit opt-in), set `true` to enable the handshake |
 | Set up a target | Whether to configure a remote system now |
 | Target name | Internal label, e.g. `hal` |
 | Transport | `tunnel` (SSH alias, recommended) or `direct` (host:port) |
@@ -660,8 +660,9 @@ Container-side writing:
   tmux/session manager keeps its old environment); paste the printed
   `environment` block into the MCP entry, or restart from a fresh shell.
 
-Turn it off with `[server] allow_enrollment = false`. `enroll_ttl` (default
-600 s) and `enroll_max_pending` (default 32) bound the unauthenticated surface.
+The endpoint is disabled by default; enable it explicitly with
+`[server] allow_enrollment = true`. `enroll_ttl` (default 600 s) and
+`enroll_max_pending` (default 32) bound the unauthenticated surface.
 
 ## Allow the gateway in the Terok Shield
 

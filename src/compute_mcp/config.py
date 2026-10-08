@@ -774,7 +774,7 @@ class ServerConfig:
     max_body_bytes: int = 256 * 1024 * 1024
     # Out-of-band client enrollment (see enrollment.py).  Approval is always an
     # explicit operator action; these only bound the unauthenticated surface.
-    allow_enrollment: bool = True
+    allow_enrollment: bool = False
     enroll_ttl: float = 600.0
     enroll_max_pending: int = 32
 
@@ -928,6 +928,9 @@ def _load_clients(
 ) -> dict[str, ClientConfig]:
     external_hashes = external_hashes or {}
     clients: dict[str, ClientConfig] = {}
+    # ``sha256:...`` -> first client id that claimed it.  Built incrementally so
+    # insertion order (and therefore the pair named in an error) is deterministic.
+    seen_hashes: dict[str, str] = {}
     table = _require_table(raw, "clients")
     for client_id, value in table.items():
         validate_target_name(client_id)
@@ -957,6 +960,13 @@ def _load_clients(
                     f"[clients.{client_id}] references unknown target {target!r}"
                 )
         label = value.get("label")
+        previous = seen_hashes.get(token_hash)
+        if previous is not None:
+            raise ConfigError(
+                f"clients {previous!r} and {client_id!r} share the same token; "
+                "each client needs a unique token"
+            )
+        seen_hashes[token_hash] = client_id
         clients[client_id] = ClientConfig(
             client_id=client_id,
             token_sha256=token_hash,
@@ -1147,7 +1157,7 @@ def parse_config(
         request_timeout=_float(server_raw.get("request_timeout"), "request_timeout", 30.0),
         exec_timeout=_float(server_raw.get("exec_timeout"), "exec_timeout", 900.0),
         max_body_bytes=_int(server_raw.get("max_body_bytes"), "max_body_bytes", 256 * 1024 * 1024),
-        allow_enrollment=bool(server_raw.get("allow_enrollment", True)),
+        allow_enrollment=bool(server_raw.get("allow_enrollment", False)),
         enroll_ttl=_float(server_raw.get("enroll_ttl"), "server.enroll_ttl", 600.0),
         enroll_max_pending=_int(
             server_raw.get("enroll_max_pending"), "server.enroll_max_pending", 32

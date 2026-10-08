@@ -86,3 +86,30 @@ def test_new_token_has_entropy():
     tokens = {new_token() for _ in range(100)}
     assert len(tokens) == 100
     assert all(len(t) >= 32 for t in tokens)
+
+
+def test_lookup_rejects_multiple_matches():
+    # Construction stays possible; the per-request lookup fails closed rather
+    # than returning an order-dependent ("last wins") match.
+    auth = Authenticator(
+        {
+            "limited": ClientConfig(
+                client_id="limited",
+                token_sha256=hash_token("shared-token"),
+                targets=("hal",),
+            ),
+            "admin": ClientConfig(
+                client_id="admin",
+                token_sha256=hash_token("shared-token"),
+                allow_all=True,
+            ),
+        }
+    )
+    with pytest.raises(AuthError):
+        auth.authenticate_bearer("Bearer shared-token")
+
+
+def test_lookup_single_match_ok():
+    auth = make_auth()
+    client = auth.authenticate_bearer("Bearer alpaka-token")
+    assert client.client_id == "alpaka"

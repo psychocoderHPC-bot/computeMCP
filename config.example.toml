@@ -39,8 +39,8 @@ exec_timeout = 900.0
 max_body_bytes = 268435456
 # Interactive enrollment (computeMCP-handshake).  /v1/enroll is unauthenticated but
 # grants nothing until an operator approves on the console; these bound it.
-# Set allow_enrollment = false to remove the endpoint entirely.
-allow_enrollment = true
+# Disabled by default: set allow_enrollment = true to expose the endpoint.
+allow_enrollment = false
 enroll_ttl = 600.0
 enroll_max_pending = 32
 

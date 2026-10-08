@@ -368,6 +368,53 @@ def test_client_requires_credentials():
         parse_config(raw)
 
 
+def test_duplicate_inline_tokens_rejected():
+    raw = base_raw()
+    raw["clients"] = {
+        "a": {"token": "SAME", "targets": ["hal"]},
+        "b": {"token": "SAME", "targets": ["*"]},
+    }
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw)
+    msg = str(excinfo.value)
+    assert "'a'" in msg and "'b'" in msg
+    assert "unique token" in msg
+
+
+def test_inline_and_tokens_file_duplicate_rejected(tmp_path):
+    from compute_mcp.auth import hash_token
+
+    tokens = tmp_path / "tokens.toml"
+    tokens.write_text(f'[tokens]\nb = "{hash_token("SAME")}"\n')
+    raw = base_raw()
+    raw["clients"] = {
+        "a": {"token": "SAME", "targets": ["hal"]},
+        "b": {"targets": ["*"]},
+    }
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, token_file=str(tokens))
+    msg = str(excinfo.value)
+    assert "'a'" in msg and "'b'" in msg
+    assert "unique token" in msg
+
+
+def test_distinct_tokens_still_accepted():
+    raw = base_raw()
+    raw["clients"] = {
+        "a": {"token": "one", "targets": ["hal"]},
+        "b": {"token": "two", "targets": ["*"]},
+    }
+    cfg = parse_config(raw)
+    assert set(cfg.clients) == {"a", "b"}
+
+
+def test_enrollment_disabled_by_default():
+    assert parse_config(base_raw()).server.allow_enrollment is False
+    raw = base_raw()
+    raw["server"]["allow_enrollment"] = True
+    assert parse_config(raw).server.allow_enrollment is True
+
+
 def test_malformed_toml_is_rejected(tmp_path: Path):
     bad = tmp_path / "config.toml"
     bad.write_text("this is = = not toml")

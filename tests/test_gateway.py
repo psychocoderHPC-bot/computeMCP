@@ -1287,6 +1287,9 @@ async def _enroll_flow(tmp_path, monkeypatch):
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         """
+        [server]
+        allow_enrollment = true
+
         [clients.ci]
         token = "ci-secret"
         targets = ["hal"]
@@ -1404,6 +1407,9 @@ async def test_enroll_approve_include_based_config_succeeds(tmp_path, monkeypatc
         """
         include = ["systems/hal.toml"]
 
+        [server]
+        allow_enrollment = true
+
         [clients.admin]
         token = "admin-token"
         targets = ["*"]
@@ -1472,6 +1478,86 @@ async def test_enroll_disabled_returns_403(tmp_path):
         """
     )
     gw = Gateway(load_config(cfg))
+    client = await make_client(gw)
+    try:
+        resp = await client.post("/v1/enroll", json={"client_id": "x", "targets": []})
+        assert resp.status == 403
+    finally:
+        await client.close()
+
+
+def _colliding_gateway():
+    """Two clients share a token: a limited one and an admin one."""
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    cfg = GatewayConfig(
+        server=ServerConfig(),
+        ssh=SSHConfig(),
+        sessions=SessionConfig(),
+        targets={"hal": target},
+        clients={
+            "limited": ClientConfig(
+                client_id="limited",
+                token_sha256=hash_token("shared-token"),
+                targets=("hal",),
+            ),
+            "extra": ClientConfig(
+                client_id="extra",
+                token_sha256=hash_token("shared-token"),
+                allow_all=True,
+            ),
+        },
+    )
+    return Gateway(cfg)
+
+
+async def test_second_client_with_duplicate_token_cannot_overreach():
+    gw = _colliding_gateway()
+    client = await make_client(gw)
+    try:
+        # The colliding token must not authenticate at all: no union/upgrade.
+        resp = await client.get("/v1/targets", headers=auth("shared-token"))
+        assert resp.status == 401
+    finally:
+        await client.close()
+
+
+async def test_admin_acl_not_widened_by_token_collision():
+    gw = _colliding_gateway()
+    client = await make_client(gw)
+    try:
+        # A request that the admin ACL would allow still fails closed.
+        resp = await client.get("/v1/clients", headers=auth("shared-token"))
+        assert resp.status == 401
+    finally:
+        await client.close()
+
+
+async def test_enroll_disabled_by_default_returns_403():
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    cfg = GatewayConfig(
+        server=ServerConfig(),
+        ssh=SSHConfig(),
+        sessions=SessionConfig(),
+        targets={"hal": target},
+        clients={
+            "admin": ClientConfig(
+                client_id="admin",
+                token_sha256=hash_token("admin-token"),
+                allow_all=True,
+            ),
+        },
+    )
+    gw = Gateway(cfg)
     client = await make_client(gw)
     try:
         resp = await client.post("/v1/enroll", json={"client_id": "x", "targets": []})

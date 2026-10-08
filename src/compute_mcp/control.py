@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -36,6 +37,8 @@ from .config import (
     default_config_path,
     load_config,
 )
+
+log = logging.getLogger("compute_mcp.control")
 
 # Fallback HTTP client timeout for commands that do not know a provisioning
 # deadline (status, clients, reload, ...) and when no flag overrides it.
@@ -65,14 +68,17 @@ def _resolve_token(config_path: str, token_file: str | None,
     # ambient token (e.g. one exported for a MCP client) cannot shadow the
     # gateway this command was pointed at.
     if token:
+        log.debug("token source: flag")
         return token
     operator_token = Path(config_path).parent / OPERATOR_TOKEN_NAME
     if operator_token.is_file():
         text = operator_token.read_text().strip()
         if text:
+            log.debug("token source: operator-token (%s)", operator_token)
             return text
     env = os.environ.get("COMPUTEMCP_TOKEN")
     if env:
+        log.debug("token source: environment (COMPUTEMCP_TOKEN)")
         return env
     # Fall back to reading the plaintext token from a tokens file, if present.
     path = token_file
@@ -91,6 +97,7 @@ def _resolve_token(config_path: str, token_file: str | None,
             if not str(key).startswith("sha256:") and str(value).startswith("sha256:"):
                 continue  # hashed entries can't be reversed to a plaintext token
             if key == client:
+                log.debug("token source: tokens-file (%s)", path)
                 return str(value)
     raise SystemExit(
         "no token available: run --bootstrap (writes an operator token next to "

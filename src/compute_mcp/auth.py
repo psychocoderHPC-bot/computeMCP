@@ -74,12 +74,22 @@ class Authenticator:
         self._hashes = {cid: c.token_sha256 for cid, c in clients.items()}
 
     def _lookup(self, token: str) -> ClientConfig | None:
+        """Resolve the client for ``token``, comparing in constant time.
+
+        If more than one configured client carries the candidate hash the
+        lookup fails closed with :class:`AuthError` instead of returning an
+        order-dependent match.  Config validation rejects duplicate tokens, so
+        this guards any path that bypasses it (e.g. a directly built
+        ``Authenticator``).
+        """
         if not token:
             return None
         candidate = hash_token(token)
         match: ClientConfig | None = None
         for client in self._clients.values():
             if hmac.compare_digest(candidate, client.token_sha256):
+                if match is not None:
+                    raise AuthError("multiple clients share the same token")
                 match = client
         return match
 

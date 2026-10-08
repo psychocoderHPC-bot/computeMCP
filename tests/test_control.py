@@ -456,3 +456,17 @@ def test_resolve_token_falls_back_to_env_without_operator_token(tmp_path, monkey
     config.write_text("")
     monkeypatch.setenv("COMPUTEMCP_TOKEN", "env-token")
     assert _resolve_token(str(config), None, "admin", None) == "env-token"
+
+
+def test_resolve_token_logs_operator_token_source(tmp_path, monkeypatch, caplog):
+    from compute_mcp.config import OPERATOR_TOKEN_NAME
+    from compute_mcp.control import _resolve_token
+
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    (tmp_path / OPERATOR_TOKEN_NAME).write_text("operator-secret\n")
+    monkeypatch.setenv("COMPUTEMCP_TOKEN", "stale-env-token")
+    with caplog.at_level("DEBUG", logger="compute_mcp.control"):
+        token = _resolve_token(str(config), None, "admin", None)
+    assert token == "operator-secret"
+    assert "operator-token" in caplog.text
