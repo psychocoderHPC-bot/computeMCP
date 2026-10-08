@@ -11,9 +11,6 @@
 set -euo pipefail
 umask 077
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CONTAINER_SCRIPT="$SCRIPT_DIR/computemcp-container.sh"
-[ -r "$CONTAINER_SCRIPT" ] || { echo "Missing container script: $CONTAINER_SCRIPT" >&2; exit 1; }
 : "${SLURM_JOB_ID:?Must run inside a Slurm allocation}"
 
 STATE="${COMPUTEMCP_STATE_DIR:-}"
@@ -34,6 +31,23 @@ if [ -n "$SETTINGS" ] && [ -r "$SETTINGS" ]; then
     source "$SETTINGS"
 fi
 STATE="${COMPUTEMCP_STATE_DIR:?COMPUTEMCP_STATE_DIR is required}"
+
+# Resolve the bundle directory.  Slurm may copy this batch script into its spool
+# directory (e.g. JURECA /var/spool/parastation/jobs), so ``BASH_SOURCE`` points
+# at the spool copy where the sibling helpers do not exist.  The provisioning
+# helper exports COMPUTEMCP_BUNDLE_DIR (inherited from the environment or, more
+# reliably, carried by the sourced settings file) and that is authoritative.
+if [ -n "${COMPUTEMCP_BUNDLE_DIR:-}" ]; then
+    SCRIPT_DIR="$COMPUTEMCP_BUNDLE_DIR"
+else
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fi
+CONTAINER_SCRIPT="$SCRIPT_DIR/computemcp-container.sh"
+[ -r "$CONTAINER_SCRIPT" ] || {
+    echo "Missing container script: $CONTAINER_SCRIPT (resolved from COMPUTEMCP_BUNDLE_DIR='${COMPUTEMCP_BUNDLE_DIR:-}')" >&2
+    exit 1
+}
+
 if [ -n "${COMPUTEMCP_SRUN_ARGS:-}" ]; then
     mapfile -t SRUN_ARGS <<< "$COMPUTEMCP_SRUN_ARGS"
 fi

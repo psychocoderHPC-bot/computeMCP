@@ -1426,21 +1426,28 @@ def _make_fake_sandbox(root: Path) -> Path:
 
 
 def _run_apptainer_configure(
-    tmp_path: Path, ssh_user: str | None, port: int
+    tmp_path: Path,
+    ssh_user: str | None,
+    port: int,
+    *,
+    sandbox: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess, Path, Path]:
     """Run the real ``apptainer_configure`` against a fake sandbox.
 
     A stub ``apptainer`` satisfies the helper's ``command -v apptainer`` check;
     the configuration itself only edits ordinary sandbox files with host
-    ``python3``.  Returns (result, sandbox, host_home).
+    ``python3``.  Returns (result, sandbox, host_home).  Pass ``sandbox`` to
+    reuse an already-configured tree (idempotency tests) instead of building a
+    pristine one.
     """
     root = tmp_path / "apptainer"
     bin_dir = root / "bin"
-    bin_dir.mkdir(parents=True)
+    bin_dir.mkdir(parents=True, exist_ok=True)
     apptainer_stub = bin_dir / "apptainer"
     apptainer_stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     apptainer_stub.chmod(0o755)
-    sandbox = _make_fake_sandbox(root)
+    if sandbox is None:
+        sandbox = _make_fake_sandbox(root)
     host_home = root / "hosthome"
     env = dict(os.environ)
     env.update(
@@ -1538,3 +1545,125 @@ def test_apptainer_configure_rejects_invalid_ssh_user(tmp_path):
     result, _, _ = _run_apptainer_configure(tmp_path, "root", _free_port())
     assert result.returncode == 2, result
     assert "Invalid COMPUTEMCP_SSH_USER" in result.stderr, result.stderr
+
+
+def test_apptainer_configure_is_idempotent(tmp_path):
+    """A second configure of an already-renamed sandbox must succeed.
+
+    Regression: every ``ensure_container`` calls ``configure``; after the first
+    run the ``ubuntu`` account no longer exists (it was renamed to the login
+    user), so the old "Expected exactly one existing ubuntu account" check made
+    every subsequent connect abort.  The second run must reconfigure the
+    requested account in place and leave exactly one account behind.
+    """
+    port = _free_port()
+    result, sandbox, _ = _run_apptainer_configure(tmp_path, "agent", port)
+    assert result.returncode == 0, (
+        f"first configure exited {result.returncode}\n"
+        f"stdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    original_backup = (sandbox / "etc/passwd.computemcp-backup").read_bytes()
+
+    second, sandbox2, _ = _run_apptainer_configure(
+        tmp_path, "agent", port, sandbox=sandbox
+    )
+    assert second.returncode == 0, (
+        f"second configure exited {second.returncode}\n"
+        f"stdout:{second.stdout}\nstderr:{second.stderr}"
+    )
+    assert sandbox2 == sandbox
+    accounts = _passwd_account(sandbox)
+    assert "agent" in accounts, accounts
+    assert "ubuntu" not in accounts, accounts
+    names = [line.split(":")[0] for line in
+             (sandbox / "etc/passwd").read_text(encoding="utf-8").splitlines()]
+    assert names.count("agent") == 1, names
+    # The original base-image passwd must not be overwritten on a re-run.
+    assert (
+        sandbox / "etc/passwd.computemcp-backup"
+    ).read_bytes() == original_backup
+
+
+def test_apptainer_configure_rejects_ambiguous_accounts(tmp_path):
+    """Two ``ubuntu`` accounts are ambiguous and must be rejected clearly."""
+    root = tmp_path / "apptainer"
+    sandbox = _make_fake_sandbox(root)
+    with (sandbox / "etc/passwd").open("a", encoding="utf-8") as stream:
+        stream.write("ubuntu:x:1001:1001:Second:/home/ubuntu2:/bin/bash\n")
+    result, _, _ = _run_apptainer_configure(
+        tmp_path, "agent", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode != 0, result
+    assert "Expected exactly one" in result.stderr, result.stderr
+    assert "agent" in result.stderr, result.stderr
+
+
+def test_job_sh_relocated_resolves_bundle_dir_from_settings(tmp_path):
+    """A scheduler-spooled job.sh finds the container script via settings.
+
+    JURECA copies ``computemcp-job.sh`` into ``/var/spool/parastation/jobs/`` and
+    runs it there, so ``BASH_SOURCE`` no longer points at the bundle.  The
+    per-job settings file carries ``COMPUTEMCP_BUNDLE_DIR``; the relocated copy
+    must use it and get past the sibling check (reaching the job step).
+    """
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    relocated = spool / "computemcp-job.sh"
+    shutil.copy2(JOB, relocated)
+    state = tmp_path / "state"
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    srun = stub_bin / "srun"
+    srun.write_text(
+        "#!/bin/sh\necho STUB-SRUN-REACHED >&2\nexit 1\n", encoding="utf-8"
+    )
+    srun.chmod(0o755)
+    settings = tmp_path / "settings"
+    settings.write_text(
+        f"export COMPUTEMCP_STATE_DIR={_shell_quote(str(state))}\n"
+        f"export COMPUTEMCP_BUNDLE_DIR={_shell_quote(str(BUNDLE_DIR))}\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("COMPUTEMCP_BUNDLE_DIR", None)
+    env["SLURM_JOB_ID"] = "9001"
+    env["PATH"] = str(stub_bin) + os.pathsep + os.environ.get("PATH", "")
+    result = subprocess.run(
+        ["bash", str(relocated), str(settings)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=spool,
+    )
+    assert "Missing container script" not in result.stderr, result.stderr
+    # Reaching the stub srun proves the sibling resolution succeeded.
+    assert "STUB-SRUN-REACHED" in result.stderr, result.stderr
+
+
+def test_job_sh_relocated_without_bundle_dir_reports_missing_script(tmp_path):
+    """A relocated copy with no ``COMPUTEMCP_BUNDLE_DIR`` fails clearly."""
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    relocated = spool / "computemcp-job.sh"
+    shutil.copy2(JOB, relocated)
+    state = tmp_path / "state"
+    settings = tmp_path / "settings"
+    settings.write_text(
+        f"export COMPUTEMCP_STATE_DIR={_shell_quote(str(state))}\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("COMPUTEMCP_BUNDLE_DIR", None)
+    env["SLURM_JOB_ID"] = "9002"
+    result = subprocess.run(
+        ["bash", str(relocated), str(settings)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=spool,
+    )
+    assert result.returncode == 1, result
+    assert "Missing container script" in result.stderr, result.stderr
+    assert str(spool) in result.stderr, result.stderr

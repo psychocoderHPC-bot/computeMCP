@@ -284,12 +284,26 @@ if not target("etc/dropbear/dropbear_ed25519_host_key").stat().st_size:
 
 passwd = target("etc/passwd")
 rows = [line.split(":") for line in passwd.read_text().splitlines()]
-accounts = [row for row in rows if row[0] == "ubuntu"]
-if len(accounts) != 1 or len(accounts[0]) != 7:
-    raise SystemExit("Expected exactly one existing ubuntu account")
-account = accounts[0]
+# Idempotency: a first configure renames the base-image ``ubuntu`` account to
+# the requested user, so a second configure (every ``ensure_container``) sees no
+# ``ubuntu`` account and must reconfigure the already-renamed one in place
+# instead of aborting.  Exactly one candidate is accepted; anything else
+# (neither, both, duplicates) is ambiguous and rejected.
+ubuntu_accounts = [row for row in rows if row[0] == "ubuntu"]
+user_accounts = [row for row in rows if row[0] == user]
+candidates = []
+if len(ubuntu_accounts) == 1 and len(ubuntu_accounts[0]) == 7:
+    candidates.append(ubuntu_accounts[0])
+if user != "ubuntu" and len(user_accounts) == 1 and len(user_accounts[0]) == 7:
+    candidates.append(user_accounts[0])
+if len(candidates) != 1:
+    found = ", ".join(f"{row[0]}(uid={row[2]})" for row in rows)
+    raise SystemExit(
+        f"Expected exactly one 'ubuntu' or '{user}' account; found: {found}"
+    )
+account = candidates[0]
 if account[2] == "0":
-    raise SystemExit("Refusing ubuntu account with UID 0")
+    raise SystemExit(f"Refusing account {account[0]!r} with UID 0")
 
 for relative in ("etc/passwd", "etc/shadow"):
     path = target(relative)
@@ -298,6 +312,7 @@ for relative in ("etc/passwd", "etc/shadow"):
         shutil.copy2(path, backup)
 
 # Rename the sandbox account to the gateway's login account, keeping UID/GID.
+original_name = account[0]
 account[0] = user
 account[1] = "*"  # Public-key access only; no usable password.
 account[5] = home
@@ -308,7 +323,9 @@ shadow = target("etc/shadow")
 if shadow.exists():
     rows = [line.split(":") for line in shadow.read_text().splitlines()]
     for row in rows:
-        if row[0] == "ubuntu" and len(row) > 1:
+        # Match the account under either its pre-rename or post-rename name so
+        # a reconfigure of an already-renamed sandbox still normalizes shadow.
+        if row[0] in (original_name, user) and len(row) > 1:
             row[0] = user
             row[1] = "*"
     write("etc/shadow", "".join(":".join(row) + "\n" for row in rows),
