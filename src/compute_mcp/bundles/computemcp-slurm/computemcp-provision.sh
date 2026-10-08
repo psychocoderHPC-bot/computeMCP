@@ -266,8 +266,14 @@ fi
 # Direct mode publishes the container on a real host port.  Docker assigns an
 # ephemeral host port for ``--publish 127.0.0.1::<port>``, so the container
 # port is NOT the endpoint; the container script records the mapping in
-# ``$STATE/container.endpoint`` on start.  Prefer that file, then ask the
-# runtime, and finally fall back to the sandbox's fixed loopback binding.
+# ``$STATE/container.endpoint`` on start.  The live runtime query is
+# authoritative: if the Docker daemon restarts, the container is re-published
+# on a NEW ephemeral host port, so the cached file goes stale and the gateway
+# would forward to a dead port (exec/files 502) until it is refreshed.  The
+# file is therefore only a fallback for when the daemon is unavailable; any
+# live mapping that differs is written back so ``status`` and later calls stay
+# consistent.  Apptainer binds the fixed loopback port, so it never needs a
+# live query or the file.
 is_valid_endpoint() {
     local VALUE="$1" ENDPOINT_PORT="${1##*:}"
     [[ "$VALUE" =~ ^127\.0\.0\.1:[0-9]{1,5}$ ]] || return 1
@@ -276,30 +282,47 @@ is_valid_endpoint() {
 }
 
 resolve_container_endpoint() {
-    local VALUE="" LINE=""
+    local CACHED="" LINE=""
+    # The cached mapping is read once and used only as a fallback now.
     if [ -s "$STATE/container.endpoint" ]; then
-        VALUE="$(head -n 1 "$STATE/container.endpoint" || true)"
-        if is_valid_endpoint "$VALUE"; then
-            printf '%s\n' "$VALUE"
-            return 0
-        fi
+        CACHED="$(head -n 1 "$STATE/container.endpoint" || true)"
+        is_valid_endpoint "$CACHED" || CACHED=""
     fi
     case "$RUNTIME" in
         docker)
+            # Query the daemon first; it knows the current published port even
+            # after a daemon restart changed it.
             if command -v docker >/dev/null 2>&1; then
                 while IFS= read -r LINE; do
                     if is_valid_endpoint "$LINE"; then
+                        if [ "$LINE" != "$CACHED" ]; then
+                            printf '%s\n' "$LINE" > "$STATE/container.endpoint"
+                        fi
                         printf '%s\n' "$LINE"
                         return 0
                     fi
                 done < <(docker container port "$NAME" "$CONTAINER_PORT/tcp" 2>/dev/null || true)
             fi
+            # Daemon unavailable: fall back to the cached mapping, then to the
+            # container port.
+            if [ -n "$CACHED" ]; then
+                printf '%s\n' "$CACHED"
+                return 0
+            fi
+            printf '127.0.0.1:%s\n' "$CONTAINER_PORT"
+            return 0
             ;;
         apptainer)
+            # Apptainer binds the fixed ``127.0.0.1:$CONTAINER_PORT``; a live
+            # query is unnecessary and the file is not consulted.
             printf '127.0.0.1:%s\n' "$CONTAINER_PORT"
             return 0
             ;;
     esac
+    if [ -n "$CACHED" ]; then
+        printf '%s\n' "$CACHED"
+        return 0
+    fi
     return 1
 }
 

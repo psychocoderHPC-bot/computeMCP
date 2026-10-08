@@ -820,6 +820,88 @@ def test_direct_mode_status_reports_published_endpoint(tmp_path, stubs):
         teardown()
 
 
+def test_direct_mode_live_port_beats_stale_cached_endpoint(tmp_path, stubs):
+    """A changed published port heals even with a stale ``container.endpoint``.
+
+    Regression for the daemon-restart staleness bug: the cached endpoint used
+    to be returned whenever it was valid-format, BEFORE the live runtime query,
+    so a Docker daemon restart that re-published the container on a new
+    ephemeral host port left the gateway forwarding to the dead port on every
+    ``status``/``target-refresh``.  The live ``docker container port`` query is
+    now authoritative; a stale file must neither be emitted nor survive the
+    call, and the reported endpoint must match the current published port.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "stale"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / "staletest" / "state"
+    old_port = _published_port(container_port)
+    new_port = _published_port(container_port)
+    assert old_port != new_port and new_port != container_port
+
+    env = _base_env("staletest", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(old_port)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["PATH"] = stubs.direct.shell_path
+
+    def teardown():
+        _cleanup()
+
+    try:
+        first = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=workdir,
+        )
+        assert first.returncode == 0, first.stderr
+        assert (
+            first.stdout.splitlines()[-1].strip()
+            == f"ENDPOINT 127.0.0.1:{old_port}"
+        ), first.stdout
+
+        # Simulate a daemon restart that re-publishes on a new host port: the
+        # stub reports the new mapping while the cached file still holds the
+        # dead one.
+        endpoint_file = state_dir / "container.endpoint"
+        endpoint_file.write_text(f"127.0.0.1:{old_port}\n", encoding="utf-8")
+        env["DOCKER_STUB_PUBLISHED_PORT"] = str(new_port)
+
+        second = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=workdir,
+        )
+        assert second.returncode == 0, second.stderr
+        assert (
+            second.stdout.splitlines()[-1].strip()
+            == f"ENDPOINT 127.0.0.1:{new_port}"
+        ), second.stdout
+        # The stale file was refreshed to the live mapping.
+        assert endpoint_file.read_text().strip() == f"127.0.0.1:{new_port}"
+
+        status = subprocess.run(
+            ["bash", str(PROVISION), "status"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=workdir,
+        )
+        assert status.returncode == 0, status.stderr
+        assert f"endpoint: 127.0.0.1:{new_port}" in status.stdout, status.stdout
+        assert f"endpoint: 127.0.0.1:{old_port}" not in status.stdout
+    finally:
+        teardown()
+
+
 def test_direct_stop_without_container_runtime_env(tmp_path, stubs):
     """``stop`` with only COMPUTEMCP_STATE_DIR must still stop the container.
 

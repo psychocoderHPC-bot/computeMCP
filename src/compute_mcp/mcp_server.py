@@ -340,6 +340,16 @@ def build_server(client: GatewayClient) -> MCPServer:
         implementation to a remote agent, but bring the results back for local
         review under the Terok rules: remote agents lack the Terok skills, so
         their output must not be trusted blindly.
+
+        A target can be backed by a development container (its own `container`
+        block, or a `bundle` that provisions one). The account the gateway logs
+        into INSIDE that container is the target's `container_user` (default
+        `agent`); it is a different account from the `user` that logs into the
+        route host, and dialing the wrong one is refused by the container's
+        sshd. That configuration is not echoed back here, but when a container
+        target is connected its `provisioned_endpoint` reports the address the
+        gateway dials (the container's published loopback host:port, or the
+        allocation relay's local port), and `null` when no endpoint is active.
         """
         return await client.request("GET", "/v1/targets")
 
@@ -367,6 +377,15 @@ def build_server(client: GatewayClient) -> MCPServer:
         remote agent, but bring the results back for local review under the Terok
         rules: remote agents lack the Terok skills, so their output must not be
         trusted blindly.
+
+        When the target is backed by a development container (its own
+        `container` block, or a `bundle` that provisions one), `provisioned_endpoint`
+        reports the address the gateway currently dials for it (the container's
+        published loopback host:port, or the allocation relay's local port), or
+        `null` when no endpoint is active. The login account inside that
+        container is the configured `container_user` (default `agent`), which is
+        distinct from the route-host `user`; the status payload does not echo
+        either account.
         """
         return await client.request("GET", f"/v1/targets/{target}")
 
