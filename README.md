@@ -701,13 +701,17 @@ happens on the host, never inside the container** (see step 3).
 1. **Install the MCP bridge in the task** (not on the host):
 
    ```bash
-   pipx install <this-package>       # isolated env, commands on PATH
-   pipx ensurepath                   # once, if ~/.local/bin is not yet on PATH
+   # Terok container: `~/.local` is owned by root, so pipx cannot create its
+   # venvs and `pipx install .` fails with a permission error. Fix it once:
+   sudo chown -R dev:dev ~/.local     # one-time fix for this container
+   pipx install .                     # install from the current folder
+   pipx ensurepath                    # once; makes ~/.local/bin available in new shells
    ```
 
-   pipx exposes `computeMCP-mcp` and `computeMCP-handshake` on `PATH`, so there
-   is no virtualenv to activate and no symlink to create. The MCP entry below
-   calls `computeMCP-mcp` directly.
+   On a normal host the `chown` line is unnecessary. pipx exposes
+   `computeMCP-mcp` and `computeMCP-handshake` on `PATH`, so there is no
+   virtualenv to activate and no symlink to create. The MCP entry below calls
+   `computeMCP-mcp` directly.
 
 2. **Allow the gateway through the Terok Shield** (default-deny). See
    [Allow the gateway in the Terok Shield](#allow-the-gateway-in-the-terok-shield);
