@@ -74,6 +74,11 @@ log = logging.getLogger("compute_mcp.gateway")
 
 RECOVERY_POLL_SECONDS = 5.0
 
+# A close command may need a short-lived route connection when the live tunnel
+# is already gone (gateway shutdown after a lost route).  Bound the dial so
+# shutdown cannot hang on an unreachable login node.
+_CLOSE_ROUTE_TIMEOUT = 15.0
+
 
 def _container_env_fields(target: TargetConfig) -> dict[str, str]:
     """The container-description fields of the gateway->provisioner contract.
@@ -720,12 +725,6 @@ class Gateway:
             return
         runtime = self.runtimes[name]
         connection = runtime.tunnel.connection if runtime.tunnel else None
-        if connection is None:
-            log.warning(
-                "target %s: close_command skipped, no live route connection",
-                name,
-            )
-            return
         route = runtime.active_route or (
             target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
         )
@@ -738,12 +737,66 @@ class Gateway:
         close_kwargs: dict[str, Any] = {}
         if provision_env is not None:
             close_kwargs["provision_env"] = provision_env
+
+        if connection is not None:
+            await self._run_close_on_connection(
+                name, target, route, connection, close_kwargs
+            )
+            return
+
+        # No live tunnel: at shutdown (or after a lost route) the route
+        # connection is gone, but the login node is the only place that can
+        # scancel.  Open a short-lived route connection and run the close over
+        # it, bounded so a dead login node cannot stall shutdown.  Direct
+        # transport has no separate login node to dial, so keep the old no-op.
+        if target.transport.kind == "direct":
+            log.warning(
+                "target %s: close_command skipped, no live route connection",
+                name,
+            )
+            return
+        short_route = None
+        try:
+            short_route = await self.tunnels.open_route_connection(
+                target, route, connection_timeout=_CLOSE_ROUTE_TIMEOUT
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+            log.warning(
+                "target %s: close_command skipped, could not open a route "
+                "connection: %s",
+                name,
+                exc,
+            )
+            return
+        try:
+            await self._run_close_on_connection(
+                name, target, route, short_route, close_kwargs
+            )
+        finally:
+            await self._close_route_connection(short_route)
+
+    async def _run_close_on_connection(
+        self,
+        name: str,
+        target: TargetConfig,
+        route: str,
+        connection: Any,
+        close_kwargs: dict[str, Any],
+    ) -> None:
+        """Run the close command over ``connection``; advisory, never raises."""
         try:
             await self.tunnels.run_close_command(
                 target, route, connection=connection, **close_kwargs
             )
         except Exception as exc:  # noqa: BLE001 - advisory, never fatal
             log.warning("target %s: close_command failed: %s", name, exc)
+
+    async def _close_route_connection(self, connection: Any) -> None:
+        """Close a short-lived route connection; failures are swallowed."""
+        with contextlib.suppress(Exception):
+            connection.close()
+        with contextlib.suppress(Exception):
+            await connection.wait_closed()
 
     async def _stop_locked(self, name: str) -> None:
         runtime = self.runtimes[name]

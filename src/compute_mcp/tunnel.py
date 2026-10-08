@@ -322,8 +322,17 @@ async def _dial_hop(
     name: str,
     fallback_user: str,
     passphrase: str | None = None,
+    connect_timeout: float | None = None,
 ) -> asyncssh.SSHClientConnection:
-    """Dial one route hop, optionally through an already-open jump connection."""
+    """Dial one route hop, optionally through an already-open jump connection.
+
+    ``connect_timeout`` overrides ``ssh.connect_timeout`` for this dial; the
+    short-lived route used during gateway shutdown passes a small value so a
+    slow login node cannot stall teardown.
+    """
+    ssh_timeout = (
+        connect_timeout if connect_timeout is not None else ssh.connect_timeout
+    )
     host = info["hostname"]
     port = info["port"]
     # asyncssh's "unset" sentinel is (), not None: passing None crashes in
@@ -344,7 +353,7 @@ async def _dial_hop(
             known_hosts=None,
             host_key_algorithms=(),
             host_key_check="on",
-            connect_timeout=ssh.connect_timeout,
+            connect_timeout=ssh_timeout,
             keepalive_interval=ssh.server_alive_interval,
             keepalive_count_max=ssh.server_alive_count_max,
         )
@@ -370,7 +379,7 @@ async def _dial_hop(
             client_factory=client_factory,
             server_host_key_algs=(),
             tunnel=tunnel,
-            connect_timeout=ssh.connect_timeout,
+            connect_timeout=ssh_timeout,
             keepalive_interval=ssh.server_alive_interval,
             keepalive_count_max=ssh.server_alive_count_max,
         )
@@ -460,6 +469,67 @@ class TunnelManager:
     def __init__(self, ssh: SSHConfig) -> None:
         self.ssh = ssh
         self._reserved: set[int] = set()
+
+    async def open_route_connection(
+        self,
+        target: TargetConfig,
+        route: str,
+        connection_timeout: float | None = None,
+    ) -> asyncssh.SSHClientConnection:
+        """Open a route connection without provisioning or local forwarding.
+
+        This is the dial half of :meth:`open_for_route`: it resolves the route,
+        applies a configured ``proxy_jump`` and dials the hop chain, but never
+        runs the provision command and never calls ``forward_local_port``.  It
+        exists for advisory work that only needs a shell on the login/route
+        node, such as running the close command during gateway shutdown when no
+        live tunnel remains.
+
+        ``connection_timeout`` overrides ``ssh.connect_timeout`` for the dial;
+        callers that must not stall shutdown pass a small value.  Direct
+        transport is rejected: there is no login node to dial separately.
+        """
+        if target.transport.kind == "direct":
+            raise TunnelError(
+                f"target {target.name!r}: no route connection for direct transport"
+            )
+
+        route_info = await _resolve_route(route, self.ssh)
+        proxy_jump = target.transport.proxy_jump
+        if proxy_jump:
+            route_info = await _apply_configured_proxy_jump(
+                route, route_info, proxy_jump, self.ssh
+            )
+
+        client_keys = _route_client_keys(target, route_info)
+        pin = target.route_host_key_sha256 or None
+
+        opened: list[asyncssh.SSHClientConnection] = []
+        conn: asyncssh.SSHClientConnection | None = None
+        try:
+            for hop in _iter_hops(route_info):
+                is_final = hop is route_info
+                tunnel_conn = await _dial_hop(
+                    hop,
+                    tunnel=conn,
+                    client_keys=client_keys,
+                    prompter=None,
+                    pin=pin if is_final else None,
+                    ssh=self.ssh,
+                    name=route,
+                    fallback_user=target.user,
+                    passphrase=None,
+                    connect_timeout=connection_timeout,
+                )
+                opened.append(tunnel_conn)
+                conn = tunnel_conn
+        except (SSHError, TunnelError, asyncssh.KeyImportError) as exc:
+            for opened_conn in reversed(opened):
+                await _close_connection(opened_conn)
+            raise TunnelError(f"route {route!r} connection failed: {exc}") from exc
+
+        assert conn is not None  # _iter_hops always yields at least the route
+        return conn
 
     async def open_for_route(
         self,

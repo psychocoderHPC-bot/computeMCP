@@ -2620,6 +2620,70 @@ async def test_gateway_stop_runs_close_command_for_connected_target(monkeypatch)
     assert calls[0]["connection"] is conn
 
 
+async def test_stop_target_releases_when_tunnel_already_gone(monkeypatch):
+    """A lost tunnel still releases the allocation on stop/shutdown.
+
+    Regression: at gateway shutdown ``runtime.tunnel`` is ``None``, so
+    ``_run_close_command`` skipped the close entirely and the Slurm job kept
+    running until its wall clock expired.  The fix dials a short-lived route.
+    """
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    # Tunnel already gone, exactly as during shutdown after a lost route.
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.tunnel = None
+    calls = _record_close(gw, monkeypatch)
+    fresh = _FakeTunnel(target, route="hal", local_port=0, connection=object())
+    dialed = []
+
+    async def fake_open_route_connection(t, route, connection_timeout=None):
+        dialed.append((t.name, route, connection_timeout))
+        return fresh
+
+    monkeypatch.setattr(
+        gw.tunnels, "open_route_connection", fake_open_route_connection
+    )
+
+    await gw.stop_target("hal")
+
+    # The close ran even though no live tunnel connection existed.
+    assert dialed == [("hal", "hal", 15.0)]
+    assert len(calls) == 1
+    assert calls[0]["connection"] is fresh
+    assert calls[0]["tunnel_alive"] is False
+    assert gw.runtimes["hal"].tunnel is None
+    assert gw.runtimes["hal"].state == "disconnected"
+
+
+async def test_stop_target_swallows_failed_short_route_dial(monkeypatch):
+    """A failing fresh-route dial is advisory: teardown still completes."""
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.tunnel = None
+    calls = _record_close(gw, monkeypatch)
+
+    async def fake_open_route_connection(t, route, connection_timeout=None):
+        raise RuntimeError("login node unreachable")
+
+    monkeypatch.setattr(
+        gw.tunnels, "open_route_connection", fake_open_route_connection
+    )
+
+    # Must not raise even though the route dial failed.
+    await gw.stop_target("hal")
+
+    assert calls == []
+    assert gw.runtimes["hal"].tunnel is None
+    assert gw.runtimes["hal"].state == "disconnected"
+
+
 async def test_apply_config_removal_does_not_run_close_command(monkeypatch):
     gw, target = _close_gateway()
     monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
@@ -2639,6 +2703,13 @@ async def test_apply_config_removal_does_not_run_close_command(monkeypatch):
 
 
 async def test_close_command_skipped_without_live_connection(monkeypatch, caplog):
+    """Without a live tunnel the gateway attempts a short-lived route.
+
+    On main ``_run_close_command`` returned immediately when ``tunnel`` was
+    ``None``, leaking the allocation at shutdown.  The fix dials a fresh route;
+    here that dial fails (bogus key), so the close is still skipped but only
+    because the advisory dial failed, and teardown completes.
+    """
     gw, target = _close_gateway()
     monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
     monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
@@ -2649,8 +2720,9 @@ async def test_close_command_skipped_without_live_connection(monkeypatch, caplog
     with caplog.at_level("WARNING"):
         result = await gw.stop_target("hal")
 
-    assert calls == []  # not invoked without a connection
-    assert "no live route connection" in caplog.text
+    # The close was not invoked because the short-lived route dial failed.
+    assert calls == []
+    assert "could not open a route connection" in caplog.text
     assert result["state"] == "disconnected"
 
 
