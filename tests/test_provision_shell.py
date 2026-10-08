@@ -1839,6 +1839,91 @@ def test_apptainer_configure_rejects_ambiguous_managed_accounts(tmp_path):
     assert "ubuntu" in result.stderr, result.stderr
 
 
+def test_apptainer_start_after_rename_uses_new_shell_path(tmp_path):
+    """``start`` checks the renamed account's shell, not the stale old file.
+
+    A sandbox configured while the container user was ``agent`` carries a
+    ``computemcp-agent-shell`` file; renaming the account to ``ubuntu`` adds
+    ``computemcp-ubuntu-shell`` but leaves the old file in place.  The start
+    gate must check ``computemcp-<SSH_USER>-shell`` only, so the stale file is
+    harmless and start proceeds past the gate and the authorized_keys check to
+    ``apptainer instance start`` (the stub only records its argv, so the run
+    then stops at the SSH banner wait).
+    """
+    root = tmp_path / "apptainer"
+    sandbox = _make_previously_managed_sandbox(root, "agent")
+    stale = sandbox / "usr/local/bin/computemcp-agent-shell"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stale.chmod(0o755)  # a stale configured shell, exactly as a real build left it
+
+    result, sandbox, host_home = _run_apptainer_configure(
+        tmp_path, "ubuntu", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode == 0, (
+        f"configure exited {result.returncode}\n"
+        f"stdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    accounts = _passwd_account(sandbox)
+    assert "ubuntu" in accounts, accounts
+    assert "agent" not in accounts, accounts
+    shell = sandbox / "usr/local/bin/computemcp-ubuntu-shell"
+    assert shell.is_file(), shell
+    assert os.access(shell, os.X_OK)
+    # The stale file is left in place by configure; start must ignore it.
+    assert stale.is_file(), stale
+
+    # Silently failing the stub is not enough: record its argv so the run can
+    # be proven to have reached ``apptainer instance start``.
+    stub = root / "bin" / "apptainer"
+    calls = root / "apptainer-calls.log"
+    stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\nexit 0\n", encoding="utf-8")
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+            "COMPUTEMCP_SYSTEM": "apstart",
+            "COMPUTEMCP_SANDBOX_DIR": str(sandbox),
+            "COMPUTEMCP_HOST_HOME": str(host_home),
+            "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
+            "COMPUTEMCP_STORAGE_ROOT": str(root / "storage"),
+            "COMPUTEMCP_SSH_USER": "ubuntu",
+            "COMPUTEMCP_SSH_WAIT_SECONDS": "2",
+        }
+    )
+    # The remote uid makes the instance name unique, but this node still serves
+    # the loopback banner for the container port, so keep the free fixed port.
+    port = _free_port()
+    env["COMPUTEMCP_CONTAINER_PORT"] = str(port)
+    env["PATH"] = str(root / "bin") + os.pathsep + env["PATH"]
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "start"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=root,
+    )
+    # Not the missing-configure gate...
+    assert "Run configure once before starting this existing sandbox." not in (
+        result.stderr
+    ), result.stderr
+    # ...and not the authorized_keys gate either.
+    assert "Missing authorized_keys" not in result.stderr, result.stderr
+    # The recorded argv proves start passed both gates and started the instance.
+    assert calls.is_file(), result.stderr
+    calls_text = calls.read_text(encoding="utf-8")
+    assert "instance start" in calls_text, calls_text
+    assert f"--bind {host_home}:/home/ubuntu" in calls_text, calls_text
+    # The stub serves no SSH banner, so the run stops at the banner wait.
+    assert "Apptainer SSH endpoint did not become ready." in result.stderr, (
+        result.returncode,
+        result.stdout,
+        result.stderr,
+    )
+
+
 def test_apptainer_configure_rejects_ambiguous_accounts(tmp_path):
     """Two ``ubuntu`` accounts are ambiguous and must be rejected clearly."""
     root = tmp_path / "apptainer"
