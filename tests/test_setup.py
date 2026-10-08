@@ -10,6 +10,7 @@ token is stored hashed, and that a bad append rolls back.
 
 from __future__ import annotations
 
+import re
 import tomllib
 
 import pytest
@@ -258,37 +259,313 @@ def test_target_block_no_duplicate_key_across_comment_and_active():
         seen.add(ident)
 
 
-def test_uncomment_single_option_still_loads(tmp_path):
-    # Each option in the matrix is present as a commented default in the
-    # unmodified target file; uncommenting exactly that one must keep the
-    # config loadable.
-    options = [
-        "provision_timeout",
-        "connect_command_mode",
-        "sandbox",
-        "auto-deploy",
-        "storage-root",
-        "gpus",
-        "known_hosts",
-        "proxy_jump",
-        "connect_backoff_max",
+# Representative answer sets: plain tunnel, tunnel+container (apptainer and
+# docker) with bundle, 2FA, and a full Slurm target.  Each must render into a
+# config that loads, and every commented option line in it must keep the
+# config loadable when that single line is uncommented.
+def _exhaustive_targets():
+    return [
+        # (a) plain tunnel
+        TargetAnswers(
+            name="plain",
+            ssh_targets=("plain",),
+            user="agent",
+            client_key="/home/u/.ssh/k",
+        ),
+        # (b) tunnel + apptainer container + bundle, fingerprint so
+        # host_key_check stays "on"
+        TargetAnswers(
+            name="rosa",
+            ssh_targets=("rosa",),
+            user="agent",
+            client_key="/home/u/.ssh/k",
+            host_key_sha256="SHA256:" + "a" * 40,
+            auto_connect=False,
+            container_runtime="apptainer",
+            container_storage_root="$HOME/computemcp",
+            bundle=True,
+        ),
+        # (c) tunnel + docker container + bundle
+        TargetAnswers(
+            name="dock",
+            ssh_targets=("dock",),
+            user="agent",
+            client_key="/home/u/.ssh/k",
+            host_key_sha256=None,
+            host_key_check="off",
+            container_runtime="docker",
+            container_storage_root="$HOME/computemcp",
+            bundle=True,
+        ),
+        # (d) direct
+        TargetAnswers(
+            name="dial",
+            transport="direct",
+            direct_host="10.0.0.5",
+            direct_port=2222,
+            user="agent",
+            client_key="/k",
+        ),
+        # (e) 2FA tunnel target
+        TargetAnswers(
+            name="otp",
+            ssh_targets=("otp",),
+            user="agent",
+            client_key="/k",
+            interactive_auth=True,
+            auto_connect=False,
+        ),
+        # (f) full Slurm target (node, allocation, sbatch, srun)
+        TargetAnswers(
+            name="rosi",
+            ssh_targets=("rosi",),
+            user="agent",
+            client_key="/home/u/.ssh/k",
+            host_key_sha256="SHA256:" + "a" * 40,
+            auto_connect=False,
+            container_runtime="apptainer",
+            container_storage_root="$HOME/computemcp",
+            bundle=True,
+            node_cpus=24,
+            node_gpus=4,
+            node_memory="378000M",
+            allocation_single="gpu-proportional",
+            allocation_multi="exclusive",
+            allocation_max_nodes=4,
+            sbatch_partition="gpu",
+            sbatch_time="02:00:00",
+            srun_cpu_bind="none",
+        ),
     ]
-    config_path, _ = _write_and_render(tmp_path, _discovery_target())
-    target_path = tmp_path / "systems" / "rosi.toml"
-    original_text = target_path.read_text()
-    # The unmodified file must load.
-    load_config(config_path)
-    for option in options:
-        wanted = f"# {option} = "
-        matching = [line for line in original_text.splitlines() if line.startswith(wanted)]
-        assert matching, f"no commented default for {option}"
-        line = matching[0]
-        stripped = line[2:]  # drop the leading "# "
-        target_path.write_text(original_text.replace(line, stripped, 1))
+
+
+def _target_option_lines(text):
+    """Commented option lines of a rendered target, counting occurrences.
+
+    A prose comment line (file prologue, inline notes) is not ``# key = value``
+    and is skipped; an option line uncommented from within the file that
+    defines it belongs to the table open at its position, so each table key is
+    only exercised once.
+    """
+    lines: list[tuple[str, tuple[str, str]]] = []
+    table = ""
+    seen: set[tuple[str, str]] = set()
+    for line in text.splitlines():
+        if line.startswith("# "):
+            body = line[2:]
+            key, sep, _value = body.partition(" = ")
+            if sep and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key):
+                if (table, key) not in seen:
+                    seen.add((table, key))
+                    lines.append((line, (table, key)))
+        elif line.startswith("[") and line.endswith("]"):
+            table = line[1:-1]
+    return lines
+
+
+def _main_config_option_lines(text):
+    """Commented option lines of the main gateway config.
+
+    Prose lines (the file prologue starts with uppercase) are not of the shape
+    ``# key = `` and are skipped; the option lines carry the defaults the
+    [server] table would pick up when uncommented.
+    """
+    return [
+        line
+        for line in text.splitlines()
+        if re.match(r"^# [a-z][a-z_]* = ", line)
+    ]
+
+
+def test_every_commented_default_loads_when_uncommented(tmp_path):
+    """Exhaustive sweep: every commented option line must load uncommented.
+
+    Each target of the matrix renders into a real include-based config; then
+    every commented option line (prose skipped) is uncommented one at a time
+    and ``load_config`` must succeed.  ``route_host_key_sha256`` is the one
+    deliberate exception: its literal ``SHA256:...`` is a kept placeholder
+    that is valid TOML but rejected by the fingerprint format check, so it is
+    verified separately in
+    :func:`test_route_fingerprint_placeholder_is_valid_toml` while a
+    format-complete fingerprint on the same line must load here.
+    """
+    exercised = 0
+    failures: list[str] = []
+    targets = _exhaustive_targets()
+    for answers in targets:
+        config_path = tmp_path / answers.name / "config.toml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path = config_path.parent / "tokens.toml"
+        token_path.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+        config_path.write_text(
+            render_gateway_config(
+                listen="127.0.0.1",
+                port=2222,
+                allow_enrollment=True,
+                client_id="alpaka",
+                client_targets=("*",),
+                client_label=None,
+                token_file=str(token_path),
+                include=[target_relative_path(answers.name)],
+            )
+        )
+        target_path = write_target_file(config_path.parent, answers)
+        # Main config: only the root ``key = `` option lines (prose is
+        # uppercase and therefore not matched).
+        main_text = config_path.read_text()
         try:
             load_config(config_path)
+        except ConfigError as exc:
+            failures.append(f"target {answers.name}: base config does not load: {exc}")
+        for line in _main_config_option_lines(main_text):
+            exercised += 1
+            variant = main_text.replace(line, line[2:], 1)
+            config_path.write_text(variant)
+            try:
+                load_config(config_path)
+            except ConfigError as exc:
+                failures.append(
+                    f"main config ({answers.name}): {line!r}\n"
+                    f"    {_classify(exc) if _looks_like_toml_error(exc) else 'rejected: ' + str(exc)}"
+                )
+            finally:
+                config_path.write_text(main_text)
+        # Target file: every table-scoped option line exactly once.
+        original_text = target_path.read_text()
+        for line, where in _target_option_lines(original_text):
+            exercised += 1
+            variant = original_text.replace(line, line[2:], 1)
+            target_path.write_text(variant)
+            try:
+                load_config(config_path)
+            except ConfigError as exc:
+                if (
+                    where[1] == "route_host_key_sha256"
+                    and "must look like" in str(exc)
+                ):
+                    # The kept SHA256:... placeholder; covered by
+                    # test_route_fingerprint_placeholder_is_valid_toml,
+                    # which also proves a full fingerprint loads.
+                    continue
+                failures.append(
+                    f"target {answers.name} [{where[0] or 'root'}] {line!r}\n"
+                    f"    {_classify(exc) if _looks_like_toml_error(exc) else 'rejected: ' + str(exc)}"
+                )
+            finally:
+                target_path.write_text(original_text)
+    assert exercised, "no commented option lines were exercised at all"
+    assert not failures, "uncommentable commented defaults:\n" + "\n".join(failures)
+    # Report what the sweep covered.
+    print(f"exercised {exercised} commented option lines across {len(targets)} targets; zero fail")
+
+
+def _looks_like_toml_error(exc: ConfigError) -> bool:
+    text = str(exc)
+    return "malformed TOML" in text or "TOMLDecodeError" in text
+
+
+def _classify(exc: ConfigError) -> str:
+    text = str(exc)
+    if "malformed TOML" in text or "TOMLDecodeError" in text:
+        return f"invalid TOML: {text}"
+    return f"loaded as TOML but rejected by the loader: {text}"
+
+
+def test_route_fingerprint_placeholder_is_valid_toml(tmp_path):
+    """The ``SHA256:...`` placeholder is valid TOML while a full fingerprint loads.
+
+    The route host-key check requires ``SHA256:`` plus more than 12 characters;
+    the literal ``SHA256:...`` is therefore a clearly marked placeholder
+    (valid TOML, rejected by the loader until a real fingerprint is swapped
+    into the same line) -- exactly the flow the operator performs.  A
+    format-complete fingerprint on the same line must load.
+    """
+    token_path = tmp_path / "tokens.toml"
+    token_path.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        render_gateway_config(
+            listen="127.0.0.1", port=2222, allow_enrollment=False,
+            client_id="alpaka", client_targets=("*",), client_label=None,
+            token_file=str(token_path),
+            include=[target_relative_path("rosi")],
+        )
+    )
+    path = write_target_file(tmp_path, _discovery_target())
+    base_text = path.read_text()
+    placeholder = '# route_host_key_sha256 = "SHA256:..."'
+    assert base_text.count(placeholder) == 1
+
+    fingerprint = "SHA256:" + "a" * 40
+    full_line = f'# route_host_key_sha256 = "{fingerprint}"'
+    for line, expect_load in ((placeholder, False), (full_line, True)):
+        # Substitute the value first (stays valid TOML), then uncomment the
+        # single commented option at its line.
+        candidate = base_text.replace(placeholder, line, 1)
+        tomllib.loads(candidate)
+        candidate = candidate.replace(line, line[2:], 1)
+        tomllib.loads(candidate)
+        path.write_text(candidate)
+        try:
+            if expect_load:
+                load_config(config_path)
+            else:
+                with pytest.raises(ConfigError, match="SHA256"):
+                    load_config(config_path)
         finally:
-            target_path.write_text(original_text)
+            path.write_text(base_text)
+
+
+def test_commented_bundle_deploy_dir_default():
+    # A bundle target without an explicit deploy dir shows the documented
+    # default location, which loads when uncommented.
+    answers = TargetAnswers(
+        name="rosi",
+        ssh_targets=("rosi",),
+        user="agent",
+        client_key="/k",
+        container_runtime="apptainer",
+        bundle=True,
+    )
+    assert '# deploy-dir = "$HOME/computemcp/bundle"' in render_target_block(answers)
+
+
+def test_commented_default_values_are_valid():
+    # The apptainer+bundle discovery target carries the corrected values.
+    block = render_target_block(_discovery_target())
+    assert '# container_user = "agent"' in block
+    assert '# route_host_key_sha256 = "SHA256:..."' in block
+    assert '# host-home = "$HOME/computemcp/rosi/home"' in block
+    # Runtime-appropriate image per target: docker:// for Apptainer (which
+    # cannot pull docker tags), plain tag for Docker.
+    apptainer_block = render_target_block(
+        TargetAnswers(
+            name="hal",
+            ssh_targets=("hal",),
+            user="agent",
+            client_key="/k",
+            container_runtime="apptainer",
+        )
+    )
+    docker_block = render_target_block(
+        TargetAnswers(
+            name="hal",
+            ssh_targets=("hal",),
+            user="agent",
+            client_key="/k",
+            container_runtime="docker",
+        )
+    )
+    assert '# image = "docker://ubuntu:24.04"' in apptainer_block
+    assert '# image = "ubuntu:24.04"' in docker_block
+    # host-home substitutes the target name and is non-empty; it also shows
+    # for the docker target above.
+    assert f'# host-home = "$HOME/computemcp/hal/home"' in docker_block
+    assert f'# host-home = "$HOME/computemcp/hal/home"' in apptainer_block
+    assert '# route_host_key_sha256 = "SHA256:..."' in docker_block
+    assert '# route_host_key_sha256 = "SHA256:..."' in apptainer_block
+    assert '# container_user = "agent"' in docker_block
+    assert '# container_user = "agent"' in apptainer_block
 
 
 def test_bootstrap_main_config_commented_defaults_parse_and_load(tmp_path):

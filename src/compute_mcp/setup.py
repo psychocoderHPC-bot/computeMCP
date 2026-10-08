@@ -377,7 +377,11 @@ def render_target_block(answers: TargetAnswers) -> str:
     # Discovery defaults for every root scalar the loader knows but the wizard
     # did not ask about (or that stays at its default).  ``proxy_jump`` is only
     # meaningful for tunnel transport; deriving it from an empty user for a
-    # tunnel would yield "" which the loader rejects, so it is guarded.
+    # tunnel would yield "" which the loader rejects, so it is guarded.  Every
+    # commented value keeps one invariant: uncommenting any single line must
+    # still load.  Values the loader rejects when empty (container user,
+    # fingerprints, non-empty strings) therefore show the fully resolved
+    # default rather than "".
     root_active = {
         key
         for key, present in (
@@ -393,10 +397,15 @@ def render_target_block(answers: TargetAnswers) -> str:
         )
         if present
     }
-    root_entries: list[tuple[str, object]] = [("container_user", "")]
+    # container_user = "agent" mirrors the dial-time resolution
+    # (TargetConfig.container_user unset -> "agent").
+    root_entries: list[tuple[str, object]] = [("container_user", "agent")]
     if not answers.host_key_sha256:
         root_entries.append(("known_hosts", ""))
-    root_entries.append(("route_host_key_sha256", ""))
+    # An obviously-placeholder SHA256 reference (valid TOML; the loader
+    # rejects it until a real fingerprint is swapped into the line -- the
+    # same swap the operator performs for the fingerprint question).
+    root_entries.append(("route_host_key_sha256", "SHA256:..."))
     if answers.host_key_check == "on":
         root_entries.append(("host_key_check", "on"))
     root_entries.append(("host_key_algorithms", []))
@@ -437,7 +446,7 @@ def render_target_block(answers: TargetAnswers) -> str:
             ("provision-env", []),
         ]
         if not answers.bundle_deploy_dir:
-            bundle_entries.insert(0, ("deploy-dir", ""))
+            bundle_entries.insert(0, ("deploy-dir", "$HOME/computemcp/bundle"))
         bundle_active = {
             key
             for key, present in (
@@ -465,11 +474,22 @@ def render_target_block(answers: TargetAnswers) -> str:
             # discovery default is the wizard's own default rather than "".
             container_entries.append(("storage-root", "$HOME/computemcp"))
         if not answers.container_image:
-            container_entries.append(("image", ""))
+            # A real reference that loads when uncommented: Apptainer needs
+            # the docker:// transport, Docker runs the plain tag.
+            container_entries.append(
+                (
+                    "image",
+                    "docker://ubuntu:24.04"
+                    if answers.container_runtime == "apptainer"
+                    else "ubuntu:24.04",
+                )
+            )
         if not answers.container_gpus:
             container_entries.append(("gpus", []))
         if not answers.container_host_home:
-            container_entries.append(("host-home", ""))
+            container_entries.append(
+                ("host-home", f"$HOME/computemcp/{answers.name}/home")
+            )
         container_entries.append(("sandbox", False))
         container_active = {
             key
