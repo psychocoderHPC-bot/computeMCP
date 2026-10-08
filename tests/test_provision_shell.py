@@ -416,6 +416,28 @@ fi
 exec "$@"
 '''
 
+# A dedicated srun stub for the restrictive-export regression: before running
+# the requested step it strips the batch script's runtime environment, exactly
+# as a restrictive sbatch --export policy (e.g. --export=SLURM_SUBMIT_DIR=...)
+# does.  The step must therefore re-source the per-job settings file itself.
+# The relay's ``--connect`` step is left untouched (it does not depend on the
+# container configuration), so the Slurm-mode flow still terminates cleanly.
+STRIPPING_SRUN = '''#!/usr/bin/env bash
+# srun stub that strips the batch runtime environment from the job step.
+set -euo pipefail
+LOG="${SLURM_STUB_LOG:-/dev/null}"
+printf 'srun %s\\n' "$*" >> "$LOG"
+env | grep '^COMPUTEMCP_' | sort >> "$LOG" || true
+
+ARGS=("$@")
+N=${#ARGS[@]}
+if [ "$N" -ge 2 ] && [ "${ARGS[N-2]}" = "--connect" ]; then
+    exec python3 "$CONNECT_BRIDGE" "${ARGS[N-1]}"
+fi
+
+exec env -u COMPUTEMCP_STORAGE_ROOT -u COMPUTEMCP_STATE_DIR -u COMPUTEMCP_BUNDLE_DIR -u HOME "$@"
+'''
+
 
 def _write_stub(path: Path, content: str, *, executable: bool = True) -> None:
     path.write_text(content, encoding="utf-8")
@@ -676,6 +698,80 @@ def test_slurm_mode_submits_job_and_reports_relay_endpoint(tmp_path, stubs):
         assert _wait_port(forward_port, timeout=15), (
             f"relay not listening on {forward_port}\nstderr:\n{result.stderr}"
         )
+    finally:
+        teardown()
+
+
+def test_slurm_job_step_resources_settings_when_env_is_stripped(tmp_path, stubs):
+    """The srun step must be self-contained under a restrictive export policy.
+
+    A JURECA submission with ``--export=SLURM_SUBMIT_DIR=...`` (no ``ALL``)
+    strips the batch script's runtime environment from the srun step, so the
+    step did not see the ``COMPUTEMCP_*`` values that ``computemcp-job.sh``
+    exported in its own shell, and ``computemcp-container.sh`` aborted with
+    "Neither COMPUTEMCP_STORAGE_ROOT nor HOME".  The dedicated stripping srun
+    stub removes those variables before executing the step; the wrapper must
+    re-source the per-job settings file inside the step and reach the docker
+    runtime.  On the parent commit this test fails; the wrapper makes it pass.
+    """
+    container_port = _free_port()
+    forward_port = _free_port()
+    workdir = tmp_path / "slurm-strip"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / "striptest" / "state"
+
+    # Swap in the srun stub that models the restrictive export policy.
+    _write_stub(stubs.slurm.bin / "srun", STRIPPING_SRUN)
+
+    env = _base_env("striptest", storage, container_port)
+    env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["SLURM_JOB_OUT"] = str(workdir / "slurm-job.out")
+    env["SLURM_JOBID_FILE"] = str(state_dir / "jobid")
+    env["PATH"] = stubs.slurm.shell_path
+
+    result = subprocess.run(
+        ["bash", str(PROVISION), "provision"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=workdir,
+    )
+    job_pid_file = Path(env["SLURM_JOB_OUT"] + ".pid")
+
+    def teardown():
+        if job_pid_file.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(job_pid_file.read_text().strip()), 15)
+        _cleanup()
+
+    try:
+        settings = state_dir / "srun-striptest.settings"
+        assert settings.exists()
+        assert settings.read_text(), settings
+        assert result.returncode == 0, (
+            f"provision exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        endpoint_line = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("ENDPOINT")
+        )
+        assert (
+            endpoint_line.strip() == f"ENDPOINT 127.0.0.1:{forward_port}"
+        ), endpoint_line
+        # The step must NOT have fallen back to the HOME-less failure path.
+        job_out = (workdir / "slurm-job.out").read_text()
+        combined = result.stderr + job_out
+        assert "Neither COMPUTEMCP_STORAGE_ROOT nor HOME" not in combined, combined
+        # It reached the container runtime: the docker stub started the container.
+        docker_log = workdir / "docker.log"
+        assert docker_log.exists()
+        assert "\ndocker start " in docker_log.read_text(), docker_log.read_text()
     finally:
         teardown()
 

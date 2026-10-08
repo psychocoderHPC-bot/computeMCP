@@ -81,8 +81,19 @@ trap 'exit 0' TERM INT
 rm -f "$READY"
 
 # Launch the container step explicitly through srun.  The step carries only the
-# rendered SRUN_ARGS; sbatch settings are never copied here.
-srun "${SRUN_ARGS[@]}" bash "$CONTAINER_SCRIPT" start
+# rendered SRUN_ARGS; sbatch settings are never copied here.  A restrictive
+# sbatch --export policy (e.g. --export=SLURM_SUBMIT_DIR=...) can strip this
+# batch script's runtime environment from the srun step, so when the settings
+# file is available the step re-sources it first (the same settings-file
+# transport one level deeper) and stays self-contained.  The path is passed as
+# a positional argv, never interpolated into the wrapper script text, so spaces
+# and quotes survive.
+if [ -n "$SETTINGS" ] && [ -r "$SETTINGS" ]; then
+    srun "${SRUN_ARGS[@]}" bash -c 'source "$1" || exit 1; shift; exec "$@"' \
+        computemcp-step "$SETTINGS" bash "$CONTAINER_SCRIPT" start
+else
+    srun "${SRUN_ARGS[@]}" bash "$CONTAINER_SCRIPT" start
+fi
 STARTED=1
 
 # Publish the node only after the container serves an SSH banner.
