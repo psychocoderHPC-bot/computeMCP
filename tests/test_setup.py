@@ -188,6 +188,134 @@ def test_render_target_block_is_parseable():
 
 
 # ---------------------------------------------------------------------------
+# commented discovery defaults
+# ---------------------------------------------------------------------------
+
+def _discovery_target():
+    """A tunnel target that leaves the commented-default options unset."""
+    return TargetAnswers(
+        name="rosi",
+        ssh_targets=("rosi",),
+        user="agent",
+        client_key="/home/u/.ssh/k",
+        host_key_check="off",  # blank fingerprint wizard path
+        container_runtime="apptainer",
+        bundle=True,
+        bundle_deploy_dir="$HOME/computemcp/bundle",
+    )
+
+
+def _write_and_render(tmp_path, answers):
+    """Write one target file plus its gateway config; return (config, text)."""
+    token_path = tmp_path / "tokens.toml"
+    token_path.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+    config_path = tmp_path / "config.toml"
+    text = render_gateway_config(
+        listen="127.0.0.1",
+        port=2222,
+        allow_enrollment=True,
+        client_id="alpaka",
+        client_targets=("*",),
+        client_label=None,
+        token_file=str(token_path),
+        include=[target_relative_path(answers.name)],
+    )
+    config_path.write_text(text)
+    write_target_file(tmp_path, answers)
+    return config_path, text
+
+
+def test_target_block_commented_defaults_present():
+    block = render_target_block(_discovery_target())
+    assert '# connect_command_mode = "on_failure"' in block
+    assert "# provision_timeout = 900.0" in block
+    assert "# sandbox = false" in block
+    assert "# auto-deploy = true" in block
+    assert "# gpus = []" in block
+
+
+def test_target_block_no_duplicate_key_across_comment_and_active():
+    block = render_target_block(_discovery_target())
+    table = None
+    seen: set[tuple[str | None, str]] = set()
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            table = line.strip("[]")
+            continue
+        body = line
+        if body.startswith("# "):
+            body = body[2:]
+        elif body.startswith("#"):
+            continue
+        if "=" not in body:
+            continue
+        key = body.split("=", 1)[0].strip()
+        ident = (table, key)
+        assert ident not in seen, f"duplicate key {ident} in rendered block"
+        seen.add(ident)
+
+
+def test_uncomment_single_option_still_loads(tmp_path):
+    # Each option in the matrix is present as a commented default in the
+    # unmodified target file; uncommenting exactly that one must keep the
+    # config loadable.
+    options = [
+        "provision_timeout",
+        "connect_command_mode",
+        "sandbox",
+        "auto-deploy",
+        "storage-root",
+        "gpus",
+        "known_hosts",
+        "proxy_jump",
+        "connect_backoff_max",
+    ]
+    config_path, _ = _write_and_render(tmp_path, _discovery_target())
+    target_path = tmp_path / "systems" / "rosi.toml"
+    original_text = target_path.read_text()
+    # The unmodified file must load.
+    load_config(config_path)
+    for option in options:
+        wanted = f"# {option} = "
+        matching = [line for line in original_text.splitlines() if line.startswith(wanted)]
+        assert matching, f"no commented default for {option}"
+        line = matching[0]
+        stripped = line[2:]  # drop the leading "# "
+        target_path.write_text(original_text.replace(line, stripped, 1))
+        try:
+            load_config(config_path)
+        finally:
+            target_path.write_text(original_text)
+
+
+def test_bootstrap_main_config_commented_defaults_parse_and_load(tmp_path):
+    config_path, text = _write_and_render(tmp_path, _discovery_target())
+    assert "# enroll_ttl = 600.0" in text
+    assert "# enroll_max_pending = 32" in text
+    tomllib.loads(text)
+    load_config(config_path)
+    # Uncommenting one enrollment default keeps the file valid TOML.
+    uncommented = text.replace("# enroll_ttl = 600.0", "enroll_ttl = 600.0", 1)
+    assert tomllib.loads(uncommented)["server"]["enroll_ttl"] == 600.0
+
+
+def test_render_direct_target_omits_tunnel_only_defaults():
+    target = TargetAnswers(
+        name="hal",
+        transport="direct",
+        direct_host="10.0.0.5",
+        direct_port=2222,
+        user="agent",
+        client_key="/k",
+    )
+    block = render_target_block(target)
+    assert "proxy_jump" not in block
+
+
+# ---------------------------------------------------------------------------
 # bootstrap flow
 # ---------------------------------------------------------------------------
 
@@ -509,7 +637,8 @@ def test_collect_target_empty_user_is_omitted():
     answers = collect_target(w, set())
     assert answers.user == ""
     block = render_target_block(answers)
-    assert "user = " not in block
+    active = [line for line in block.splitlines() if not line.startswith("#")]
+    assert "user = " not in "\n".join(active)
 
 
 def test_no_slurm_question_without_bundle():
@@ -669,8 +798,10 @@ def test_wizard_auto_connect_no_loads_false(tmp_path):
     answers = collect_target(w, set())
     assert answers.auto_connect is False
     # Omit the key entirely (loader default false); never write "true".
-    assert "auto_connect = true" not in render_target_block(answers)
-    assert "auto_connect = false" not in render_target_block(answers)
+    block = render_target_block(answers)
+    active = [line for line in block.splitlines() if not line.startswith("#")]
+    assert "auto_connect = true" not in active
+    assert "auto_connect = false" not in active
     cfg, _ = _write_and_load(tmp_path, answers)
     assert cfg.targets["rosi"].auto_connect is False
 

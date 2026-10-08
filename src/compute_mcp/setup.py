@@ -303,6 +303,44 @@ def _toml_array(values: tuple[str, ...]) -> str:
     return "[" + ", ".join(_toml_str(v) for v in values) + "]"
 
 
+def _toml_value(value: object) -> str:
+    """Render one Python value as a TOML literal.
+
+    One formatter for every commented default keeps them consistent with the
+    loader: booleans render lowercase, floats keep a decimal point (so the
+    loader reads them back as floats), ints stay plain, strings use the
+    existing quoter and arrays the existing array writer.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return _toml_str(value)
+    if isinstance(value, (list, tuple)):
+        return _toml_array(tuple(str(item) for item in value))
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, int):
+        return str(value)
+    raise TypeError(f"cannot render {value!r} as TOML")
+
+
+def _commented_defaults(
+    entries: list[tuple[str, object]], *, skip: tuple[str, ...] = ()
+) -> list[str]:
+    """Render unset options as ``# key = default`` discovery lines.
+
+    ``entries`` pairs a TOML key (spelled exactly as the loader reads it) with
+    its loader default; ``skip`` names keys already emitted uncommented in the
+    same table, so a key is never present both ways.
+    """
+    skipped = set(skip)
+    return [
+        f"# {key} = {_toml_value(value)}"
+        for key, value in entries
+        if key not in skipped
+    ]
+
+
 def render_target_block(answers: TargetAnswers) -> str:
     """Render one target as a commented TOML block ending in a newline."""
     lines: list[str] = ["", f"[targets.{answers.name}]"]
@@ -336,6 +374,54 @@ def render_target_block(answers: TargetAnswers) -> str:
     # false) would fall back to the loader default and never auto-connect.
     if answers.auto_connect:
         lines.append("auto_connect = true")
+    # Discovery defaults for every root scalar the loader knows but the wizard
+    # did not ask about (or that stays at its default).  ``proxy_jump`` is only
+    # meaningful for tunnel transport; deriving it from an empty user for a
+    # tunnel would yield "" which the loader rejects, so it is guarded.
+    root_active = {
+        key
+        for key, present in (
+            ("user", bool(answers.user)),
+            ("client_key", bool(answers.client_key)),
+            ("host_key_sha256", bool(answers.host_key_sha256)),
+            ("host_key_check", answers.host_key_check != "on"),
+            ("host_key_algorithms", bool(answers.host_key_algorithms)),
+            ("known_hosts", bool(answers.known_hosts)),
+            ("proxy_jump", bool(answers.proxy_jump)),
+            ("interactive_auth", answers.interactive_auth),
+            ("auto_connect", answers.auto_connect),
+        )
+        if present
+    }
+    root_entries: list[tuple[str, object]] = [("container_user", "")]
+    if not answers.host_key_sha256:
+        root_entries.append(("known_hosts", ""))
+    root_entries.append(("route_host_key_sha256", ""))
+    if answers.host_key_check == "on":
+        root_entries.append(("host_key_check", "on"))
+    root_entries.append(("host_key_algorithms", []))
+    if answers.transport == "tunnel":
+        root_entries.append(("proxy_jump", ""))
+    root_entries += [
+        ("connect_mode", "shared"),
+        ("sharing", "unknown"),
+        ("node_info", []),
+        ("agent", []),
+        ("provision_command", []),
+        ("provision_timeout", 900.0),
+        ("close_command", []),
+        ("close_command_timeout", 120.0),
+        ("connect_command", []),
+        ("connect_command_timeout", 120.0),
+        ("connect_command_mode", "on_failure"),
+    ]
+    if not answers.auto_connect:
+        root_entries.append(("auto_connect", False))
+    root_entries += [
+        ("connect_backoff_initial", 1.0),
+        ("connect_backoff_max", 60.0),
+    ]
+    lines += _commented_defaults(root_entries, skip=tuple(root_active))
     if answers.bundle:
         lines.append("")
         lines.append(f"[targets.{answers.name}.bundle]")
@@ -346,6 +432,21 @@ def render_target_block(answers: TargetAnswers) -> str:
             lines.append(
                 f"provision-env = {_toml_array(answers.bundle_provision_env)}"
             )
+        bundle_entries: list[tuple[str, object]] = [
+            ("auto-deploy", True),
+            ("provision-env", []),
+        ]
+        if not answers.bundle_deploy_dir:
+            bundle_entries.insert(0, ("deploy-dir", ""))
+        bundle_active = {
+            key
+            for key, present in (
+                ("deploy-dir", bool(answers.bundle_deploy_dir)),
+                ("provision-env", bool(answers.bundle_provision_env)),
+            )
+            if present
+        }
+        lines += _commented_defaults(bundle_entries, skip=tuple(bundle_active))
     if answers.container_runtime:
         lines.append("")
         lines.append(f"[targets.{answers.name}.container]")
@@ -358,6 +459,29 @@ def render_target_block(answers: TargetAnswers) -> str:
             lines.append(f"gpus = {_toml_array(answers.container_gpus)}")
         if answers.container_host_home:
             lines.append(f"host-home = {_toml_str(answers.container_host_home)}")
+        container_entries: list[tuple[str, object]] = []
+        if not answers.container_storage_root:
+            # The loader rejects an empty storage root, so the commented
+            # discovery default is the wizard's own default rather than "".
+            container_entries.append(("storage-root", "$HOME/computemcp"))
+        if not answers.container_image:
+            container_entries.append(("image", ""))
+        if not answers.container_gpus:
+            container_entries.append(("gpus", []))
+        if not answers.container_host_home:
+            container_entries.append(("host-home", ""))
+        container_entries.append(("sandbox", False))
+        container_active = {
+            key
+            for key, present in (
+                ("storage-root", bool(answers.container_storage_root)),
+                ("image", bool(answers.container_image)),
+                ("gpus", bool(answers.container_gpus)),
+                ("host-home", bool(answers.container_host_home)),
+            )
+            if present
+        }
+        lines += _commented_defaults(container_entries, skip=tuple(container_active))
     if answers.node_cpus is not None or answers.node_gpus is not None or answers.node_memory:
         lines.append("")
         lines.append(f"[targets.{answers.name}.node]")
@@ -431,6 +555,13 @@ def render_gateway_config(
         f"listen = {_toml_str(listen)}",
         f"port = {port}",
         f"allow_enrollment = {'true' if allow_enrollment else 'false'}",
+    ]
+    # Discovery defaults for the bounded enrollment surface; approval itself is
+    # always manual.  Both keys have loader defaults in ServerConfig.
+    lines += _commented_defaults(
+        [("enroll_ttl", 600.0), ("enroll_max_pending", 32)]
+    )
+    lines += [
         "",
         "[ssh]",
         "",
