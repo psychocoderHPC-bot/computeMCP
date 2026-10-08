@@ -35,7 +35,23 @@ SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
 SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"
 HOST_HOME="${COMPUTEMCP_HOST_HOME:-$SYSTEM_DIR/home}"
 STATE="$SYSTEM_DIR/state"
-NAME="computemcp-$SYSTEM"
+
+# Runtime name.  Docker is daemon-global and Apptainer instances are per-host,
+# so the target name alone collides for two users on the same node.  The remote
+# numeric uid is the only discriminator available on the remote host and is
+# stable across login and compute nodes; include it.  COMPUTEMCP_CONTAINER_NAME
+# is an optional operator/test override and is validated exactly like the
+# derived value.
+REMOTE_UID="$(id -u 2>/dev/null || true)"
+if [ -n "$REMOTE_UID" ]; then
+    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$REMOTE_UID-$SYSTEM}"
+else
+    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$SYSTEM}"
+fi
+if ! { [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && [ "$NAME" != . ] && [ "$NAME" != .. ]; }; then
+    echo "Invalid container name: $NAME" >&2
+    exit 2
+fi
 
 RUNTIME="${COMPUTEMCP_CONTAINER_RUNTIME:-}"
 IMAGE="${COMPUTEMCP_IMAGE:-}"

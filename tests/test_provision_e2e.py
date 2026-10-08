@@ -226,6 +226,9 @@ def test_direct_mode_stop_without_full_env(tmp_path, stubs):
             "PATH": stubs.direct.shell_path,
             "HOME": os.environ.get("HOME", str(workdir)),
             "COMPUTEMCP_STATE_DIR": str(state_dir),
+            # The provisioner that created ``computemcp-stopflow`` used this
+            # pinned override; the env-less stop must resolve the same name.
+            "COMPUTEMCP_CONTAINER_NAME": "computemcp-stopflow",
             "BANNER_SERVER": str(stubs_banner_path()),
             "DOCKER_STUB_LOG": str(workdir / "docker-stop-noenv.log"),
             "DOCKER_STUB_STATE": str(workdir / "dockerstate"),

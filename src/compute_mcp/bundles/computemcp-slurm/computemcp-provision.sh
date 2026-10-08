@@ -62,7 +62,24 @@ elif [[ "$STORAGE_ROOT" =~ ^~(/|$) ]]; then
     STORAGE_ROOT="$HOME${STORAGE_ROOT#\~}"
 fi
 SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
-NAME="computemcp-$SYSTEM"
+
+# Runtime name.  Docker is daemon-global and Apptainer instances are per-host,
+# so the target name alone collides for two users on the same node.  The remote
+# numeric uid is the only discriminator available on the remote host and is
+# stable across login and compute nodes; include it.  COMPUTEMCP_CONTAINER_NAME
+# is an optional operator/test override and is validated exactly like the
+# derived value.  Keep this derivation identical to computemcp-container.sh so
+# both scripts agree byte-for-byte.
+REMOTE_UID="$(id -u 2>/dev/null || true)"
+if [ -n "$REMOTE_UID" ]; then
+    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$REMOTE_UID-$SYSTEM}"
+else
+    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$SYSTEM}"
+fi
+if ! { [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && [ "$NAME" != . ] && [ "$NAME" != .. ]; }; then
+    echo "Invalid container name: $NAME" >&2
+    exit 2
+fi
 STATE="${COMPUTEMCP_STATE_DIR:-$SYSTEM_DIR/state}"
 SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"
 HOST_HOME="${COMPUTEMCP_HOST_HOME:-$SYSTEM_DIR/home}"
@@ -114,6 +131,9 @@ export COMPUTEMCP_GPU_VENDORS="$GPU_VENDORS"
 export COMPUTEMCP_CONTAINER_PORT="$CONTAINER_PORT"
 export COMPUTEMCP_SSH_WAIT_SECONDS="$SSH_WAIT_SECONDS"
 export COMPUTEMCP_SSH_USER="${COMPUTEMCP_SSH_USER:-agent}"
+# Transport an explicit name override (if any) so computemcp-container.sh uses
+# the same runtime name as this helper in every mode.
+export COMPUTEMCP_CONTAINER_NAME="${COMPUTEMCP_CONTAINER_NAME:-}"
 
 # Resolve the SSH public key to install in the container.  The gateway is
 # expected to inject COMPUTEMCP_SSH_PUBLIC_KEY (or a file path); when it does
@@ -401,7 +421,7 @@ runtime_tool() {
 container_missing() {
     case "$RUNTIME" in
         apptainer) [ ! -d "$SANDBOX" ] ;;
-        docker)    ! docker image inspect "computemcp-${SYSTEM,,}:latest" >/dev/null 2>&1 ;;
+        docker)    ! docker image inspect "${NAME,,}:latest" >/dev/null 2>&1 ;;
         *) return 1 ;;
     esac
 }
@@ -531,7 +551,7 @@ if [ "$ACTION" = provision ]; then
 
     if [ -z "$JOBID" ]; then
         stop_relay
-        SETTINGS="$STATE/srun-$SYSTEM.settings"        HELPER_ARGS=(--parsable --job-name="computemcp-$SYSTEM")
+        SETTINGS="$STATE/srun-$SYSTEM.settings"        HELPER_ARGS=(--parsable --job-name="$NAME")
         sbatch_has() {
             local WANTED="$1" ARG
             for ARG in "${SBATCH_ARGS[@]}"; do

@@ -990,6 +990,26 @@ allocation state, or a running job. With a `[targets.X.bundle]` block,
 itself. Set `provision_command`/`close_command` explicitly only to manage the
 bundle by hand instead.
 
+### Container and instance naming
+
+The provisioning helper derives the runtime name as
+`computemcp-<uid>-<target>`, where `<uid>` is the numeric remote uid from
+`id -u` and `<target>` is `COMPUTEMCP_SYSTEM`. Docker is daemon-global and
+Apptainer instances are per-host, so the uid keeps two users on the same node
+from colliding on the container or instance name. The Docker image tag derives
+from the same name as `<name>:latest`, so the image is per user too.
+
+`COMPUTEMCP_CONTAINER_NAME` overrides the derived name; the helper validates it
+against the same rules and exits 2 when it is not a legal Docker/Apptainer name
+or filename component (letters, digits, `.`, `_`, `-`; not `.` or `..`). The
+gateway sets no such key; the variable exists for advanced operators and tests.
+
+Names changed from the earlier `computemcp-<target>`, so a container created by
+an older version is not found under the new name and the helper builds a fresh
+one. Nothing deletes the old container; it stays until an operator removes it.
+Every mutating Docker step is still gated by the `org.computemcp.owner-uid`
+label check, so the helper never touches another user's container.
+
 ### Worked example: GPU target with Apptainer (ROSI illustration)
 
 This template mirrors the design-document ROSI illustration: one GPU per

@@ -577,6 +577,10 @@ def _base_env(system: str, storage_root: Path, port: int) -> dict:
             "COMPUTEMCP_WAIT_SECONDS": "60",
             "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
             "COMPUTEMCP_NODES": "1",
+            # Pin the runtime name so the existing assertions stay readable.
+            # The helper defaults to ``computemcp-<uid>-<system>``; tests that
+            # exercise the default derivation pop this key first.
+            "COMPUTEMCP_CONTAINER_NAME": f"computemcp-{system}",
             # Both the direct ``docker start`` path (via the docker stub) and
             # the slurm ``srun --connect`` path (via the srun stub) need this.
             "BANNER_SERVER": str(stubs_banner_path()),
@@ -767,6 +771,117 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
         teardown()
 
 
+def test_default_container_name_includes_uid(tmp_path, stubs):
+    """Without an override the runtime name embeds the remote uid.
+
+    Docker is daemon-global, so ``computemcp-$SYSTEM`` collides for two users
+    on the same node.  The default derivation is
+    ``computemcp-<id -u>-<system>``; this runs the real provisioner without
+    ``COMPUTEMCP_CONTAINER_NAME`` and asserts the docker stub trace carries the
+    uid-qualified name, and that its image tag derives from the same name.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "defaultname"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    published_port = _published_port(container_port)
+    expected = f"computemcp-{os.getuid()}-defaultname"
+
+    env = _base_env("defaultname", storage, container_port)
+    # Exercise the default derivation, not the pinned test override.
+    env.pop("COMPUTEMCP_CONTAINER_NAME", None)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published_port)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["PATH"] = stubs.direct.shell_path
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=workdir,
+        )
+        assert result.returncode == 0, (
+            f"provision exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        log = (workdir / "docker.log").read_text(encoding="utf-8", errors="replace")
+        # The container was created/started and the image built under the
+        # uid-qualified name; the image tag is the lowercased NAME.
+        assert f"--name {expected}" in log, log
+        assert "docker build --build-arg" in log
+        assert f"--tag {expected}:latest" in log, log
+        assert f"docker start {expected}" in log, log
+        # The stub records the state under a directory named after the container.
+        assert (workdir / "dockerstate" / f"ctr-{expected}").is_dir()
+    finally:
+        _cleanup()
+
+
+def test_container_name_override_is_used_and_validated(tmp_path, stubs):
+    """The optional override is honored and still validated.
+
+    ``COMPUTEMCP_CONTAINER_NAME`` lets an operator pin a name.  A legal value
+    is used verbatim in the docker trace; an illegal value (a ``/`` or an empty
+    segment) exits 2 with a clear message before any docker command runs.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "override"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    published_port = _published_port(container_port)
+
+    env = _base_env("overridetest", storage, container_port)
+    env["COMPUTEMCP_CONTAINER_NAME"] = "computemcp-custom"
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published_port)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["PATH"] = stubs.direct.shell_path
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=workdir,
+        )
+        assert result.returncode == 0, result.stderr
+        log = (workdir / "docker.log").read_text(encoding="utf-8", errors="replace")
+        assert "--name computemcp-custom" in log, log
+
+        # An illegal name is rejected before touching docker.
+        bad_workdir = tmp_path / "override-bad"
+        bad_workdir.mkdir()
+        bad_env = _base_env("overridetest", bad_workdir / "storage", _free_port())
+        bad_env["COMPUTEMCP_CONTAINER_NAME"] = "computemcp/evil"
+        bad_env["DOCKER_STUB_LOG"] = str(bad_workdir / "docker.log")
+        bad_env["DOCKER_STUB_STATE"] = str(bad_workdir / "dockerstate")
+        bad_env["PATH"] = stubs.direct.shell_path
+        bad = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=bad_env,
+            cwd=bad_workdir,
+        )
+        assert bad.returncode == 2, (bad.returncode, bad.stderr)
+        assert "Invalid container name" in bad.stderr, bad.stderr
+        bad_log = bad_workdir / "docker.log"
+        assert not bad_log.exists() or not bad_log.read_text().strip(), (
+            "an invalid override still invoked docker"
+        )
+    finally:
+        _cleanup()
+
+
 def test_direct_mode_status_reports_published_endpoint(tmp_path, stubs):
     """The ``status`` action reports Docker's published host port.
 
@@ -945,6 +1060,9 @@ def test_direct_stop_without_container_runtime_env(tmp_path, stubs):
             "PATH": stubs.direct.shell_path,
             "HOME": os.environ.get("HOME", str(workdir)),
             "COMPUTEMCP_STATE_DIR": str(state_dir),
+            # The provisioner that created ``computemcp-stopruntime`` used this
+            # pinned override; the env-less stop must resolve the same name.
+            "COMPUTEMCP_CONTAINER_NAME": "computemcp-stopruntime",
             "BANNER_SERVER": str(stubs_banner_path()),
             "DOCKER_STUB_LOG": str(workdir / "docker-stop.log"),
             "DOCKER_STUB_STATE": str(workdir / "dockerstate"),
