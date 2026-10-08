@@ -761,12 +761,21 @@ class Gateway:
                 target, route, connection_timeout=_CLOSE_ROUTE_TIMEOUT
             )
         except Exception as exc:  # noqa: BLE001 - advisory, never fatal
-            log.warning(
-                "target %s: close_command skipped, could not open a route "
-                "connection: %s",
-                name,
-                exc,
-            )
+            if target.interactive_auth:
+                log.warning(
+                    "target %s: close_command skipped, interactive_auth route "
+                    "needs a second factor; the allocation may need a manual "
+                    "scancel: %s",
+                    name,
+                    exc,
+                )
+            else:
+                log.warning(
+                    "target %s: close_command skipped, could not open a route "
+                    "connection: %s",
+                    name,
+                    exc,
+                )
             return
         try:
             await self._run_close_on_connection(

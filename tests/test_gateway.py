@@ -2684,6 +2684,60 @@ async def test_stop_target_swallows_failed_short_route_dial(monkeypatch):
     assert gw.runtimes["hal"].state == "disconnected"
 
 
+async def test_stop_target_closes_short_route_when_close_command_raises(
+    monkeypatch,
+):
+    """A short-lived route connection is still closed when the close raises.
+
+    Regression: the ``finally`` path in ``_run_close_command`` closes the
+    dialled short-lived route even when the close command itself raises.  This
+    is the only path that used to leave the route connection open.
+    """
+    gw, target = _close_gateway()
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.tunnel = None
+
+    class _RecordingConnection:
+        def __init__(self):
+            self.closed = False
+            self.wait_closed_called = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            self.wait_closed_called = True
+
+    conn = _RecordingConnection()
+    dialed = []
+
+    async def fake_open_route_connection(t, route, connection_timeout=None):
+        dialed.append((t.name, route, connection_timeout))
+        return conn
+
+    monkeypatch.setattr(
+        gw.tunnels, "open_route_connection", fake_open_route_connection
+    )
+
+    async def boom_close_command(target, route, connection=None, **kwargs):
+        raise RuntimeError("close boom")
+
+    monkeypatch.setattr(gw.tunnels, "run_close_command", boom_close_command)
+
+    # Must not raise even though the close command itself raised.
+    await gw.stop_target("hal")
+
+    assert dialed == [("hal", "hal", 15.0)]
+    assert conn.closed is True
+    assert conn.wait_closed_called is True
+    assert gw.runtimes["hal"].tunnel is None
+    assert gw.runtimes["hal"].state == "disconnected"
+
+
 async def test_apply_config_removal_does_not_run_close_command(monkeypatch):
     gw, target = _close_gateway()
     monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
