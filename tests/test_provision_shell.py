@@ -1598,6 +1598,39 @@ def test_apptainer_configure_rejects_ambiguous_accounts(tmp_path):
     assert "agent" in result.stderr, result.stderr
 
 
+def test_apptainer_configure_rejects_cross_name_ambiguity(tmp_path):
+    """A pre-added account matching the login user plus the base ``ubuntu``
+    account are cross-name-ambiguous and must be rejected cleanly.
+
+    Regression: the idempotency fix (commit 3d1f52d) accepts the requested user
+    account as a candidate so a re-run of an already-renamed sandbox succeeds.
+    That same branch makes a *pristine* sandbox with both ``ubuntu`` (uid 1000)
+    and a pre-existing ``agent`` (uid 1001) ambiguous: two candidates.  The
+    configure must abort and, being a rejection, change no account (no rename,
+    no uid/GID edit) so a failed run has zero side effects.
+    """
+    root = tmp_path / "apptainer"
+    sandbox = _make_fake_sandbox(root)
+    passwd = sandbox / "etc/passwd"
+    # A "pre-added" account with the requested login name and a different uid,
+    # so the code finds both the base ``ubuntu`` and a ``user`` candidate.
+    with passwd.open("a", encoding="utf-8") as stream:
+        stream.write("agent:x:1001:1001:Agent:/home/agent:/bin/bash\n")
+    original = passwd.read_bytes()
+    result, _, _ = _run_apptainer_configure(
+        tmp_path, "agent", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode != 0, result
+    assert "Expected exactly one" in result.stderr, result.stderr
+    accounts = _passwd_account(sandbox)
+    assert "ubuntu" in accounts, accounts
+    assert "agent" in accounts, accounts
+    assert accounts["ubuntu"][2] == "1000"
+    assert accounts["agent"][2] == "1001"
+    # A rejected configure must be side-effect free: passwd left byte-identical.
+    assert passwd.read_bytes() == original, "passwd was modified on failure"
+
+
 def test_job_sh_relocated_resolves_bundle_dir_from_settings(tmp_path):
     """A scheduler-spooled job.sh finds the container script via settings.
 
