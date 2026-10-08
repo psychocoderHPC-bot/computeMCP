@@ -9,6 +9,11 @@
 # only place that knows how to build/configure/start a container.  The Slurm
 # batch job calls it with "start" on the compute node; the provisioning helper
 # calls it with "build"/"configure" on the login node.
+#
+# COMPUTEMCP_IMAGE is normalized once at startup: repeated ``docker://``
+# prefixes are collapsed to one, and for Apptainer a bare registry reference
+# (``nvcr.io/...``) is accepted and prefixed with ``docker://``.  Other schemes
+# and local paths are left untouched.
 set -euo pipefail
 umask 077
 
@@ -78,6 +83,29 @@ fi
 RUNTIME="${COMPUTEMCP_CONTAINER_RUNTIME:-}"
 IMAGE="${COMPUTEMCP_IMAGE:-}"
 GPU_VENDORS="${COMPUTEMCP_GPU_VENDORS:-}"
+
+# Canonicalize COMPUTEMCP_IMAGE.  A doubled ``docker://`` prefix is a common
+# typo (e.g. retyped on top of the wizard default); apptainer would then treat
+# ``docker://`` as the source transport host and fail with "lookup docker: no
+# such host".  Collapse any run of ``docker://`` prefixes to exactly one, and
+# for Apptainer accept a bare registry reference (contains a ``/`` but no
+# scheme and not a local path) by prefixing it.  Anything with another scheme
+# (``oras://``, ``shub://``, ``library://``, ``file://``) or a local path
+# (leading ``/`` or ``./``) is left for Apptainer/Docker to handle unchanged.
+normalize_image() {
+    local VALUE="$1"
+    while [[ "$VALUE" == docker://docker://* ]]; do
+        VALUE="${VALUE#docker://}"
+    done
+    if [ "$RUNTIME" = apptainer ]; then
+        if [[ "$VALUE" != docker://* ]] && [[ "$VALUE" != *://* ]] &&
+            [[ "$VALUE" == */* ]] && [[ "$VALUE" != /* ]] && [[ "$VALUE" != .* ]]; then
+            VALUE="docker://$VALUE"
+        fi
+    fi
+    printf '%s' "$VALUE"
+}
+IMAGE="$(normalize_image "$IMAGE")"
 CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
 SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 
@@ -291,6 +319,10 @@ check_sandbox_arch() {
 # ---------------------------------------------------------------------------
 apptainer_build() {
     command -v apptainer >/dev/null
+    # IMAGE was normalized above: a bare registry ref was prefixed with
+    # docker:// and repeated prefixes were collapsed to one.  What remains
+    # here is either a docker:// ref or an unsupported scheme/local path that
+    # must be rejected rather than silently rewritten.
     [ -n "$IMAGE" ] || { echo 'COMPUTEMCP_IMAGE is required to build a sandbox.' >&2; exit 1; }
     [ "${IMAGE#docker://}" != "$IMAGE" ] || { echo 'Apptainer IMAGE must use docker://.' >&2; exit 2; }
     if [ -e "$SANDBOX" ]; then

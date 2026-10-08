@@ -831,7 +831,8 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
         )
         answers.container_image = wizard.ask(
             "Base image",
-            description="docker:// ref for Apptainer, plain ref for Docker",
+            description="docker:// registry ref for Apptainer (repeated "
+            "prefix collapsed), plain ref for Docker",
             default=default_image,
         )
         vendors = wizard.ask(

@@ -264,13 +264,19 @@ case "$CMD" in
         ;;
     build)
         TAG=""
+        CONTEXT=""
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --tag) TAG="$2"; shift 2 ;;
                 --build-arg) shift 2 ;;
-                *) shift ;;
+                *) CONTEXT="$1"; shift ;;
             esac
         done
+        # Optional hook: capture the generated Dockerfile so a test can assert
+        # on the resolved base image (DOCKER_STUB_DOCKERFILE_LOG).
+        if [ -n "${DOCKER_STUB_DOCKERFILE_LOG:-}" ] && [ -f "$CONTEXT/Dockerfile" ]; then
+            cat "$CONTEXT/Dockerfile" >> "$DOCKER_STUB_DOCKERFILE_LOG"
+        fi
         touch "$(img_marker "$TAG")"
         exit 0
         ;;
@@ -2913,3 +2919,143 @@ def test_batch_job_start_rejects_stale_login_arch_sandbox(tmp_path):
         f"instance start was reached despite the arch gate:\n{calls}\n"
         f"{result.stdout}\n{result.stderr}"
     )
+
+
+# --- COMPUTEMCP_IMAGE normalization ----------------------------------------
+#
+# A doubled ``docker://`` prefix (the wizard default retyped) made Apptainer
+# treat ``docker://`` as the source transport host and fail with an opaque
+# "lookup docker: no such host".  The helper now collapses repeated prefixes
+# and, for Apptainer, accepts a bare registry reference.
+
+
+def _run_apptainer_build(
+    tmp_path: Path, image: str
+) -> tuple[subprocess.CompletedProcess, Path]:
+    """Run the real ``apptainer_build`` with an argv/def-capturing stub.
+
+    The stub ``apptainer`` records its argv and copies the definition file
+    (the last argument of ``apptainer build``) next to its log, so a test can
+    assert on the generated ``From:`` line without Apptainer installed.
+    """
+    root = tmp_path / "appbuild"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    def_capture = root / "definition"
+    calls = root / "apptainer.log"
+    stub = bin_dir / "apptainer"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'apptainer %s\\n' \"$*\" >> '{calls}'\n"
+        "# The definition path is the final argv element of ``apptainer build``.\n"
+        "for LAST in \"$@\"; do :; done\n"
+        f"[ -f \"$LAST\" ] && cp -- \"$LAST\" '{def_capture}'\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    sandbox = root / "sandbox"
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+            "COMPUTEMCP_SYSTEM": "imgtest",
+            "COMPUTEMCP_STORAGE_ROOT": str(root / "storage"),
+            "COMPUTEMCP_SANDBOX_DIR": str(sandbox),
+            "COMPUTEMCP_HOST_HOME": str(root / "hosthome"),
+            "COMPUTEMCP_CONTAINER_PORT": str(_free_port()),
+            "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
+            "COMPUTEMCP_IMAGE": image,
+        }
+    )
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "build"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=root,
+    )
+    return result, def_capture
+
+
+def _definition_from(def_capture: Path) -> str:
+    assert def_capture.is_file(), "the apptainer build did not receive a definition"
+    return def_capture.read_text(encoding="utf-8")
+
+
+def test_apptainer_build_collapses_doubled_docker_prefix(tmp_path):
+    """A doubled ``docker://`` must not reach the definition's ``From:`` line."""
+    result, def_capture = _run_apptainer_build(
+        tmp_path, "docker://docker://nvcr.io/nvidia/cuda:13.4.2-devel-ubuntu24.04"
+    )
+    definition = _definition_from(def_capture)
+    assert (
+        "From: nvcr.io/nvidia/cuda:13.4.2-devel-ubuntu24.04\n" in definition
+    ), definition
+    assert "From: docker://" not in definition, definition
+    assert "Bootstrap: docker\n" in definition, definition
+
+
+def test_apptainer_build_prefixes_bare_registry_reference(tmp_path):
+    """A bare registry reference is accepted and prefixed for Apptainer."""
+    result, def_capture = _run_apptainer_build(
+        tmp_path, "nvcr.io/nvidia/cuda:13.4.2-devel-ubuntu24.04"
+    )
+    definition = _definition_from(def_capture)
+    assert (
+        "From: nvcr.io/nvidia/cuda:13.4.2-devel-ubuntu24.04\n" in definition
+    ), definition
+    assert "From: docker://" not in definition, definition
+
+
+def test_apptainer_build_leaves_single_docker_prefix_unchanged(tmp_path):
+    """A normal single ``docker://`` ref is unchanged."""
+    result, def_capture = _run_apptainer_build(tmp_path, "docker://ubuntu:24.04")
+    definition = _definition_from(def_capture)
+    assert "From: ubuntu:24.04\n" in definition, definition
+    assert "From: docker://" not in definition, definition
+
+
+def test_apptainer_build_leaves_unsupported_scheme_untouched(tmp_path):
+    """Another scheme is not rewritten; Apptainer/Aptainer gets it verbatim."""
+    result, _ = _run_apptainer_build(tmp_path, "oras://ghcr.io/org/img:tag")
+    assert result.returncode == 2, (result.returncode, result.stderr)
+    assert "must use docker://" in result.stderr, result.stderr
+
+
+def test_docker_build_collapses_doubled_docker_prefix(tmp_path, stubs):
+    """A doubled ``docker://`` must not leak ``docker://`` into ``FROM``."""
+    container_port = _free_port()
+    workdir = tmp_path / "dockerfile"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    dockerfile_log = workdir / "Dockerfile.log"
+
+    env = _base_env("dockerfiletest", storage, container_port)
+    env["COMPUTEMCP_IMAGE"] = "docker://docker://ubuntu:24.04"
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(_published_port(container_port))
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["DOCKER_STUB_DOCKERFILE_LOG"] = str(dockerfile_log)
+    env["PATH"] = stubs.direct.shell_path
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=workdir,
+        )
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert dockerfile_log.is_file(), "the docker build did not capture the Dockerfile"
+        dockerfile = dockerfile_log.read_text(encoding="utf-8")
+        # FROM is parameterized by BASE_IMAGE; the resolved value must be the
+        # collapsed ref, and no transport prefix may survive into the build.
+        assert "ARG BASE_IMAGE=ubuntu:24.04" in dockerfile, dockerfile
+        assert "docker://" not in dockerfile, dockerfile
+    finally:
+        _cleanup()
