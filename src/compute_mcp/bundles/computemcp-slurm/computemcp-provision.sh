@@ -7,18 +7,20 @@
 # the design doc, "Gateway-to-provisioner interface").  Every value has a
 # documented fallback so the helper also works for manual/legacy invocations.
 #
-# Stages are strictly separate: SBATCH_ARGS request the allocation, SRUN_ARGS
-# launch the container job step inside it.  They are never copied between each
-# other or merged.
+# Stages are strictly separate: SBATCH_ARGS request the allocation; the batch
+# script sources the settings file for the container configuration and starts
+# the container directly on the batch node; SRUN_ARGS are consumed by the
+# relay's per-connection srun steps.  They are never copied between each other
+# or merged.
 #
-# SRUN_ARGS transport: the helper writes a per-job settings file and passes its
-# path to the batch script as a positional argument (``sbatch ... job.sh
-# SETTINGS``).  Slurm passes positional arguments to the batch script verbatim,
-# so this survives ``--export=NONE`` and any custom export policy without the
-# helper touching the user's ``--export``.  The batch script sources that file
-# to obtain the SRUN_ARGS array and the container configuration.  An
-# ``--export`` based mechanism was rejected because it can silently clobber or
-# be clobbered by the user's export policy, which the design forbids.
+# Settings-file transport: the helper writes a per-job settings file (the
+# container configuration plus COMPUTEMCP_SRUN_ARGS) and passes its path to the
+# batch script as a positional argument (``sbatch ... job.sh SETTINGS``).
+# Slurm passes positional arguments to the batch script verbatim, so this
+# survives ``--export=NONE`` and any custom export policy without the helper
+# touching the user's ``--export``.  An ``--export`` based mechanism was
+# rejected because it can silently clobber or be clobbered by the user's export
+# policy, which the design forbids.
 set -euo pipefail
 umask 077
 

@@ -1318,9 +1318,11 @@ The gateway exports the resolved allocation and container description as
   before the build, and again inside the container-start path on the job node
   (a login-node `module load` does not propagate to the compute node).
 
-`sbatch` and `srun` remain separate stages: the helper submits
-`sbatch "${SBATCH_ARGS[@]}" …`; the batch job launches
-`srun "${SRUN_ARGS[@]}" …`. No value moves from one list to the other.
+`sbatch` and `srun` remain separate stages, and no value moves from one list to
+the other: `SBATCH_ARGS` request the allocation; the batch job starts the
+container DIRECTLY on the batch node (not in an `srun` step, so a fakeroot
+Apptainer instance is not killed when a step ends); `SRUN_ARGS` are used by the
+container's internal workload/relay steps and are carried by the settings file.
 
 ### Requirements and validation
 

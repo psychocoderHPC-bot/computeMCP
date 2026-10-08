@@ -169,15 +169,14 @@ When the target's `slurm.sbatch` stage configures an account, the gateway emits
 `--account=<account>` into `COMPUTEMCP_SBATCH_ARGS`; an unset or empty account
 adds nothing.  The helper's `COMPUTEMCP_ACCOUNT` fallback below is unchanged.
 
-`COMPUTEMCP_SRUN_ARGS` reaches the batch job through a per-job settings file
-whose path is passed as a positional argument to the batch script.  Slurm
-delivers positional arguments verbatim even under `--export=NONE`, so the
-helper does not touch the user's `--export` policy.  An `--export`-based bridge
-was rejected because it can silently override or be overridden by that policy,
-which the design forbids.  The settings file also carries the resolved container
-configuration.  `computemcp-job.sh` sources it and launches the container step
-with `srun "${SRUN_ARGS[@]}"`, so the step receives exactly the rendered
-`SRUN_ARGS` and nothing from the submission stage.
+The settings file carries the container configuration and `COMPUTEMCP_SRUN_ARGS`
+for the relay's `--connect` steps, and is passed to the batch script as a
+positional argument.  Slurm delivers positional arguments verbatim even under
+`--export=NONE`, so the helper does not touch the user's `--export` policy.  An
+`--export`-based bridge was rejected because it can silently override or be
+overridden by that policy, which the design forbids.  `computemcp-job.sh`
+sources it and starts the container DIRECTLY on the batch node (not via `srun`),
+so a fakeroot instance is not torn down with a transient step.
 
 ## GPU vendors
 
