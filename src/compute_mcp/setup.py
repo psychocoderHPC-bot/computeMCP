@@ -402,10 +402,11 @@ def render_target_block(answers: TargetAnswers) -> str:
     root_entries: list[tuple[str, object]] = [("container_user", "agent")]
     if not answers.host_key_sha256:
         root_entries.append(("known_hosts", ""))
-    # An obviously-placeholder SHA256 reference (valid TOML; the loader
-    # rejects it until a real fingerprint is swapped into the line -- the
-    # same swap the operator performs for the fingerprint question).
-    root_entries.append(("route_host_key_sha256", "SHA256:..."))
+    # A format-complete placeholder that passes the loader's route host-key
+    # check, so uncommenting the line itself keeps the config loadable; the
+    # operator swaps in a real fingerprint the same way as for the
+    # fingerprint question.
+    root_entries.append(("route_host_key_sha256", "SHA256:REPLACE_WITH_FINGERPRINT"))
     if answers.host_key_check == "on":
         root_entries.append(("host_key_check", "on"))
     root_entries.append(("host_key_algorithms", []))

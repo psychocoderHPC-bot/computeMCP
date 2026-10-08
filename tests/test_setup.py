@@ -382,12 +382,10 @@ def test_every_commented_default_loads_when_uncommented(tmp_path):
 
     Each target of the matrix renders into a real include-based config; then
     every commented option line (prose skipped) is uncommented one at a time
-    and ``load_config`` must succeed.  ``route_host_key_sha256`` is the one
-    deliberate exception: its literal ``SHA256:...`` is a kept placeholder
-    that is valid TOML but rejected by the fingerprint format check, so it is
-    verified separately in
-    :func:`test_route_fingerprint_placeholder_is_valid_toml` while a
-    format-complete fingerprint on the same line must load here.
+    and ``load_config`` must succeed -- with zero exceptions, including
+    ``route_host_key_sha256`` whose placeholder now passes the fingerprint
+    format check (see
+    :func:`test_route_fingerprint_placeholder_is_valid_toml`).
     """
     exercised = 0
     failures: list[str] = []
@@ -439,14 +437,6 @@ def test_every_commented_default_loads_when_uncommented(tmp_path):
             try:
                 load_config(config_path)
             except ConfigError as exc:
-                if (
-                    where[1] == "route_host_key_sha256"
-                    and "must look like" in str(exc)
-                ):
-                    # The kept SHA256:... placeholder; covered by
-                    # test_route_fingerprint_placeholder_is_valid_toml,
-                    # which also proves a full fingerprint loads.
-                    continue
                 failures.append(
                     f"target {answers.name} [{where[0] or 'root'}] {line!r}\n"
                     f"    {_classify(exc) if _looks_like_toml_error(exc) else 'rejected: ' + str(exc)}"
@@ -472,13 +462,12 @@ def _classify(exc: ConfigError) -> str:
 
 
 def test_route_fingerprint_placeholder_is_valid_toml(tmp_path):
-    """The ``SHA256:...`` placeholder is valid TOML while a full fingerprint loads.
+    """The route fingerprint placeholder is valid TOML and loads uncommented.
 
-    The route host-key check requires ``SHA256:`` plus more than 12 characters;
-    the literal ``SHA256:...`` is therefore a clearly marked placeholder
-    (valid TOML, rejected by the loader until a real fingerprint is swapped
-    into the same line) -- exactly the flow the operator performs.  A
-    format-complete fingerprint on the same line must load.
+    ``SHA256:REPLACE_WITH_FINGERPRINT`` is a format-complete placeholder
+    that passes the loader's route host-key check, so uncommenting the
+    rendered line keeps the config loadable; a real fingerprint on the same
+    line loads as well.
     """
     token_path = tmp_path / "tokens.toml"
     token_path.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
@@ -493,27 +482,30 @@ def test_route_fingerprint_placeholder_is_valid_toml(tmp_path):
     )
     path = write_target_file(tmp_path, _discovery_target())
     base_text = path.read_text()
-    placeholder = '# route_host_key_sha256 = "SHA256:..."'
+    placeholder = '# route_host_key_sha256 = "SHA256:REPLACE_WITH_FINGERPRINT"'
     assert base_text.count(placeholder) == 1
 
+    # The placeholder itself loads when uncommented.
+    candidate = base_text.replace(placeholder, placeholder[2:], 1)
+    tomllib.loads(candidate)
+    path.write_text(candidate)
+    try:
+        load_config(config_path)
+    finally:
+        path.write_text(base_text)
+
+    # A full fingerprint on the same line loads as well.
     fingerprint = "SHA256:" + "a" * 40
     full_line = f'# route_host_key_sha256 = "{fingerprint}"'
-    for line, expect_load in ((placeholder, False), (full_line, True)):
-        # Substitute the value first (stays valid TOML), then uncomment the
-        # single commented option at its line.
-        candidate = base_text.replace(placeholder, line, 1)
-        tomllib.loads(candidate)
-        candidate = candidate.replace(line, line[2:], 1)
-        tomllib.loads(candidate)
-        path.write_text(candidate)
-        try:
-            if expect_load:
-                load_config(config_path)
-            else:
-                with pytest.raises(ConfigError, match="SHA256"):
-                    load_config(config_path)
-        finally:
-            path.write_text(base_text)
+    candidate = base_text.replace(placeholder, full_line, 1)
+    tomllib.loads(candidate)
+    candidate = candidate.replace(full_line, full_line[2:], 1)
+    tomllib.loads(candidate)
+    path.write_text(candidate)
+    try:
+        load_config(config_path)
+    finally:
+        path.write_text(base_text)
 
 
 def test_commented_bundle_deploy_dir_default():
@@ -534,7 +526,7 @@ def test_commented_default_values_are_valid():
     # The apptainer+bundle discovery target carries the corrected values.
     block = render_target_block(_discovery_target())
     assert '# container_user = "agent"' in block
-    assert '# route_host_key_sha256 = "SHA256:..."' in block
+    assert '# route_host_key_sha256 = "SHA256:REPLACE_WITH_FINGERPRINT"' in block
     assert '# host-home = "$HOME/computemcp/rosi/home"' in block
     # Runtime-appropriate image per target: docker:// for Apptainer (which
     # cannot pull docker tags), plain tag for Docker.
@@ -562,8 +554,8 @@ def test_commented_default_values_are_valid():
     # for the docker target above.
     assert f'# host-home = "$HOME/computemcp/hal/home"' in docker_block
     assert f'# host-home = "$HOME/computemcp/hal/home"' in apptainer_block
-    assert '# route_host_key_sha256 = "SHA256:..."' in docker_block
-    assert '# route_host_key_sha256 = "SHA256:..."' in apptainer_block
+    assert '# route_host_key_sha256 = "SHA256:REPLACE_WITH_FINGERPRINT"' in docker_block
+    assert '# route_host_key_sha256 = "SHA256:REPLACE_WITH_FINGERPRINT"' in apptainer_block
     assert '# container_user = "agent"' in docker_block
     assert '# container_user = "agent"' in apptainer_block
 
