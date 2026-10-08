@@ -749,9 +749,22 @@ class Gateway:
         # scancel.  Open a short-lived route connection and run the close over
         # it, bounded so a dead login node cannot stall shutdown.  Direct
         # transport has no separate login node to dial, so keep the old no-op.
+        # An interactive_auth target is deliberately NOT dialed here: the key-only
+        # route connection cannot supply the second factor, so the dial would only
+        # produce a guaranteed login failure that can trip fail2ban / account
+        # lockout policies.  The config already tells us a factor is required, so
+        # we skip the factor-less reconnect and log the manual scancel.
         if target.transport.kind == "direct":
             log.warning(
                 "target %s: close_command skipped, no live route connection",
+                name,
+            )
+            return
+        if target.interactive_auth:
+            log.warning(
+                "target %s: close_command skipped, interactive_auth requires a "
+                "second factor and the route connection is gone; the allocation "
+                "may need a manual scancel",
                 name,
             )
             return
@@ -761,21 +774,12 @@ class Gateway:
                 target, route, connection_timeout=_CLOSE_ROUTE_TIMEOUT
             )
         except Exception as exc:  # noqa: BLE001 - advisory, never fatal
-            if target.interactive_auth:
-                log.warning(
-                    "target %s: close_command skipped, interactive_auth route "
-                    "needs a second factor; the allocation may need a manual "
-                    "scancel: %s",
-                    name,
-                    exc,
-                )
-            else:
-                log.warning(
-                    "target %s: close_command skipped, could not open a route "
-                    "connection: %s",
-                    name,
-                    exc,
-                )
+            log.warning(
+                "target %s: close_command skipped, could not open a route "
+                "connection: %s",
+                name,
+                exc,
+            )
             return
         try:
             await self._run_close_on_connection(

@@ -2658,6 +2658,58 @@ async def test_stop_target_releases_when_tunnel_already_gone(monkeypatch):
     assert gw.runtimes["hal"].state == "disconnected"
 
 
+async def test_stop_target_does_not_dial_interactive_auth_route(
+    monkeypatch, caplog
+):
+    """An interactive_auth target is never dialed without a factor.
+
+    The key-only route connection cannot supply the second factor, so dialing
+    it would only produce a guaranteed login failure that can trip fail2ban /
+    account lockout policies.  The gateway must skip the factor-less reconnect
+    for such targets without raising, and log the manual scancel hint.
+    """
+    import logging
+
+    gw = make_gateway()
+    target = _tunnel_target(interactive_auth=True, close_command=("scancel",))
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    # Tunnel already gone, exactly as during shutdown after a lost route.
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.tunnel = None
+    calls = _record_close(gw, monkeypatch)
+
+    dialed = []
+
+    async def fake_open_route_connection(t, route, connection_timeout=None):
+        dialed.append((t.name, route, connection_timeout))
+        return _FakeTunnel(t, route=route, local_port=0, connection=object())
+
+    monkeypatch.setattr(
+        gw.tunnels, "open_route_connection", fake_open_route_connection
+    )
+
+    with caplog.at_level(logging.WARNING, logger="compute_mcp.gateway"):
+        # Must not raise, and must not attempt the factor-less dial at all.
+        await gw.stop_target("hal")
+
+    assert dialed == []
+    assert calls == []
+    assert gw.runtimes["hal"].tunnel is None
+    assert gw.runtimes["hal"].state == "disconnected"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "interactive_auth requires a second factor" in m
+        and "manual scancel" in m
+        for m in messages
+    )
+
+
 async def test_stop_target_swallows_failed_short_route_dial(monkeypatch):
     """A failing fresh-route dial is advisory: teardown still completes."""
     gw, target = _close_gateway()
