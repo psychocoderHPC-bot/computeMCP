@@ -104,6 +104,15 @@ case "$RUNTIME" in
     "") echo 'COMPUTEMCP_CONTAINER_RUNTIME must be apptainer or docker.' >&2; exit 2 ;;
     *) echo "Unsupported container runtime: $RUNTIME" >&2; exit 2 ;;
 esac
+# Environment hygiene for the Apptainer path.  A bind list inherited from the
+# login node or the scheduler spool environment (APPTAINER_BIND/BINDPATH) would
+# silently change the mount set of ``instance start``; drop it once, before any
+# apptainer invocation.  Done after the availability check so a missing binary
+# still fails with the established message.
+if [ "$RUNTIME" = apptainer ]; then
+    command -v apptainer >/dev/null || { echo 'apptainer not found.' >&2; exit 1; }
+    unset APPTAINER_BIND APPTAINER_BINDPATH
+fi
 if ! { [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] && (( CONTAINER_PORT >= 1024 && CONTAINER_PORT <= 65535 )); }; then
     echo "Invalid container port: $CONTAINER_PORT" >&2
     exit 2
@@ -173,6 +182,108 @@ install_authorized_key() {
     fi
     printf '%s\n' "$KEY" > "$AUTH"
     chmod 600 "$AUTH"
+}
+
+# ---------------------------------------------------------------------------
+# Architecture check (Apptainer sandbox vs compute node)
+# ---------------------------------------------------------------------------
+# A sandbox built on a login node of another architecture (e.g. an x86-64
+# sandbox started on an aarch64 NVIDIA Grace partition) fails deep inside
+# Apptainer with an opaque ``exec format error``.  Detect the mismatch up
+# front and print an actionable error instead.
+#
+# The sandbox ``/bin/sh`` is a reliably-present ELF binary; its e_machine
+# (offset 18 of the ELF header) names the architecture without depending on
+# ``file`` being installed.  ``od`` is part of coreutils and always present.
+#
+# COMPUTEMCP_NODE_ARCH is a test/override-only escape hatch: when set it
+# replaces ``uname -m`` for this check.  It is validated against the known
+# architecture tokens and otherwise ignored.
+
+# Map an ELF e_machine value (hex, no ``0x``) to a canonical architecture
+# token.  Arch names are normalized so ``uname -m`` and the ELF value compare
+# canonically.  Unknown machines print nothing so callers can warn and proceed.
+elf_machine_to_arch() {
+    case "${1,,}" in
+        003e|3e) printf 'x86_64' ;;
+        00b7|b7) printf 'aarch64' ;;
+        0003|03) printf 'i386' ;;
+        0028|28) printf 'arm' ;;
+        0008|08|000a|0a) printf 'mips' ;;
+        002a|2a) printf 'sh' ;;
+        00f3|f3) printf 'riscv' ;;
+        *) printf '' ;;
+    esac
+}
+
+# Canonicalize this node's architecture.  Honors COMPUTEMCP_NODE_ARCH when it
+# is a recognized token; otherwise falls back to ``uname -m``.
+node_arch() {
+    local RAW="${COMPUTEMCP_NODE_ARCH:-}"
+    if [ -z "$RAW" ]; then
+        RAW="$(uname -m 2>/dev/null || true)"
+    fi
+    case "${RAW,,}" in
+        x86_64|amd64) printf 'x86_64' ;;
+        aarch64|arm64) printf 'aarch64' ;;
+        i386|i486|i586|i686|x86) printf 'i386' ;;
+        armv5*|armv6*|armv7*|arm) printf 'arm' ;;
+        mips|mips64) printf 'mips' ;;
+        sh|sh4) printf 'sh' ;;
+        riscv64|riscv) printf 'riscv' ;;
+        *) printf '' ;;
+    esac
+}
+
+# Print the sandbox architecture token, or return non-zero when the binary is
+# missing/unreadable or is not an ELF file.  A readable ELF with an unknown
+# e_machine returns 0 with empty output (the caller warns and proceeds).
+sandbox_arch() {
+    local BIN="$1" HEADER
+    [ -n "$BIN" ] && [ -r "$BIN" ] || return 1
+    # ``od`` wraps its output every 16 bytes; collapse the newlines before
+    # splitting the whitespace-separated hex bytes.
+    HEADER="$(od -An -v -tx1 -N20 -- "$BIN" 2>/dev/null | tr '\n' ' ')" || return 1
+    local -a BYTES=()
+    read -r -a BYTES <<< "$HEADER" || return 1
+    [ "${#BYTES[@]}" -ge 20 ] || return 1
+    [ "${BYTES[0]}" = 7f ] && [ "${BYTES[1]}" = 45 ] &&
+        [ "${BYTES[2]}" = 4c ] && [ "${BYTES[3]}" = 46 ] || return 1
+    local MACHINE
+    if [ "${BYTES[5]}" = 02 ]; then
+        MACHINE="${BYTES[18]}${BYTES[19]}"   # big-endian e_machine
+    else
+        MACHINE="${BYTES[19]}${BYTES[18]}"   # little-endian e_machine
+    fi
+    elf_machine_to_arch "$MACHINE"
+}
+
+# Reject a sandbox whose architecture differs from this node's.  A sandbox we
+# cannot classify (missing/non-ELF binary, unknown e_machine, unknown node
+# arch) only warns: blocking a working setup is worse than the opaque error.
+check_sandbox_arch() {
+    local TARGET="$SANDBOX/bin/sh"
+    if [ ! -e "$TARGET" ]; then
+        TARGET="$SANDBOX/usr/bin/sh"
+    fi
+    local SANDBOX_ARCH NODE_ARCH
+    if ! SANDBOX_ARCH="$(sandbox_arch "$TARGET")"; then
+        echo "WARNING: could not determine the sandbox architecture of $TARGET; proceeding." >&2
+        return 0
+    fi
+    if [ -z "$SANDBOX_ARCH" ]; then
+        echo "WARNING: unrecognized ELF machine in $TARGET; proceeding." >&2
+        return 0
+    fi
+    NODE_ARCH="$(node_arch)"
+    if [ -z "$NODE_ARCH" ]; then
+        echo "WARNING: could not determine this node's architecture; proceeding." >&2
+        return 0
+    fi
+    if [ "$SANDBOX_ARCH" != "$NODE_ARCH" ]; then
+        echo "Sandbox architecture '$SANDBOX_ARCH' does not match this node '$NODE_ARCH': $TARGET. Build the sandbox for the compute-node architecture (build it on a node of this partition, or use a matching image); starting it here would fail with 'exec format error'." >&2
+        exit 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -450,7 +561,15 @@ apptainer_start() {
     if [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
         export APPTAINERENV_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
     fi
+    # A sandbox built for another architecture cannot start here; fail with an
+    # actionable message before Apptainer emits its opaque exec-format error.
+    check_sandbox_arch
     local COMMON=(--fakeroot --writable --containall --no-mount "home,cwd,hostfs,bind-paths")
+    # Start from a directory that exists on this node: an inherited batch CWD
+    # may be a path that is absent on the compute node, which makes Apptainer
+    # warn and fall back to '/'.  The bind set and instance-start arguments are
+    # unchanged; only the invoking cwd is normalized.
+    cd /
     apptainer instance start "${COMMON[@]}" \
         --bind "$HOST_HOME:/root" \
         --bind "$HOST_HOME:/home/$SSH_USER" \

@@ -2170,3 +2170,140 @@ def test_provision_without_home_and_without_storage_root_fails_clearly(tmp_path)
     assert "unbound variable" not in result.stderr, result.stderr
     assert "COMPUTEMCP_STORAGE_ROOT" in result.stderr, result.stderr
     assert "HOME" in result.stderr, result.stderr
+
+
+# --- Apptainer sandbox architecture hardening ------------------------------
+#
+# JURECA's ``dc-gh`` partition is ARM/aarch64 (NVIDIA Grace).  A sandbox built
+# on the x86-64 login node aborts inside Apptainer with an opaque
+# ``exec format error``; the start path now reads the sandbox ELF architecture,
+# compares it with the node, and reports the mismatch clearly.  The node arch
+# is injectable through COMPUTEMCP_NODE_ARCH (test/override only) so the check
+# is hermetic.
+
+
+def _write_elf_stub(path: Path, e_machine: int) -> None:
+    """Write a minimal ELF header carrying ``e_machine`` (little-endian)."""
+    header = bytearray(20)
+    header[0:4] = b"\x7fELF"
+    header[4] = 2  # EI_CLASS = ELFCLASS64
+    header[5] = 1  # EI_DATA = ELFDATA2LSB
+    header[6] = 1
+    # e_type lives at offset 16; e_machine at offset 18 (0x12).
+    header[16] = 3  # ET_DYN
+    header[18] = e_machine & 0xFF
+    header[19] = (e_machine >> 8) & 0xFF
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(header))
+
+
+def _run_apptainer_start(
+    tmp_path: Path,
+    *,
+    sandbox_sh_machine: int,
+    node_arch: str,
+    ssh_user: str = "ubuntu",
+) -> tuple[subprocess.CompletedProcess, Path]:
+    """Configure a fake sandbox, give ``bin/sh`` an ELF machine, then ``start``.
+
+    Returns (result, apptainer call log path).  The apptainer stub records its
+    argv so a test can prove whether ``instance start`` was reached.
+    """
+    root = tmp_path / "apptainer"
+    sandbox = _make_fake_sandbox(root)
+    result, sandbox, host_home = _run_apptainer_configure(
+        tmp_path, ssh_user, _free_port(), sandbox=sandbox
+    )
+    assert result.returncode == 0, result.stderr
+    _write_elf_stub(sandbox / "bin/sh", sandbox_sh_machine)
+
+    stub = root / "bin" / "apptainer"
+    calls = root / "apptainer-calls.log"
+    stub.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\nexit 0\n",
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+            "COMPUTEMCP_SYSTEM": "archtest",
+            "COMPUTEMCP_SANDBOX_DIR": str(sandbox),
+            "COMPUTEMCP_HOST_HOME": str(host_home),
+            "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
+            "COMPUTEMCP_STORAGE_ROOT": str(root / "storage"),
+            "COMPUTEMCP_SSH_USER": ssh_user,
+            "COMPUTEMCP_SSH_WAIT_SECONDS": "2",
+            "COMPUTEMCP_CONTAINER_PORT": str(_free_port()),
+            "COMPUTEMCP_NODE_ARCH": node_arch,
+        }
+    )
+    env["PATH"] = str(root / "bin") + os.pathsep + env["PATH"]
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "start"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=root,
+    )
+    return result, calls
+
+
+def test_apptainer_start_rejects_arch_mismatch(tmp_path):
+    """A sandbox of another architecture fails with an actionable message.
+
+    Case A: the sandbox ``/bin/sh`` is aarch64 (0xb7) while the node is x86_64,
+    so start must exit non-zero, name both architectures and the sandbox path,
+    and never reach ``apptainer instance start``.
+    """
+    result, calls = _run_apptainer_start(
+        tmp_path, sandbox_sh_machine=0xB7, node_arch="x86_64"
+    )
+    assert result.returncode != 0, (result.returncode, result.stdout, result.stderr)
+    assert "does not match" in result.stderr, result.stderr
+    assert "aarch64" in result.stderr, result.stderr
+    assert "x86_64" in result.stderr, result.stderr
+    assert "bin/sh" in result.stderr, result.stderr
+    assert "exec format error" in result.stderr, result.stderr
+    # The opaque error must be prevented, not merely explained afterwards.
+    calls_text = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    assert "instance start" not in calls_text, calls_text
+
+
+def test_apptainer_start_proceeds_on_matching_arch(tmp_path):
+    """Matching architectures pass the check and reach ``instance start``.
+
+    Case B: an x86-64 sandbox (0x3e) on an x86_64 node must not emit the arch
+    error; the stub start succeeds and the run then stops at the banner wait,
+    exactly like the existing start tests.
+    """
+    result, calls = _run_apptainer_start(
+        tmp_path, sandbox_sh_machine=0x3E, node_arch="x86_64"
+    )
+    assert "does not match" not in result.stderr, result.stderr
+    assert calls.is_file(), result.stderr
+    calls_text = calls.read_text(encoding="utf-8")
+    assert "instance start" in calls_text, calls_text
+    # The stub serves no SSH banner, so the run stops at the banner wait.
+    assert "Apptainer SSH endpoint did not become ready." in result.stderr, (
+        result.returncode,
+        result.stdout,
+        result.stderr,
+    )
+
+
+def test_apptainer_start_warns_on_unknown_arch(tmp_path):
+    """An unclassifiable sandbox only warns and proceeds.
+
+    Case C: an unknown e_machine (0x1234) cannot be compared, so the check must
+    warn instead of blocking a setup that may well work.
+    """
+    result, calls = _run_apptainer_start(
+        tmp_path, sandbox_sh_machine=0x1234, node_arch="x86_64"
+    )
+    assert "does not match" not in result.stderr, result.stderr
+    assert "WARNING" in result.stderr, result.stderr
+    calls_text = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    assert "instance start" in calls_text, calls_text
