@@ -398,6 +398,29 @@ def test_inline_and_tokens_file_duplicate_rejected(tmp_path):
     assert "unique token" in msg
 
 
+def test_tokens_file_duplicate_rejected(tmp_path):
+    from compute_mcp.auth import hash_token
+
+    tokens = tmp_path / "tokens.toml"
+    # Both ids come only from the tokens file: one already hashed, one in clear
+    # text that hashes to the same digest.
+    tokens.write_text(f'[tokens]\na = "{hash_token("SAME")}"\nb = "SAME"\n')
+    raw = base_raw()
+    raw["clients"] = {
+        "a": {"targets": ["hal"]},
+        "b": {"targets": ["*"]},
+    }
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(
+            raw,
+            config_path=str(tmp_path / "config.toml"),
+            token_file=str(tokens),
+        )
+    msg = str(excinfo.value)
+    assert "'a'" in msg and "'b'" in msg
+    assert "unique token" in msg
+
+
 def test_distinct_tokens_still_accepted():
     raw = base_raw()
     raw["clients"] = {

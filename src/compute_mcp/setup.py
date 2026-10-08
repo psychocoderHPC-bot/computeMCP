@@ -1009,9 +1009,10 @@ def run_bootstrap(
     )
     allow_enrollment = wizard.confirm(
         "Allow interactive enrollment (handshake)?",
-        default=True,
-        description="lets a Terok task request access; approval stays manual. "
-        "Written to the config so you can disable it later.",
+        default=False,
+        description="off by default. Enabling it exposes the unauthenticated "
+        "/v1/enroll endpoint so a Terok task can request access; approval stays "
+        "manual. Written to the config so you can change it later.",
     )
 
     # The operator client for computeMCP-gatewayctl.  A Terok task receives its
