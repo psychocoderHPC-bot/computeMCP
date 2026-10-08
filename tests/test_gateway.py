@@ -873,7 +873,59 @@ async def test_headless_interactive_target_raises_clear_error(monkeypatch):
         await gw._open_container_conn("hal")
 
 
-async def test_interactive_target_connects_with_factor(monkeypatch):
+async def test_connected_target_with_stale_factor_surfaces_real_dial_error(monkeypatch):
+    """A stale awaiting_factor on a live target must not mask a real dial error.
+
+    The invariant after a successful connect is ``state == "connected"`` and
+    ``awaiting_factor is False`` together.  If a stale flag remains (e.g. from a
+    factor-less refresh), a container-dial ``SSHError`` must surface as-is rather
+    than being mapped to the 2FA 503.
+    """
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, target = _interactive_gateway()
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.tunnel = _FakeTunnel(target, route="hal", local_port=2222, alive=True)
+    # Simulate the stale window: connected + live tunnel, flag still set.
+    runtime.awaiting_factor = True
+
+    async def fake_ensure(name):
+        return runtime
+
+    async def boom(target, host, port):
+        raise SSHError("container dial refused")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 2222))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    with pytest.raises(SSHError, match="container dial refused"):
+        await gw._open_container_conn("hal")
+
+
+async def test_genuinely_awaiting_factor_still_yields_2fa_503(monkeypatch):
+    """A factor that is genuinely outstanding (target not connected) stays a 503."""
+    from compute_mcp.gateway import InteractiveAuthRequired
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, target = _interactive_gateway()
+    runtime = gw.runtimes["hal"]
+    runtime.state = "disconnected"
+    runtime.awaiting_factor = True
+
+    async def fake_ensure(name):
+        return runtime
+
+    async def boom(target, host, port):
+        raise SSHError("container dial refused")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 2222))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    with pytest.raises(InteractiveAuthRequired):
+        await gw._open_container_conn("hal")
     """An interactive target dials the route with the supplied factor."""
     import dataclasses
 

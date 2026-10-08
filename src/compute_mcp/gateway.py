@@ -435,9 +435,14 @@ class Gateway:
         async with self._lock(name):
             runtime = self.runtimes[name]
             if runtime.state == "connected":
+                # A live target is by definition no longer awaiting a factor, so
+                # clear a flag left over from a factor-less refresh or a previous
+                # loss.  Otherwise the stale flag could mask a real dial failure.
                 if target.transport.kind == "direct":
+                    runtime.awaiting_factor = False
                     return runtime
                 if runtime.tunnel and runtime.tunnel.is_alive():
+                    runtime.awaiting_factor = False
                     return runtime
                 self._mark_lost(runtime, "tunnel connection closed")
             # Recovery/automatic reconnect must retain the resolved settings
@@ -509,6 +514,9 @@ class Gateway:
         runtime.needs_refresh = False
         runtime.backoff = 0.0
         runtime.state = "connected"
+        # A successful connect resolves any outstanding factor: the invariant
+        # after this point is ``state == "connected"`` and
+        # ``awaiting_factor is False`` together.
         runtime.awaiting_factor = False
         return runtime
 
@@ -906,6 +914,37 @@ class Gateway:
         return prompter
 
     # -- connection providers for exec/sessions --------------------------
+    def _target_connected_live(
+        self, target: TargetConfig, runtime: TargetRuntime
+    ) -> bool:
+        """Whether the target is successfully connected with a usable route.
+
+        Mirrors the early-return liveness test in ``ensure_connected``: a direct
+        transport is live as soon as it is connected; a tunnel target also needs
+        an alive tunnel.
+        """
+        if runtime.state != "connected":
+            return False
+        if target.transport.kind == "direct":
+            return True
+        return runtime.tunnel is not None and runtime.tunnel.is_alive()
+
+    def _factor_outstanding(
+        self, target: TargetConfig, runtime: TargetRuntime
+    ) -> bool:
+        """Whether a second factor is genuinely still outstanding.
+
+        ``awaiting_factor`` is authoritative only while the target is not
+        successfully connected with a usable route.  A live target is treated as
+        resolved even if a stale flag remains, so a real container-dial failure
+        surfaces as-is instead of being masked as a 2FA-required 503.
+        """
+        return (
+            target.interactive_auth
+            and runtime.awaiting_factor
+            and not self._target_connected_live(target, runtime)
+        )
+
     async def _open_container_conn(self, name: str, force_dedicated: bool = False):
         """Open the container SSH connection for a target.
 
@@ -920,10 +959,14 @@ class Gateway:
             # A real tunnel/host-key/dial failure on an interactive target must
             # surface as-is (502).  Map to 503 only when this target is known to
             # still be awaiting a factor.
-            if target.interactive_auth and self.runtimes[name].awaiting_factor:
+            if self._factor_outstanding(target, self.runtimes[name]):
                 raise InteractiveAuthRequired(name) from None
             raise
         runtime = self.runtimes[name]
+        # Pre-dial gate: while the target is not connected at all a factor is
+        # genuinely outstanding, so refuse before dialing.  A target that claims
+        # to be connected is dialed, and any failure is classified by the final
+        # gate below (which also carries the dial detail).
         if (
             target.interactive_auth
             and runtime.awaiting_factor
@@ -985,7 +1028,7 @@ class Gateway:
             # Only map to 503 while a factor is genuinely outstanding.  A real
             # container-dial failure (stopped container, refused port, ...) on
             # an interactive target must surface as-is (502) with its message.
-            if target.interactive_auth and runtime.awaiting_factor:
+            if self._factor_outstanding(target, runtime):
                 raise InteractiveAuthRequired(name, detail=str(first)) from None
             raise first
 
