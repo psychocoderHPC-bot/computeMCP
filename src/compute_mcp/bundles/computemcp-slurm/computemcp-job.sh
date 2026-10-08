@@ -3,34 +3,32 @@
 #
 # Runs inside the allocation on the compute node.  It starts the container via
 # computemcp-container.sh (on the first node) and then keeps the allocation
-# alive.  The job-step arguments come from the per-job settings file whose path
-# the provisioning helper passes as the first positional argument (with
-# COMPUTEMCP_SRUN_SETTINGS_FILE as an environment fallback); they are the
-# SRUN_ARGS the gateway rendered and are deliberately NOT copied from the
-# sbatch stage.
+# alive.  The container configuration comes from the per-job settings file whose
+# path the provisioning helper passes as the first positional argument (with
+# COMPUTEMCP_SRUN_SETTINGS_FILE as an environment fallback).  The settings file
+# also carries COMPUTEMCP_SRUN_ARGS for the relay's ``--connect`` job steps; the
+# relay reads them via COMPUTEMCP_CPU_BIND from the environment the login node
+# exported, so this batch script does not parse them.
 set -euo pipefail
 umask 077
 
 : "${SLURM_JOB_ID:?Must run inside a Slurm allocation}"
 
-STATE="${COMPUTEMCP_STATE_DIR:-}"
-CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
-SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
-SRUN_ARGS=()
 # The provisioning helper passes the per-job settings file path as the first
 # positional argument, which Slurm delivers verbatim even with --export=NONE.
-# This is the SRUN_ARGS transport: it does not touch the user's export policy.
-# Sourcing must happen before STATE is required, because with --export=NONE the
-# settings file is the only carrier of the container configuration.
+# Source it FIRST: it exports the whole container configuration (STATE, port,
+# banner timeout, runtime, ...) in THIS batch shell, so a restrictive export
+# policy that strips the gateway's COMPUTEMCP_* variables cannot leave the
+# direct container start below with defaults.
 SETTINGS="${1:-${COMPUTEMCP_SRUN_SETTINGS_FILE:-}}"
 if [ -n "$SETTINGS" ] && [ -r "$SETTINGS" ]; then
-    # Source the per-job settings: it exports the whole container configuration
-    # and COMPUTEMCP_SRUN_ARGS (one complete argument per line, no trailing
-    # newline, exactly as the gateway rendered it).
     # shellcheck disable=SC1090
     source "$SETTINGS"
 fi
+
 STATE="${COMPUTEMCP_STATE_DIR:?COMPUTEMCP_STATE_DIR is required}"
+CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
+SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 
 # Resolve the bundle directory.  Slurm may copy this batch script into its spool
 # directory (e.g. JURECA /var/spool/parastation/jobs), so ``BASH_SOURCE`` points
@@ -47,10 +45,6 @@ CONTAINER_SCRIPT="$SCRIPT_DIR/computemcp-container.sh"
     echo "Missing container script: $CONTAINER_SCRIPT (resolved from COMPUTEMCP_BUNDLE_DIR='${COMPUTEMCP_BUNDLE_DIR:-}')" >&2
     exit 1
 }
-
-if [ -n "${COMPUTEMCP_SRUN_ARGS:-}" ]; then
-    mapfile -t SRUN_ARGS <<< "$COMPUTEMCP_SRUN_ARGS"
-fi
 
 # Apply the provision hook again on the compute node: a login-node ``module
 # load`` / ``source`` does not propagate into the allocation.  The settings file
@@ -103,20 +97,17 @@ if [ "${COMPUTEMCP_BUILD_LOCATION:-login}" = compute ]; then
     fi
 fi
 
-# Launch the container step explicitly through srun.  The step carries only the
-# rendered SRUN_ARGS; sbatch settings are never copied here.  A restrictive
-# sbatch --export policy (e.g. --export=SLURM_SUBMIT_DIR=...) can strip this
-# batch script's runtime environment from the srun step, so when the settings
-# file is available the step re-sources it first (the same settings-file
-# transport one level deeper) and stays self-contained.  The path is passed as
-# a positional argv, never interpolated into the wrapper script text, so spaces
-# and quotes survive.
-if [ -n "$SETTINGS" ] && [ -r "$SETTINGS" ]; then
-    srun "${SRUN_ARGS[@]}" bash -c 'source "$1" || exit 1; shift; exec "$@"' \
-        computemcp-step "$SETTINGS" bash "$CONTAINER_SCRIPT" start
-else
-    srun "${SRUN_ARGS[@]}" bash "$CONTAINER_SCRIPT" start
-fi
+# Start the container DIRECTLY on this batch node.  It must NOT run inside an
+# ``srun`` job step: under fakeroot/root-mapped Apptainer the instance's
+# lifetime is tied to the step, so when the step command exits the scheduler
+# tears down the step cgroup and kills the instance ("no instance found" moments
+# later, even though ``instance start`` reported success).  The batch process
+# keeps the allocation alive, so the instance it starts here survives.  The
+# settings file was already sourced above, so this shell owns the full
+# COMPUTEMCP_* environment regardless of the user's --export policy.  SRUN_ARGS
+# apply only to the relay's internal ``--connect`` steps, not to starting the
+# instance, so they are not passed here.
+bash "$CONTAINER_SCRIPT" start
 STARTED=1
 
 # Publish the node only after the container serves an SSH banner.

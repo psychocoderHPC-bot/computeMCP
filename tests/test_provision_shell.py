@@ -364,7 +364,10 @@ SBATCH = '''#!/usr/bin/env bash
 # sbatch stub: log argv, then emulate the scheduler starting the batch script.
 # Slurm passes the batch script path and the per-job settings file as the last
 # two positional arguments, so it runs that script in the background with a
-# fake job id and reports the id plus a test cluster name.
+# fake job id and reports the id plus a test cluster name.  With
+# SLURM_STRIP_JOB_ENV=1 it launches the batch script with HOME and every
+# COMPUTEMCP_* variable removed, modelling a restrictive ``--export`` policy;
+# the positional settings path survives, so the batch script must re-source it.
 set -euo pipefail
 LOG="${SLURM_STUB_LOG:-/dev/null}"
 printf 'sbatch %s\\n' "$*" >> "$LOG"
@@ -374,8 +377,21 @@ N=${#ARGS[@]}
 SETTINGS="${ARGS[N-1]}"
 JOB_SCRIPT="${ARGS[N-2]}"
 export SLURM_JOB_ID=4242
+LAUNCH=(bash)
+if [ "${SLURM_STRIP_JOB_ENV:-}" = 1 ]; then
+    LAUNCH=(env -u HOME
+        -u COMPUTEMCP_SYSTEM -u COMPUTEMCP_STORAGE_ROOT -u COMPUTEMCP_STATE_DIR
+        -u COMPUTEMCP_BUNDLE_DIR -u COMPUTEMCP_SANDBOX_DIR -u COMPUTEMCP_HOST_HOME
+        -u COMPUTEMCP_CONTAINER_RUNTIME -u COMPUTEMCP_IMAGE -u COMPUTEMCP_GPU_VENDORS
+        -u COMPUTEMCP_BUILD_LOCATION -u COMPUTEMCP_CPUS_PER_NODE
+        -u COMPUTEMCP_GPUS_PER_NODE -u COMPUTEMCP_MEMORY_PER_NODE_MIB
+        -u COMPUTEMCP_CONTAINER_PORT -u COMPUTEMCP_SSH_WAIT_SECONDS -u COMPUTEMCP_SSH_USER
+        -u COMPUTEMCP_SSH_PUBLIC_KEY -u COMPUTEMCP_CPU_BIND -u COMPUTEMCP_SRUN_ARGS
+        -u COMPUTEMCP_PROVISION_ENV
+        bash)
+fi
 if [ -n "${SLURM_JOB_OUT:-}" ]; then
-    nohup bash "$JOB_SCRIPT" "$SETTINGS" >"$SLURM_JOB_OUT" 2>&1 </dev/null 9>&- &
+    nohup "${LAUNCH[@]}" "$JOB_SCRIPT" "$SETTINGS" >"$SLURM_JOB_OUT" 2>&1 </dev/null 9>&- &
     echo "$!" > "$SLURM_JOB_OUT.pid"
 fi
 printf '4242;testcluster\\n'
@@ -414,28 +430,6 @@ if [ "$N" -ge 2 ] && [ "${ARGS[N-2]}" = "--connect" ]; then
 fi
 
 exec "$@"
-'''
-
-# A dedicated srun stub for the restrictive-export regression: before running
-# the requested step it strips the batch script's runtime environment, exactly
-# as a restrictive sbatch --export policy (e.g. --export=SLURM_SUBMIT_DIR=...)
-# does.  The step must therefore re-source the per-job settings file itself.
-# The relay's ``--connect`` step is left untouched (it does not depend on the
-# container configuration), so the Slurm-mode flow still terminates cleanly.
-STRIPPING_SRUN = '''#!/usr/bin/env bash
-# srun stub that strips the batch runtime environment from the job step.
-set -euo pipefail
-LOG="${SLURM_STUB_LOG:-/dev/null}"
-printf 'srun %s\\n' "$*" >> "$LOG"
-env | grep '^COMPUTEMCP_' | sort >> "$LOG" || true
-
-ARGS=("$@")
-N=${#ARGS[@]}
-if [ "$N" -ge 2 ] && [ "${ARGS[N-2]}" = "--connect" ]; then
-    exec python3 "$CONNECT_BRIDGE" "${ARGS[N-1]}"
-fi
-
-exec env -u COMPUTEMCP_STORAGE_ROOT -u COMPUTEMCP_STATE_DIR -u COMPUTEMCP_BUNDLE_DIR -u HOME "$@"
 '''
 
 
@@ -702,17 +696,20 @@ def test_slurm_mode_submits_job_and_reports_relay_endpoint(tmp_path, stubs):
         teardown()
 
 
-def test_slurm_job_step_resources_settings_when_env_is_stripped(tmp_path, stubs):
-    """The srun step must be self-contained under a restrictive export policy.
+def test_slurm_job_start_resources_settings_when_env_is_stripped(tmp_path, stubs):
+    """The direct container start works under a restrictive export policy.
 
     A JURECA submission with ``--export=SLURM_SUBMIT_DIR=...`` (no ``ALL``)
-    strips the batch script's runtime environment from the srun step, so the
-    step did not see the ``COMPUTEMCP_*`` values that ``computemcp-job.sh``
-    exported in its own shell, and ``computemcp-container.sh`` aborted with
-    "Neither COMPUTEMCP_STORAGE_ROOT nor HOME".  The dedicated stripping srun
-    stub removes those variables before executing the step; the wrapper must
-    re-source the per-job settings file inside the step and reach the docker
-    runtime.  On the parent commit this test fails; the wrapper makes it pass.
+    strips the batch script's runtime environment, so ``computemcp-job.sh``
+    starts without the ``COMPUTEMCP_*`` values the gateway exported and
+    ``computemcp-container.sh`` would abort with "Neither
+    COMPUTEMCP_STORAGE_ROOT nor HOME".  The settings file path is passed as a
+    positional argument, which Slurm delivers even under ``--export=NONE``, and
+    job.sh re-sources it in its own shell before the DIRECT container start, so
+    the restrictive export never reaches the start.  The sbatch stub runs the
+    batch script with HOME and every ``COMPUTEMCP_*`` variable removed; the
+    container must still start.  Note there is no srun step involved: the start
+    runs directly on the batch node, whose lifetime keeps the instance alive.
     """
     container_port = _free_port()
     forward_port = _free_port()
@@ -721,11 +718,9 @@ def test_slurm_job_step_resources_settings_when_env_is_stripped(tmp_path, stubs)
     storage = workdir / "storage"
     state_dir = storage / "striptest" / "state"
 
-    # Swap in the srun stub that models the restrictive export policy.
-    _write_stub(stubs.slurm.bin / "srun", STRIPPING_SRUN)
-
     env = _base_env("striptest", storage, container_port)
     env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
+    env["SLURM_STRIP_JOB_ENV"] = "1"
     env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
     env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
     env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
@@ -764,7 +759,8 @@ def test_slurm_job_step_resources_settings_when_env_is_stripped(tmp_path, stubs)
         assert (
             endpoint_line.strip() == f"ENDPOINT 127.0.0.1:{forward_port}"
         ), endpoint_line
-        # The step must NOT have fallen back to the HOME-less failure path.
+        # The start must NOT have fallen back to the HOME-less failure path:
+        # job.sh re-sourced the settings file in its own shell.
         job_out = (workdir / "slurm-job.out").read_text()
         combined = result.stderr + job_out
         assert "Neither COMPUTEMCP_STORAGE_ROOT nor HOME" not in combined, combined
@@ -1296,11 +1292,11 @@ def test_job_sh_reapplies_hook_from_settings_file(tmp_path, stubs, housekeeping)
     A login-node ``module load`` does not propagate into the allocation, so
     the per-job settings file transports ``COMPUTEMCP_PROVISION_ENV`` (via
     ``%q``) and the batch script re-runs each line in its own shell before
-    the job step starts.  This runs the REAL job.sh with a settings file
+    the container starts.  This runs the REAL job.sh with a settings file
     whose two hook lines create a marker and append a count: both must be
-    applied in the job shell while the stub ``srun`` starts the container
-    (banner already running) and keeps the allocation alive until this
-    test tears it down.
+    applied in the job shell while job.sh starts the container directly on
+    the batch node (banner already running) and keeps the allocation alive
+    until this test tears it down.
     """
     container_port = _free_port()
     workdir = tmp_path / "jobhook"
@@ -1386,7 +1382,7 @@ def test_job_sh_reapplies_hook_from_settings_file(tmp_path, stubs, housekeeping)
     try:
         # The job keeps the allocation alive forever; wait for both hook
         # lines to land in the job shell.  If the job exits on its own
-        # (e.g. srun stub exits fast) still check the marker.
+        # still check the marker.
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if hook_marker.exists() and hook_count.exists():
@@ -1402,10 +1398,13 @@ def test_job_sh_reapplies_hook_from_settings_file(tmp_path, stubs, housekeeping)
         )
         counts = hook_count.read_text(encoding="utf-8", errors="replace").splitlines()
         assert counts == ["applied"], counts
-        # The container-step log shows the stub srun launched after the hook
-        # (slurm log is non-empty because the stub records the invocation).
-        slurm_log = (workdir / "slurm.log").read_text(encoding="utf-8", errors="replace")
-        assert "srun" in slurm_log
+        # The start ran directly on the batch node: the docker stub saw the
+        # container start path run (it would not appear if the start had been
+        # wrapped in an srun step that exits).
+        docker_log = (workdir / "docker.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        assert "docker container inspect computemcp-jobhook" in docker_log, docker_log
     finally:
         if job.poll() is None:
             with contextlib.suppress(OSError):
@@ -1704,8 +1703,8 @@ def test_job_sh_builds_sandbox_on_compute_node(tmp_path, stubs):
 
     The login node skipped the build, so the batch script (running on the first
     allocated compute node) must build and configure the sandbox there before
-    starting the container.  The stub ``srun`` runs the start command, and the
-    log proves the build ran on the compute node.
+    starting the container.  The stub apptainer log proves the build ran on the
+    compute node.
     """
     APPTH = tmp_path / "apptainer-stub"
     APPTH.mkdir()
@@ -1772,8 +1771,11 @@ def test_job_sh_login_build_location_does_not_build(tmp_path, stubs):
     """build-location = login: job.sh never builds on the compute node.
 
     The default keeps the existing behavior exactly: the sandbox was built on
-    the login node, so the batch script only starts the container (the stub srun
-    records the start; no apptainer build call is made).
+    the login node, so the batch script only starts the container (the start
+    runs DIRECTLY on the batch node; no apptainer build call is made).  The
+    sandbox is absent here, so start stops at container.sh's "Missing sandbox"
+    gate -- proving the direct invocation reached the container script without
+    an srun step.
     """
     APPTH = tmp_path / "apptainer-stub"
     APPTH.mkdir()
@@ -1824,8 +1826,115 @@ def test_job_sh_login_build_location_does_not_build(tmp_path, stubs):
     )
     calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
     assert "build" not in calls, (calls, result.stderr)
-    # The start path was reached through the stub srun.
-    assert "srun" in (workdir / "slurm.log").read_text(encoding="utf-8")
+    # The container start ran directly on this node: container.sh's own
+    # missing-sandbox gate fired, and no srun step carried the start.
+    assert "Missing sandbox; use build first." in result.stderr, result.stderr
+    slurm_log = workdir / "slurm.log"
+    slurm_text = slurm_log.read_text(encoding="utf-8") if slurm_log.exists() else ""
+    assert "start" not in slurm_text, slurm_text
+
+
+def test_batch_job_starts_container_directly_not_via_srun(tmp_path, stubs):
+    """Regression: the Slurm batch path must start the instance WITHOUT srun.
+
+    Under fakeroot/root-mapped Apptainer (no user namespaces) the instance's
+    lifetime is tied to the ``srun`` job step: when the step command exits the
+    scheduler tears down the step cgroup and kills the instance, so
+    ``instance start`` reports success but the instance is gone moments later
+    ("no instance found").  The batch process itself keeps the allocation
+    alive, so job.sh must call ``computemcp-container.sh start`` directly.
+    A stub ``srun`` and a stub ``apptainer`` both log their invocations; the
+    test asserts the apptainer ``instance start`` happened and that no srun
+    call carried the container start.
+    """
+    APPTH = tmp_path / "apptainer-stub"
+    APPTH.mkdir()
+    app_log = tmp_path / "apptainer.log"
+    app = APPTH / "apptainer"
+    app.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'apptainer %s\\n\' "$*" >> {app_log}\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    app.chmod(0o755)
+
+    # srun stub records every call.  The relay's --connect steps never run in
+    # this test (the relay runs on the login node), so any srun entry carrying
+    # the container script would prove the start was wrapped.
+    srun_dir = tmp_path / "srun-stub"
+    srun_dir.mkdir()
+    srun_log = srun_dir / "srun.log"
+    _write_stub(
+        srun_dir / "srun",
+        "#!/usr/bin/env bash\n"
+        f"printf 'srun %s\\\\n' \"$*\" >> {srun_log}\n"
+        "exit 0\n",
+    )
+    # The start path probes the container port with ``ss`` when available;
+    # stub it to report the port free so the run reaches ``instance start``.
+    _write_stub(srun_dir / "ss", "#!/bin/sh\nexit 0\n")
+
+    workdir = tmp_path / "directstart"
+    workdir.mkdir()
+    state = workdir / "state"
+    state.mkdir()
+    port = _free_port()
+    sandbox = _make_fake_sandbox(workdir)
+    result, sandbox, host_home = _run_apptainer_configure(
+        tmp_path, "ubuntu", port, sandbox=sandbox
+    )
+    assert result.returncode == 0, result.stderr
+
+    settings = workdir / "settings"
+    settings.write_text(
+        "\n".join(
+            [
+                "export COMPUTEMCP_SYSTEM=directstart",
+                f"export COMPUTEMCP_STATE_DIR={state}",
+                f"export COMPUTEMCP_SANDBOX_DIR={sandbox}",
+                f"export COMPUTEMCP_HOST_HOME={host_home}",
+                "export COMPUTEMCP_CONTAINER_RUNTIME=apptainer",
+                "export COMPUTEMCP_IMAGE=docker://ubuntu:24.04",
+                "export COMPUTEMCP_BUILD_LOCATION=login",
+                "export COMPUTEMCP_SSH_PUBLIC_KEY='ssh-ed25519 AAAATEST fixture@test'",
+                "export COMPUTEMCP_SSH_USER=ubuntu",
+                "export COMPUTEMCP_SSH_WAIT_SECONDS=2",
+                f"export COMPUTEMCP_CONTAINER_PORT={port}",
+                f"export COMPUTEMCP_BUNDLE_DIR={BUNDLE_DIR}",
+                "export COMPUTEMCP_SRUN_ARGS='--cpu-bind=none'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["SLURM_JOB_ID"] = "9879"
+    env["PATH"] = (
+        str(srun_dir) + os.pathsep
+        + str(APPTH) + os.pathsep
+        + os.environ.get("PATH", "")
+    )
+    result = subprocess.run(
+        ["bash", str(JOB), str(settings)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=workdir,
+    )
+    # The direct start reached ``apptainer instance start``; the stub serves no
+    # banner, so the run then stops at the container script's banner wait.
+    app_calls = app_log.read_text(encoding="utf-8") if app_log.exists() else ""
+    assert "instance start" in app_calls, (app_calls, result.stderr, result.stdout)
+    # Regression: the start did NOT go through an srun step.  A future change
+    # that wraps the start in srun (the container-lifetime bug) would make the
+    # srun stub log the container script path here.
+    srun_text = srun_log.read_text(encoding="utf-8") if srun_log.exists() else ""
+    assert "computemcp-container.sh" not in srun_text, (
+        f"the container start went through srun:\n{srun_text}\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
 
 
 # --- Apptainer account provisioning ---------------------------------------
@@ -2306,30 +2415,37 @@ def test_job_sh_relocated_resolves_bundle_dir_from_settings(tmp_path):
     JURECA copies ``computemcp-job.sh`` into ``/var/spool/parastation/jobs/`` and
     runs it there, so ``BASH_SOURCE`` no longer points at the bundle.  The
     per-job settings file carries ``COMPUTEMCP_BUNDLE_DIR``; the relocated copy
-    must use it and get past the sibling check (reaching the job step).
+    must use it and reach ``computemcp-container.sh start``.  A stub container
+    script that records its argv stands in for the real one (the real start
+    needs a configured sandbox); reaching it proves the sibling resolution.
     """
     spool = tmp_path / "spool"
     spool.mkdir()
     relocated = spool / "computemcp-job.sh"
     shutil.copy2(JOB, relocated)
     state = tmp_path / "state"
-    stub_bin = tmp_path / "bin"
-    stub_bin.mkdir()
-    srun = stub_bin / "srun"
-    srun.write_text(
-        "#!/bin/sh\necho STUB-SRUN-REACHED >&2\nexit 1\n", encoding="utf-8"
+    state.mkdir()
+    # A sibling container script that marks the unreachable line: if job.sh
+    # resolves COMPUTEMCP_BUNDLE_DIR, it runs this and fails here rather than
+    # writing a ready file, which the test detects via the marker.
+    bundle = tmp_path / "spoolbundle"
+    bundle.mkdir()
+    container = bundle / "computemcp-container.sh"
+    container.write_text(
+        "#!/bin/sh\necho STUB-CONTAINER-REACHED >&2\nexit 1\n", encoding="utf-8"
     )
-    srun.chmod(0o755)
+    container.chmod(0o755)
+    # srun is deliberately NOT stubbed: if job.sh still wrapped the start in an
+    # srun job step, the missing srun would abort the run before the marker.
     settings = tmp_path / "settings"
     settings.write_text(
         f"export COMPUTEMCP_STATE_DIR={_shell_quote(str(state))}\n"
-        f"export COMPUTEMCP_BUNDLE_DIR={_shell_quote(str(BUNDLE_DIR))}\n",
+        f"export COMPUTEMCP_BUNDLE_DIR={_shell_quote(str(bundle))}\n",
         encoding="utf-8",
     )
     env = dict(os.environ)
     env.pop("COMPUTEMCP_BUNDLE_DIR", None)
     env["SLURM_JOB_ID"] = "9001"
-    env["PATH"] = str(stub_bin) + os.pathsep + os.environ.get("PATH", "")
     result = subprocess.run(
         ["bash", str(relocated), str(settings)],
         capture_output=True,
@@ -2339,8 +2455,9 @@ def test_job_sh_relocated_resolves_bundle_dir_from_settings(tmp_path):
         cwd=spool,
     )
     assert "Missing container script" not in result.stderr, result.stderr
-    # Reaching the stub srun proves the sibling resolution succeeded.
-    assert "STUB-SRUN-REACHED" in result.stderr, result.stderr
+    # Reaching the stub container script proves the sibling resolution succeeded
+    # and that the start was invoked directly (no srun).
+    assert "STUB-CONTAINER-REACHED" in result.stderr, result.stderr
 
 
 def test_job_sh_relocated_without_bundle_dir_reports_missing_script(tmp_path):
@@ -2687,10 +2804,9 @@ def test_batch_job_start_rejects_stale_login_arch_sandbox(tmp_path):
     (here: an x86-64 login leaving an e_machine 0x3e /bin/sh) - must be
     rejected by the START path's architecture gate on the aarch64 compute node,
     with the actionable "does not match this node" error.  The batch script is
-    run exactly as the scheduler would (SLURM_JOB_ID + settings file), with an
-    srun stub that emulates running the job step on THIS node, and a stub
-    apptainer that records argv so the test proves ``instance start`` was
-    never reached.
+    run exactly as the scheduler would (SLURM_JOB_ID + settings file): it starts
+    the container DIRECTLY on this node (no srun step), and a stub apptainer that
+    records argv proves ``instance start`` was never reached.
     """
     APPTH = tmp_path / "apptainer-stub"
     APPTH.mkdir()
@@ -2703,8 +2819,8 @@ def test_batch_job_start_rejects_stale_login_arch_sandbox(tmp_path):
         encoding="utf-8",
     )
     app.chmod(0o755)
-    # srun stub for the job step; emulates an srun job step by running the
-    # command on this node (the same node, where the arch gate must fire).
+    # srun stub: the start must NOT go through it.  It only logs; if job.sh ever
+    # sent the start here the log would carry the container script path.
     srun_dir = tmp_path / "srun-stub"
     srun_dir.mkdir()
     srun_log = srun_dir / "srun.log"
@@ -2712,7 +2828,7 @@ def test_batch_job_start_rejects_stale_login_arch_sandbox(tmp_path):
         srun_dir / "srun",
         "#!/usr/bin/env bash\n"
         f"printf 'srun %s\\\\n' \"$*\" >> {srun_log}\n"
-        "exec \"$@\"\n",
+        "exit 0\n",
     )
 
     workdir = tmp_path / "stalesandbox"
@@ -2781,12 +2897,11 @@ def test_batch_job_start_rejects_stale_login_arch_sandbox(tmp_path):
     # compute-node build path is not triggered (the job only builds a MISSING
     # sandbox): no ``apptainer build`` call was made.
     assert "build" not in calls, (calls, result.stderr)
-    # The job step ran: the srun stub saw the start.
+    # The start ran directly on the batch node, not in an srun step: the srun
+    # stub never saw the container script.  (The relay's --connect steps are
+    # created by the login-side relay process, not by this batch script.)
     slurm_log = srun_log.read_text(encoding="utf-8") if srun_log.exists() else ""
-    assert f"computemcp-container.sh start" in slurm_log or "start" in slurm_log, (
-        slurm_log,
-        result.stderr,
-    )
+    assert "computemcp-container.sh" not in slurm_log, (slurm_log, result.stderr)
     # start exited non-zero with the actionable message, naming both
     # architectures, and the job script has no apptainer call log at all
     # (the arch gate fires before the first apptainer instance call), and the
