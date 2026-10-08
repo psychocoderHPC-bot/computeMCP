@@ -197,12 +197,19 @@ def plan_signature(summary: dict | None) -> tuple | None:
 class InteractiveAuthRequired(RuntimeError):
     """A target needs a second factor and no factor was supplied for the request."""
 
-    def __init__(self, target: str) -> None:
-        super().__init__(
+    def __init__(self, target: str, detail: str | None = None) -> None:
+        message = (
             f"target {target!r} requires interactive authentication (second "
             f"factor); run target-connect --2fa <secret> {target}"
         )
+        # The actionable sentence stays the prefix so existing substring
+        # assertions keep matching; the dial detail follows when known so the
+        # operator can see why the container hop failed in the awaiting case.
+        if detail:
+            message = f"{message} (container hop failed: {detail})"
+        super().__init__(message)
         self.target = target
+        self.detail = detail
 
 
 @dataclass
@@ -975,8 +982,11 @@ class Gateway:
                     return target, conn
                 except SSHError:
                     pass
-            if target.interactive_auth:
-                raise InteractiveAuthRequired(name) from None
+            # Only map to 503 while a factor is genuinely outstanding.  A real
+            # container-dial failure (stopped container, refused port, ...) on
+            # an interactive target must surface as-is (502) with its message.
+            if target.interactive_auth and runtime.awaiting_factor:
+                raise InteractiveAuthRequired(name, detail=str(first)) from None
             raise first
 
     async def _connection_provider(self, name: str):

@@ -866,6 +866,8 @@ async def test_headless_interactive_target_raises_clear_error(monkeypatch):
     monkeypatch.setattr(gw.backend, "connection", boom)
     monkeypatch.setattr(gw, "ensure_connected", no_connect)
     monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 9))
+    # A dial failure while a factor is still outstanding stays a 2FA error.
+    gw.runtimes["hal"].awaiting_factor = True
 
     with pytest.raises(InteractiveAuthRequired):
         await gw._open_container_conn("hal")
@@ -2179,6 +2181,79 @@ async def test_open_container_conn_maps_to_interactive_when_awaiting(monkeypatch
     monkeypatch.setattr(gw, "ensure_connected", boom)
     with pytest.raises(InteractiveAuthRequired):
         await gw._open_container_conn("hal")
+
+
+async def test_http_exec_surfaces_real_dial_error_not_2fa(monkeypatch):
+    """F1 regression: a connected interactive target whose container hop fails
+    must return the real dial error (502), never the misleading 2FA 503."""
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, _ = _interactive_gateway()
+    # Connected, factor already satisfied -> awaiting_factor stays False.  The
+    # container dial itself then fails for an unrelated reason.
+    gw.runtimes["hal"].state = "connected"
+    assert gw.runtimes["hal"].awaiting_factor is False
+
+    async def fake_ensure(name):
+        return gw.runtimes[name]
+
+    async def boom(t, host, port, prompter=None):
+        raise SSHError("container hop refused: connection reset by peer")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 9))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/exec",
+            headers=auth("alpaka-token"),
+            json={"target": "hal", "command": "hostname"},
+        )
+        assert resp.status == 502
+        text = await resp.text()
+        assert "connection reset by peer" in text
+        assert "requires interactive authentication" not in text
+    finally:
+        await client.close()
+
+
+async def test_http_exec_still_returns_2fa_when_awaiting(monkeypatch):
+    """The complementary case: while a factor is genuinely outstanding the
+    actionable 2FA 503 is still returned."""
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, _ = _interactive_gateway()
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].awaiting_factor = True
+
+    async def fake_ensure(name):
+        return gw.runtimes[name]
+
+    async def boom(t, host, port, prompter=None):
+        raise SSHError("container hop refused")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 9))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/exec",
+            headers=auth("alpaka-token"),
+            json={"target": "hal", "command": "hostname"},
+        )
+        assert resp.status == 503
+        text = await resp.text()
+        assert "requires interactive authentication" in text
+        assert "--2fa" in text
+        # The underlying dial error is included so the operator sees why the
+        # container hop failed even in the awaiting-factor case.
+        assert "container hop refused" in text
+    finally:
+        await client.close()
 
 
 def test_public_status_exposes_awaiting_factor():
