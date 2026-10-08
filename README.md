@@ -54,7 +54,7 @@ overwrites an existing config.
 1. **Create the container key once** (skip if it exists):
    `ssh-keygen -t ed25519 -f ~/.ssh/computemcp_container -C computeMCP-gateway`.
    Install only the `.pub` half as `authorized_keys` of the target `user`
-   (default `agent`).
+   (empty by default).
 2. **Start the gateway**: `computeMCP-gateway` (or
    `systemctl --user start computeMCP-gateway` with the shipped unit). It reads
    `config.toml` and `tokens.toml`.
@@ -305,15 +305,15 @@ Notes and invariants:
 - **Driver policy:** the NVIDIA kernel driver lives on the host and MUST NOT be
   installed inside the container. Verify with `docker exec computeMCP-container nvidia-smi`.
 - The `agent` user, `sudo` without password, and key-only auth (no passwords, no
-  root login) match the container login the gateway dials (the bundle sets the
-  container user to `agent`; the gateway `user` field stays empty and lets the
-  SSH config decide).
+  root login) match the container login the gateway dials (this recipe keeps the
+  container user as `agent`; by default the bundle keeps it `ubuntu`; the gateway
+  `user` field stays empty and lets the SSH config decide).
 - **Single `agent` user, no duplicate uid.** The entrypoint reuses (renames) the
   base account that already owns `AGENT_UID` instead of `useradd -o`-ing a second
-  one, so the SSH login and `whoami` both resolve to `agent` rather than the stock
-  `ubuntu`. Passwordless sudo is granted to both `agent` and the numeric `#<uid>`
-  so it keeps working whichever name `AGENT_UID` resolves to, and the whole config
-  is checked with `visudo -c`.
+  one, so exactly one account (here `agent`; the bundle's default keeps it
+  `ubuntu`) is the SSH login and `whoami` result. Passwordless sudo is granted to
+  that account and the numeric `#<uid>` so it keeps working whichever name
+  `AGENT_UID` resolves to, and the whole config is checked with `visudo -c`.
 - **The entrypoint must be idempotent.** Docker stores the `bash -euc '...'` as
   the container `Cmd` and re-runs it on **every** start. The first version of
   this recipe installed the packages and created the user unconditionally, so on

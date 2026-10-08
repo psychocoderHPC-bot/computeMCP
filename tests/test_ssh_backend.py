@@ -524,7 +524,7 @@ async def test_container_dial_wrong_account_fails_but_container_account_ok(
     backend = SSHBackend()
     try:
         # The container sshd allows only ``agent``; dialing the route account
-        # (container_user unset would still resolve to ``agent``, so use an
+        # (container_user unset would still resolve to ``ubuntu``, so use an
         # explicit wrong account) is refused -> the 502 root cause.
         with pytest.raises(SSHError):
             await asyncio.wait_for(

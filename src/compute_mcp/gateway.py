@@ -96,7 +96,7 @@ def _container_env_fields(target: TargetConfig) -> dict[str, str]:
     }
     if target.container is not None or target.bundle is not None:
         # The container sshd allows only its own login account (default
-        # ``agent``); the helper creates it and AllowUsers it.  The gateway
+        # ``ubuntu``); the helper creates it and AllowUsers it.  The gateway
         # dials the container as the same account, resolved through the single
         # ``container_login_user`` source of truth so the two cannot drift.
         fields["COMPUTEMCP_SSH_USER"] = container_login_user(target)
