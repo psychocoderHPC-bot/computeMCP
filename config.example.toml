@@ -376,7 +376,9 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # while "compute" builds it on the first allocated compute node.  Set "compute"
 # # on an architecture-mismatched partition (e.g. an ARM partition whose login
 # # nodes are x86-64); it requires Slurm, because the compute-node build happens
-# # inside the allocation.
+# # inside the allocation.  "compute" is meaningful for the Apptainer runtime (an
+# # architecture-mismatched partition); with the Docker runtime it is orthogonal
+# # because the image is pulled and started where it runs.
 # [targets.rosi.container]
 # runtime = "apptainer"
 # storage-root = "/scratch/USER/computemcp"

@@ -2511,17 +2511,31 @@ def test_provision_without_home_and_without_storage_root_fails_clearly(tmp_path)
 # is hermetic.
 
 
-def _write_elf_stub(path: Path, e_machine: int) -> None:
-    """Write a minimal ELF header carrying ``e_machine`` (little-endian)."""
+def _write_elf_stub(path: Path, e_machine: int, *, endianness: str = "little") -> None:
+    """Write a minimal ELF header carrying ``e_machine``.
+
+    ``endianness`` selects the ELF byte order (``EI_DATA``): ``"little"``
+    (ELFDATA2LSB, the default, matching the original caller) or ``"big"``
+    (ELFDATA2MSB).
+    """
+    if endianness not in ("little", "big"):
+        raise ValueError(f"unsupported endianness: {endianness!r}")
     header = bytearray(20)
     header[0:4] = b"\x7fELF"
     header[4] = 2  # EI_CLASS = ELFCLASS64
-    header[5] = 1  # EI_DATA = ELFDATA2LSB
-    header[6] = 1
-    # e_type lives at offset 16; e_machine at offset 18 (0x12).
+    # e_type lives at offset 16; e_machine at offsets 18-19 (0x12), whose order
+    # follows the ELF header byte order.
+    low = e_machine & 0xFF
+    high = (e_machine >> 8) & 0xFF
+    if endianness == "little":
+        header[5] = 1  # EI_DATA = ELFDATA2LSB
+        header[18] = low
+        header[19] = high
+    else:
+        header[5] = 2  # EI_DATA = ELFDATA2MSB
+        header[18] = high
+        header[19] = low
     header[16] = 3  # ET_DYN
-    header[18] = e_machine & 0xFF
-    header[19] = (e_machine >> 8) & 0xFF
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(bytes(header))
 
@@ -2532,6 +2546,7 @@ def _run_apptainer_start(
     sandbox_sh_machine: int,
     node_arch: str,
     ssh_user: str = "ubuntu",
+    endianness: str = "little",
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """Configure a fake sandbox, give ``bin/sh`` an ELF machine, then ``start``.
 
@@ -2544,7 +2559,7 @@ def _run_apptainer_start(
         tmp_path, ssh_user, _free_port(), sandbox=sandbox
     )
     assert result.returncode == 0, result.stderr
-    _write_elf_stub(sandbox / "bin/sh", sandbox_sh_machine)
+    _write_elf_stub(sandbox / "bin/sh", sandbox_sh_machine, endianness=endianness)
 
     stub = root / "bin" / "apptainer"
     calls = root / "apptainer-calls.log"
@@ -2636,3 +2651,150 @@ def test_apptainer_start_warns_on_unknown_arch(tmp_path):
     assert "WARNING" in result.stderr, result.stderr
     calls_text = calls.read_text(encoding="utf-8") if calls.exists() else ""
     assert "instance start" in calls_text, calls_text
+
+
+def test_apptainer_start_rejects_big_endian_arch_mismatch(tmp_path):
+    """A big-endian sandbox ELF is decoded and a mismatch still fails.
+
+    Case D: a binary whose ELF header declares big-endian (``EI_DATA = 2``)
+    holds ``e_machine`` in most-significant-byte-first order (bytes 18,19),
+    so aarch64 encodes as 0x00 0xb7.  The check must decode that byte order,
+    recognize aarch64, and reject the sandbox on an x86_64 node with the
+    actionable error instead of silently passing.
+    """
+    result, calls = _run_apptainer_start(
+        tmp_path,
+        sandbox_sh_machine=0xB7,
+        node_arch="x86_64",
+        endianness="big",
+    )
+    assert result.returncode != 0, (result.returncode, result.stdout, result.stderr)
+    assert "does not match" in result.stderr, result.stderr
+    assert "aarch64" in result.stderr, result.stderr
+    assert "x86_64" in result.stderr, result.stderr
+    assert "bin/sh" in result.stderr, result.stderr
+    assert "exec format error" in result.stderr, result.stderr
+    calls_text = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    assert "instance start" not in calls_text, calls_text
+
+
+def test_batch_job_start_rejects_stale_login_arch_sandbox(tmp_path):
+    """The joint build-location x arch-check path catches a stale sandbox.
+
+    With ``build-location = compute`` the login node skips the build and the
+    batch job runs ``computemcp-container.sh start`` on the first allocated
+    node, so a STALE sandbox - built earlier on the arch-mismatched login node
+    (here: an x86-64 login leaving an e_machine 0x3e /bin/sh) - must be
+    rejected by the START path's architecture gate on the aarch64 compute node,
+    with the actionable "does not match this node" error.  The batch script is
+    run exactly as the scheduler would (SLURM_JOB_ID + settings file), with an
+    srun stub that emulates running the job step on THIS node, and a stub
+    apptainer that records argv so the test proves ``instance start`` was
+    never reached.
+    """
+    APPTH = tmp_path / "apptainer-stub"
+    APPTH.mkdir()
+    call_log = tmp_path / "apptainer.log"
+    app = APPTH / "apptainer"
+    app.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'apptainer %s\\n\' "$*" >> {call_log}\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    app.chmod(0o755)
+    # srun stub for the job step; emulates an srun job step by running the
+    # command on this node (the same node, where the arch gate must fire).
+    srun_dir = tmp_path / "srun-stub"
+    srun_dir.mkdir()
+    srun_log = srun_dir / "srun.log"
+    _write_stub(
+        srun_dir / "srun",
+        "#!/usr/bin/env bash\n"
+        f"printf 'srun %s\\\\n' \"$*\" >> {srun_log}\n"
+        "exec \"$@\"\n",
+    )
+
+    workdir = tmp_path / "stalesandbox"
+    workdir.mkdir()
+    state = workdir / "state"
+    state.mkdir()
+    sandbox = _make_fake_sandbox(workdir)
+    # The stale sandbox: its /bin/sh is the login-node x86-64 binary, left
+    # over from an earlier build on the x86-64 login node.
+    _write_elf_stub(sandbox / "bin/sh", 0x3E)
+    # The login node still manages to configure the existing (stale) sandbox:
+    # configure is architecture-independent and must not be blocked here.
+    configure_result, _, _ = _run_apptainer_configure(
+        workdir, "ubuntu", _free_port(), sandbox=sandbox
+    )
+    assert configure_result.returncode == 0, configure_result.stderr
+
+    host_home = workdir / "hosthome"
+    (host_home / ".ssh").mkdir(parents=True, exist_ok=True)
+    (host_home / ".ssh" / "authorized_keys").write_text(
+        "ssh-ed25519 AAAATEST fixture@test\n", encoding="utf-8"
+    )
+
+    settings = workdir / "settings"
+    settings.write_text(
+        "\n".join(
+            [
+                "export COMPUTEMCP_SYSTEM=stalearch",
+                f"export COMPUTEMCP_STATE_DIR={state}",
+                f"export COMPUTEMCP_SANDBOX_DIR={sandbox}",
+                f"export COMPUTEMCP_HOST_HOME={host_home}",
+                "export COMPUTEMCP_CONTAINER_RUNTIME=apptainer",
+                "export COMPUTEMCP_IMAGE=docker://ubuntu:24.04",
+                "export COMPUTEMCP_BUILD_LOCATION=compute",
+                "export COMPUTEMCP_SSH_PUBLIC_KEY='ssh-ed25519 AAAATEST fixture@test'",
+                "export COMPUTEMCP_SSH_USER=ubuntu",
+                "export COMPUTEMCP_SSH_WAIT_SECONDS=2",
+                f"export COMPUTEMCP_NODE_ARCH=aarch64",
+                f"export COMPUTEMCP_CONTAINER_PORT={_free_port()}",
+                f"export COMPUTEMCP_BUNDLE_DIR={BUNDLE_DIR}",
+                "export COMPUTEMCP_SRUN_ARGS=''",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["SLURM_JOB_ID"] = "9878"
+    # The batch script runs as the scheduler would: srun/stage tools from the
+    # stub dir, apptainer from the apptainer stub, everything else system.
+    env["PATH"] = (
+        str(srun_dir) + os.pathsep
+        + str(APPTH) + os.pathsep
+        + os.environ.get("PATH", "")
+    )
+    result = subprocess.run(
+        ["bash", str(JOB), str(settings)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=workdir,
+    )
+    calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+    # The batch script recognizes the STALE sandbox as present, so the
+    # compute-node build path is not triggered (the job only builds a MISSING
+    # sandbox): no ``apptainer build`` call was made.
+    assert "build" not in calls, (calls, result.stderr)
+    # The job step ran: the srun stub saw the start.
+    slurm_log = srun_log.read_text(encoding="utf-8") if srun_log.exists() else ""
+    assert f"computemcp-container.sh start" in slurm_log or "start" in slurm_log, (
+        slurm_log,
+        result.stderr,
+    )
+    # start exited non-zero with the actionable message, naming both
+    # architectures, and the job script has no apptainer call log at all
+    # (the arch gate fires before the first apptainer instance call), and the
+    # ``instance start`` argv was never recorded.
+    assert result.returncode != 0, (result.returncode, result.stdout, result.stderr)
+    assert "does not match" in result.stderr, result.stderr
+    assert "aarch64" in result.stderr and "x86_64" in result.stderr, result.stderr
+    assert "instance start" not in calls, (
+        f"instance start was reached despite the arch gate:\n{calls}\n"
+        f"{result.stdout}\n{result.stderr}"
+    )

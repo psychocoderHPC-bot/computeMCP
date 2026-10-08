@@ -968,7 +968,7 @@ Describes the container runtime for the provisioning bundle.
 | `gpus` | string array | Subset of `nvidia`, `amd`, `intel`. Missing device nodes are reported and skipped |
 | `host-home` | string | Host directory carrying `.ssh/authorized_keys` that the container trusts |
 | `sandbox` | boolean | Informational flag; the helper reads the actual sandbox path |
-| `build-location` | `"login"` or `"compute"` | Where the sandbox is built. `login` (default) builds it on the login/head node before submitting; `compute` builds it on the first allocated compute node. Use `compute` on an architecture-mismatched partition (e.g. an ARM partition whose login nodes are x86-64). `compute` requires Slurm, because the build happens inside the allocation |
+| `build-location` | `"login"` or `"compute"` | Where the sandbox is built. `login` (default) builds it on the login/head node before submitting; `compute` builds it on the first allocated compute node. Use `compute` on an architecture-mismatched partition (e.g. an ARM partition whose login nodes are x86-64), and it is meaningful for the Apptainer runtime; with the Docker runtime it is orthogonal because the image is pulled and started where it runs. `compute` requires Slurm, because the build happens inside the allocation |
 
 ### `[targets.X.bundle]`
 

@@ -108,7 +108,7 @@ values.
 | `gpus` | GPU vendors to expose; missing devices are reported and skipped |
 | `host-home` | Directory whose `.ssh/authorized_keys` the container trusts |
 | `sandbox` | Informational request flag; the helper reads the actual path |
-| `build-location` | `login` (default) builds the sandbox on the login/head node; `compute` builds it on the first allocated compute node (use on an architecture-mismatched partition such as an ARM partition with x86-64 login nodes). `compute` requires Slurm |
+| `build-location` | `login` (default) builds the sandbox on the login/head node; `compute` builds it on the first allocated compute node (use on an architecture-mismatched partition such as an ARM partition with x86-64 login nodes). `compute` requires Slurm, and it is meaningful for the Apptainer runtime (an architecture-mismatched partition); with the Docker runtime it is orthogonal because the image is pulled and started where it runs |
 
 The gateway exports the resolved values as `COMPUTEMCP_SYSTEM`,
 `COMPUTEMCP_STORAGE_ROOT`, `COMPUTEMCP_IMAGE`, `COMPUTEMCP_GPU_VENDORS`,
