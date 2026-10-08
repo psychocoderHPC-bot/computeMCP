@@ -96,23 +96,20 @@ systemd/compute-mcp-gateway.service
 
 ## Install (gateway on the host, not as root)
 
-```bash
-# Terok container: `~/.local` is owned by root there, so pipx cannot create its
-# venvs and `pipx install .` fails with a permission error. Fix it once:
-sudo chown -R dev:dev ~/.local        # one-time fix for this container
+The install and bootstrap steps are the [Quick start](#quick-start); this
+section only covers the two cases that differ from it.
 
-pipx install .                        # install from the current folder
-pipx ensurepath                       # once; makes ~/.local/bin available in new shells
-computeMCP-gateway --bootstrap        # or copy config.example.toml by hand
+Inside a Terok container `~/.local` is owned by root, so `pipx install .` fails
+with a permission error until you run this one-time fix (it is unnecessary on a
+normal host):
+
+```bash
+sudo chown -R dev:dev ~/.local
 ```
 
-On a normal host the `chown` line is unnecessary; `pipx install .` works as
-is.
-
-`--bootstrap` (see [Quick start](#quick-start)) writes `config.toml` and
-`tokens.toml` for you. The manual alternative is `mkdir -p
-~/.config/computeMCP-gateway` and copying `config.example.toml` there, then
-replacing its `/home/USER` placeholders with real paths.
+To configure by hand instead of `--bootstrap`, create
+`~/.config/computeMCP-gateway` and copy `config.example.toml` there, replacing
+its `/home/USER` placeholders with real paths.
 
 ### Configure the gateway interactively
 
