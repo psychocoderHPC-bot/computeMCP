@@ -164,6 +164,10 @@ deck has none).  It submits with:
 sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS"
 ```
 
+When the target's `slurm.sbatch` stage configures an account, the gateway emits
+`--account=<account>` into `COMPUTEMCP_SBATCH_ARGS`; an unset or empty account
+adds nothing.  The helper's `COMPUTEMCP_ACCOUNT` fallback below is unchanged.
+
 `COMPUTEMCP_SRUN_ARGS` reaches the batch job through a per-job settings file
 whose path is passed as a positional argument to the batch script.  Slurm
 delivers positional arguments verbatim even under `--export=NONE`, so the

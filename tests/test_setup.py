@@ -113,6 +113,7 @@ def _full_target():
         allocation_max_nodes=4,
         sbatch_partition="gpu",
         sbatch_time="02:00:00",
+        sbatch_account="proj",
         srun_cpu_bind="none",
     )
 
@@ -142,6 +143,7 @@ def test_render_config_loads(tmp_path):
     assert t.container.gpus == ("nvidia", "amd")
     assert t.bundle.source == "computemcp-container"
     assert t.allocation.single_node == "gpu-proportional"
+    assert t.slurm.sbatch.account == "proj"
     assert cfg.clients["alpaka"].allow_all is True
 
 
@@ -334,6 +336,7 @@ def _exhaustive_targets():
             allocation_max_nodes=4,
             sbatch_partition="gpu",
             sbatch_time="02:00:00",
+            sbatch_account="proj",
             srun_cpu_bind="none",
         ),
     ]
@@ -602,7 +605,7 @@ def _bootstrap_answers():
         "",                                    # pre-provision environment (none)
         "y",                                   # behind a Slurm scheduler? yes
         "y",                                   # slurm description
-        "24", "4", "378000M", "gpu-proportional", "exclusive", "4", "gpu", "02:00:00", "none",
+        "24", "4", "378000M", "gpu-proportional", "exclusive", "4", "gpu", "02:00:00", "proj", "none",
         "n",                                   # no more targets
     ]
 
@@ -622,6 +625,32 @@ def test_bootstrap_writes_config_and_hashed_token(tmp_path):
     # Bootstrap mints only the operator token, not a per-project one.
     assert set(cfg.clients) == {"admin"}
     assert cfg.clients["admin"].allow_all
+
+
+def test_bootstrap_writes_slurm_account(tmp_path):
+    config_path = tmp_path / "config.toml"
+    run_bootstrap(config_path, wizard=_wizard(_bootstrap_answers()))
+    target_path = tmp_path / "systems" / "rosi.toml"
+    text = target_path.read_text()
+    assert 'account = "proj"' in text
+    cfg = load_config(config_path)
+    assert cfg.targets["rosi"].slurm.sbatch.account == "proj"
+
+
+def test_bootstrap_omits_slurm_account_when_empty(tmp_path):
+    # Same as _bootstrap_answers but the Slurm account question is answered
+    # with an empty string (optional, empty allowed).
+    answers = list(_bootstrap_answers())
+    answers[answers.index("proj")] = ""
+    config_path = tmp_path / "config.toml"
+    rc = run_bootstrap(config_path, wizard=_wizard(answers))
+    assert rc == 0
+    target_path = tmp_path / "systems" / "rosi.toml"
+    text = target_path.read_text()
+    assert "account" not in text
+    assert "[targets.rosi.slurm.sbatch]" in text
+    cfg = load_config(config_path)
+    assert cfg.targets["rosi"].slurm.sbatch.account is None
 
 
 def test_bootstrap_enables_enrollment_by_default(tmp_path):

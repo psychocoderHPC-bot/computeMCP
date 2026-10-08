@@ -674,7 +674,13 @@ def _render_stage(
 ) -> tuple[str, ...]:
     if stage is None:
         return ()  # absent stage: no arguments at all
-    args = _render_manual(target, stage_name, stage.options)
+    # The scheduler account is a first-class stage field and always leads the
+    # stage's arguments so ordering is deterministic and independent of the
+    # manual-option order.  An empty/None account emits nothing.
+    args: list[str] = []
+    if stage.account:
+        args.append(f"--account={stage.account}")
+    args += _render_manual(target, stage_name, stage.options)
     mapped, _ = _render_mapped(target, stage_name, stage, plan)
     combined = args + mapped
     # Verify no stage setting appears twice: a manual option and a mapped
@@ -705,12 +711,15 @@ def plan_summary(target: TargetConfig, plan: ResolvedPlan) -> dict:
     lists the calculated fields no stage emitted (e.g. a calculated memory
     share when only a manual ``mem`` option is configured, or an exclusivity
     intent with no ``exclusive`` mapping).  ``manual`` carries the verbatim
-    manual options per stage.  The preview must keep the *calculated* intent,
-    the *emitted* request and the possibly-different manual memory apart.
+    manual options per stage; ``account`` carries the per-stage scheduler
+    account (``None`` when unset, so ``--dry-run`` can show it).  The preview
+    must keep the *calculated* intent, the *emitted* request and the
+    possibly-different manual memory apart.
     """
     slurm = target.slurm
     emitted: dict[str, list[str]] = {"sbatch": [], "srun": []}
     manual: dict[str, dict[str, Any]] = {"sbatch": {}, "srun": {}}
+    account: dict[str, str | None] = {"sbatch": None, "srun": None}
     if slurm is not None:
         for stage_name, stage in (("sbatch", slurm.sbatch), ("srun", slurm.srun)):
             if stage is None:
@@ -718,6 +727,7 @@ def plan_summary(target: TargetConfig, plan: ResolvedPlan) -> dict:
             _, fields = _render_mapped(target, stage_name, stage, plan)
             emitted[stage_name] = list(fields)
             manual[stage_name] = {str(k): v for k, v in stage.options.items()}
+            account[stage_name] = stage.account
     # Map each plan field to its canonical mapping key so that "emitted"
     # (named per mapping key, hyphens) and "not_emitted" compare like-for-like.
     field_to_mapping_key = {
@@ -749,6 +759,7 @@ def plan_summary(target: TargetConfig, plan: ResolvedPlan) -> dict:
         "defaults_used": plan.defaults_used,
         "overrides": dict(plan.overrides),
         "manual": manual,
+        "account": account,
         "args": {"sbatch": list(sbatch), "srun": list(srun)},
         "emitted": emitted,
         "not_emitted": not_emitted,

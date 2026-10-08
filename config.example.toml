@@ -330,9 +330,13 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # values are a string/integer (rendered --key=value), a boolean (true emits
 # # --key, false omits) or an array (repeated --key=value).  Protocol options
 # # the helper owns (parsable, quiet, wrap) are rejected here.
+# # The dedicated `account` key is the scheduler account passed as
+# # `sbatch -A`/`--account`; an empty string or an omitted key emits no
+# # --account argument at all.
 # [targets.rosi.slurm.sbatch]
 # partition = "REPLACE_WITH_PARTITION_NAME"   # nested table under [slurm]
 # time = "02:00:00"
+# account = "REPLACE_WITH_ACCOUNT"            # omitted -> no -A/--account
 # mem = "100G"           # fixed memory; when a manual option is present the
 #                        # memory-per-node mapping is refused (conflict error)
 # ntasks-per-node = 1    # = 1 so the cpus-per-task mapping below is valid
@@ -415,6 +419,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # [targets.cpuhost.slurm.sbatch]
 # partition = "REPLACE_WITH_PARTITION_NAME"
 # time = "01:00:00"
+# account = "REPLACE_WITH_ACCOUNT"      # empty/omitted -> no --account
 # ntasks-per-node = 1
 #
 # [targets.cpuhost.slurm.sbatch-map]
@@ -503,6 +508,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # [targets.X.slurm.sbatch]
 # partition = "REPLACE_WITH_PARTITION_NAME"
 # time = "02:00:00"
+# account = "REPLACE_WITH_ACCOUNT"      # empty/omitted -> no --account
 # ntasks-per-node = 1
 #
 # [targets.X.slurm.sbatch-map]

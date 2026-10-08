@@ -910,6 +910,14 @@ without the leading `--`. The value is a scalar, a boolean, or an array:
 A stage absent from the config emits no argument at all for that stage. An
 empty `[slurm]` table is equivalent to no Slurm block.
 
+The dedicated `account` key is the scheduler account passed as `sbatch -A` /
+`--account`. It is a first-class per-stage field, so `slurm.sbatch` and
+`slurm.srun` carry independent accounts and nothing is copied between them.
+It always leads that stage's rendered arguments, before the manual options.
+An empty string (or whitespace-only value) and an omitted key both emit no
+`--account` argument. A non-string value, or a string containing whitespace,
+a newline, a carriage return, or a NUL, is rejected at load time.
+
 Protocol options the provisioning helper owns (`parsable`, `quiet`, `wrap`)
 are rejected in manual options; the helper adds its own launcher flags.
 Option names must be plain tokens (no leading `--`, no whitespace), and

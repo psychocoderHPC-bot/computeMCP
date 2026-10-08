@@ -1007,6 +1007,59 @@ def test_slurm_stage_tables_parsed_and_stages_independent():
     assert slurm.srun.mapping == {"cpus-per-node": "cpus-per-task"}
 
 
+def test_slurm_stage_account_parsed_and_independent():
+    cfg = parse_config(
+        base_raw(
+            slurm={
+                "sbatch": {"account": "proj", "partition": "gpu"},
+                "srun": {"ntasks-per-node": 1},
+            }
+        )
+    )
+    slurm = cfg.targets["hal"].slurm
+    assert slurm.sbatch.account == "proj"
+    # The account is pulled out of options, never left as a manual key.
+    assert "account" not in slurm.sbatch.options
+    assert slurm.sbatch.options == {"partition": "gpu"}
+    # Stages stay independent: nothing copied to srun.
+    assert slurm.srun.account is None
+
+
+def test_slurm_stage_account_empty_normalizes_to_none():
+    for raw in ("", "   ", "\t"):
+        cfg = parse_config(
+            base_raw(slurm={"sbatch": {"account": raw, "partition": "gpu"}})
+        )
+        stage = cfg.targets["hal"].slurm.sbatch
+        assert stage.account is None
+        assert "account" not in stage.options
+
+
+def test_slurm_stage_account_non_string_rejected():
+    for raw in (1, True, 0, ["proj"], {"a": "b"}):
+        with pytest.raises(ConfigError, match="account must be a string"):
+            parse_config(base_raw(slurm={"sbatch": {"account": raw}}))
+
+
+def test_slurm_stage_account_whitespace_or_control_rejected():
+    for raw in ("proj one", "proj\tone", "proj\none", "proj\rone", "proj\x00one"):
+        with pytest.raises(ConfigError, match="account must not contain"):
+            parse_config(base_raw(slurm={"sbatch": {"account": raw}}))
+
+
+def test_slurm_stage_account_does_not_affect_option_parsing():
+    cfg = parse_config(
+        base_raw(
+            slurm={
+                "sbatch": {"account": "proj", "ntasks-per-node": 1, "tags": ["a", "b"]},
+            }
+        )
+    )
+    stage = cfg.targets["hal"].slurm.sbatch
+    assert stage.account == "proj"
+    assert stage.options == {"ntasks-per-node": 1, "tags": ["a", "b"]}
+
+
 def test_slurm_unknown_key_rejected():
     with pytest.raises(ConfigError, match="unknown key"):
         parse_config(base_raw(slurm={"sbatch": {}, "wat": {}}))

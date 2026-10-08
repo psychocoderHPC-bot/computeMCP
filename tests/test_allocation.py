@@ -486,6 +486,55 @@ def test_render_manual_options_strings_bools_and_arrays():
     assert srun == ("--bind=cores",)
 
 
+def test_render_account_leads_stage_args_before_manual_options():
+    target = make_target(
+        slurm=SlurmConfig(
+            sbatch=SlurmStageConfig(
+                account="proj",
+                options={"partition": "gpu", "ntasks-per-node": 1},
+                mapping={"nodes": "nodes"},
+            ),
+            srun=SlurmStageConfig(),
+        ),
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    # The account leads the stage's arguments regardless of manual order.
+    assert sbatch == (
+        "--account=proj",
+        "--partition=gpu",
+        "--ntasks-per-node=1",
+        "--nodes=1",
+    )
+    assert srun == ()
+
+
+def test_render_account_empty_or_none_emits_nothing():
+    for value in (None, ""):
+        target = make_target(
+            slurm=SlurmConfig(
+                sbatch=SlurmStageConfig(account=value, options={"partition": "gpu"}),
+                srun=SlurmStageConfig(),
+            ),
+        )
+        plan = compute_plan(target)
+        sbatch, _ = render_args(target, plan)
+        assert sbatch == ("--partition=gpu",)
+
+
+def test_render_account_not_copied_to_other_stage():
+    target = make_target(
+        slurm=SlurmConfig(
+            sbatch=SlurmStageConfig(account="proj", options={"partition": "gpu"}),
+            srun=SlurmStageConfig(options={"ntasks-per-node": 1}),
+        ),
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    assert "--account=proj" in sbatch
+    assert all("account" not in arg for arg in srun)
+
+
 def test_render_multiple_stages_independently():
     target = make_target(
         slurm=SlurmConfig(
@@ -662,3 +711,16 @@ def test_plan_summary_is_json_serializable_and_complete():
     # memory-per-node was calculated but no stage emitted it.
     assert summary["not_emitted"] == ["memory-per-node"]
     assert json.loads(text)["plan"]["gpus_per_node"] == 1
+
+
+def test_plan_summary_surfaces_account_per_stage():
+    target = make_target(
+        slurm=SlurmConfig(
+            sbatch=SlurmStageConfig(account="proj"),
+            srun=SlurmStageConfig(),
+        ),
+    )
+    plan = compute_plan(target)
+    summary = plan_summary(target, plan)
+    assert summary["account"] == {"sbatch": "proj", "srun": None}
+    assert json.loads(json.dumps(summary))["account"]["sbatch"] == "proj"

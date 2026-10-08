@@ -89,6 +89,7 @@ class TargetAnswers:
     allocation_max_nodes: int | None = None
     sbatch_partition: str | None = None
     sbatch_time: str | None = None
+    sbatch_account: str | None = None
     srun_cpu_bind: str | None = None
     extra: dict = field(default_factory=dict)
 
@@ -525,13 +526,15 @@ def render_target_block(answers: TargetAnswers) -> str:
             lines.append(f"multi-node = {_toml_str(answers.allocation_multi)}")
         if answers.allocation_max_nodes is not None:
             lines.append(f"max-nodes = {answers.allocation_max_nodes}")
-    if answers.sbatch_partition or answers.sbatch_time:
+    if answers.sbatch_partition or answers.sbatch_time or answers.sbatch_account:
         lines.append("")
         lines.append(f"[targets.{answers.name}.slurm.sbatch]")
         if answers.sbatch_partition:
             lines.append(f"partition = {_toml_str(answers.sbatch_partition)}")
         if answers.sbatch_time:
             lines.append(f"time = {_toml_str(answers.sbatch_time)}")
+        if answers.sbatch_account:
+            lines.append(f"account = {_toml_str(answers.sbatch_account)}")
         lines.append("ntasks-per-node = 1")
     if answers.srun_cpu_bind:
         lines.append("")
@@ -950,6 +953,13 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
                 description="wall time for sbatch, e.g. 02:00:00",
                 default="02:00:00",
             )
+            answers.sbatch_account = wizard.ask(
+                "Slurm account",
+                description="scheduler account passed as sbatch -A/--account; "
+                "leave empty to omit the option",
+                default=None,
+                required=False,
+            ) or None
             answers.srun_cpu_bind = wizard.ask(
                 "srun cpu-bind",
                 description="step CPU binding; 'none' keeps scheduler defaults",

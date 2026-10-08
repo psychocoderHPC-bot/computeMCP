@@ -214,10 +214,16 @@ class SlurmStageConfig:
     is a scalar, bool, or array (arrays repeat the option).  ``mapping`` maps
     calculated values to output representations, e.g.
     ``gpus-per-node = "gres"``; only the ``MAPPING_VOCABULARY`` is accepted.
+
+    ``account`` is the scheduler account passed as ``sbatch -A``/``--account``.
+    It is a first-class field per stage so ``slurm.sbatch`` and ``slurm.srun``
+    stay independent (nothing is copied between stages).  ``None`` and an empty
+    string both mean "emit no ``--account``"; any other string is stored as-is.
     """
 
     options: dict[str, object] = field(default_factory=dict)
     mapping: dict[str, str] = field(default_factory=dict)
+    account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -415,6 +421,30 @@ def _load_allocation_config(name: str, value: dict | None) -> AllocationConfig |
     )
 
 
+def _parse_account(raw: object, name: str, stage: str) -> str | None:
+    """Validate the optional per-stage scheduler account.
+
+    ``None`` and an empty/whitespace-only string mean "omit ``--account``" and
+    normalize to ``None``.  A non-string (int, bool, list, ...) is an error, as
+    is a string containing whitespace, a newline, a carriage return or a NUL;
+    those would inject into the rendered argument list.  A valid string is
+    returned verbatim.
+    """
+    where = f"targets.{name}.slurm.{stage}.account"
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ConfigError(f"{where} must be a string")
+    if not raw.strip():
+        return None
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise ConfigError(
+            f"{where} must not contain whitespace, newlines, carriage returns "
+            "or NUL"
+        )
+    return raw
+
+
 def _load_slurm_stage(
     name: str,
     stage: str,
@@ -427,8 +457,10 @@ def _load_slurm_stage(
     ``slurm.<stage>-map`` dict respectively; either may be ``None``.  When both
     are ``None`` the stage is absent and ``None`` is returned so T2/T3 emit
     nothing for it.  ``options`` keys are preserved verbatim (e.g.
-    ``ntasks-per-node``); each value is a scalar, bool, or array of them.
-    ``mapping_raw`` is validated against ``MAPPING_VOCABULARY``.
+    ``ntasks-per-node``); each value is a scalar, bool, or array of them.  The
+    reserved ``account`` key is pulled out of ``options`` into the first-class
+    ``account`` field and never appears in ``options``.  ``mapping_raw`` is
+    validated against ``MAPPING_VOCABULARY``.
     """
     if options is None and mapping_raw is None:
         return None
@@ -440,10 +472,13 @@ def _load_slurm_stage(
         mapping = {str(k): v for k, v in mapping_raw.items()}
     else:
         mapping = {}
-    _validate_slurm_mapping(mapping, stage, options or {}, name)
+    manual = dict(options or {})
+    account = _parse_account(manual.pop("account", None), name, stage)
+    _validate_slurm_mapping(mapping, stage, manual, name)
     return SlurmStageConfig(
-        options=dict(options or {}),
+        options=manual,
         mapping=mapping,
+        account=account,
     )
 
 
