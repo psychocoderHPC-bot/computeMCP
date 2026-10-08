@@ -371,6 +371,12 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # (docker://<ref> for Apptainer, plain reference for Docker). `gpus` is a
 # # vendor list (subset of nvidia, amd, intel). `host-home` is the host dir whose
 # # .ssh/authorized_keys the container trusts. `sandbox` is informational.
+# # `build-location` is "login" (default) or "compute": "login" builds the
+# # Apptainer sandbox on the login/head node before submitting the allocation,
+# # while "compute" builds it on the first allocated compute node.  Set "compute"
+# # on an architecture-mismatched partition (e.g. an ARM partition whose login
+# # nodes are x86-64); it requires Slurm, because the compute-node build happens
+# # inside the allocation.
 # [targets.rosi.container]
 # runtime = "apptainer"
 # storage-root = "/scratch/USER/computemcp"
@@ -378,6 +384,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # gpus = ["nvidia"]
 # host-home = "/scratch/USER/computemcp/home"
 # sandbox = true
+# build-location = "compute"
 #
 # # Operator preview of the allocation without connecting:
 # #   computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2 --dry-run

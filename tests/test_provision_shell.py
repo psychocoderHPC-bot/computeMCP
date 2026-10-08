@@ -1499,6 +1499,335 @@ def test_slurm_mode_settings_roundtrip_preserves_hook(tmp_path, stubs):
         teardown()
 
 
+# --- Build location: login vs compute node ---------------------------------
+
+
+def _provision_slurm_arrays(tmp_path):
+    """Write an argv-recording ``apptainer`` stub and return its bin dir.
+
+    The login-node runtime check (``command -v apptainer``) needs a stub so the
+    test does not depend on Apptainer being installed; the recorded argv lets a
+    test prove whether the login node attempted a build.
+    """
+    root = tmp_path / "stublog"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    stub = bin_dir / "apptainer"
+    stub.write_text(
+        f'#!/usr/bin/env bash\nprintf \'apptainer %s\\n\' "$*" >> {root}/apptainer.log\nexit 0\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return root, bin_dir
+
+
+def _base_apptainer_env(system, storage_root, port, container_name):
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "COMPUTEMCP_SYSTEM": system,
+        "COMPUTEMCP_STORAGE_ROOT": str(storage_root),
+        "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+        "COMPUTEMCP_IMAGE": "docker://ubuntu:24.04",
+        "COMPUTEMCP_CONTAINER_NAME": container_name,
+        "COMPUTEMCP_CONTAINER_PORT": str(port),
+        "COMPUTEMCP_FORWARD_PORT": str(port + 1),
+        "COMPUTEMCP_SSH_WAIT_SECONDS": "15",
+        "COMPUTEMCP_WAIT_SECONDS": "60",
+        "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
+        "COMPUTEMCP_NODES": "1",
+    }
+    return env
+
+
+def test_provision_compute_build_skips_login_build(tmp_path, stubs):
+    """build-location = compute: the login node must NOT build the sandbox.
+
+    The architecture-mismatched partition case: the login node is x86-64 but the
+    compute node is aarch64, so a login-node ``apptainer build`` would produce a
+    sandbox that fails with exec format error.  With no sandbox present, the
+    login-node provision must instead print the informational message, carry
+    ``COMPUTEMCP_BUILD_LOCATION=compute`` into the per-job settings, and submit
+    the allocation so the batch job builds it on the compute node.
+    """
+    container_port = _free_port()
+    forward_port = _free_port()
+    workdir = tmp_path / "computebuild"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / "archtest" / "state"
+
+    env = _base_apptainer_env(
+        "archtest", storage, container_port, "computemcp-archtest"
+    )
+    env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
+    env["COMPUTEMCP_BUILD_LOCATION"] = "compute"
+    env["COMPUTEMCP_WAIT_SECONDS"] = "3"
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    # No SLURM_JOB_OUT: the sbatch stub does not launch the batch job, so only
+    # the login-node phase runs.  Any apptainer build here would be the bug this
+    # test guards against; the job-owned build is covered separately.
+    env["SLURM_JOBID_FILE"] = str(state_dir / "jobid")
+    _root, app_bin = _provision_slurm_arrays(tmp_path)
+    env["PATH"] = str(app_bin) + os.pathsep + stubs.slurm.shell_path
+
+    result = subprocess.run(
+        ["bash", str(PROVISION), "provision"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=workdir,
+    )
+
+    try:
+        # The login node skipped the build: no sandbox tree and no build call.
+        assert not (storage / "archtest" / "sandbox").exists()
+        assert "will be built on the compute node" in result.stderr, result.stderr
+        app_log = _root / "apptainer.log"
+        assert not app_log.exists() or "build" not in app_log.read_text(
+            encoding="utf-8"
+        ), app_log.read_text(encoding="utf-8")
+        # The submission still happened and the settings carry the flag.
+        settings = state_dir / "srun-archtest.settings"
+        assert settings.exists()
+        assert "export COMPUTEMCP_BUILD_LOCATION=compute" in settings.read_text()
+        assert "sbatch --parsable" in (workdir / "slurm.log").read_text()
+    finally:
+        _cleanup()
+
+
+def test_provision_login_build_unchanged_by_default(tmp_path, stubs):
+    """The default build-location = login keeps the existing build behavior.
+
+    A missing Apptainer sandbox is built on the login node before submission;
+    the stub records the login-node build call.
+    """
+    container_port = _free_port()
+    forward_port = _free_port()
+    workdir = tmp_path / "loginbuild"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / "loginbuild" / "state"
+
+    env = _base_apptainer_env(
+        "loginbuild", storage, container_port, "computemcp-loginbuild"
+    )
+    env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
+    env["COMPUTEMCP_WAIT_SECONDS"] = "3"
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    # No SLURM_JOB_OUT: only the login-node phase runs; the stub apptainer
+    # records the login-node build that this default must perform.
+    env["SLURM_JOBID_FILE"] = str(state_dir / "jobid")
+    _root, app_bin = _provision_slurm_arrays(tmp_path)
+    env["PATH"] = str(app_bin) + os.pathsep + stubs.slurm.shell_path
+
+    result = subprocess.run(
+        ["bash", str(PROVISION), "provision"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=workdir,
+    )
+
+    try:
+        assert "building it on the login node" in result.stderr, result.stderr
+        app_log = (_root / "apptainer.log").read_text(encoding="utf-8")
+        assert "build" in app_log, app_log
+    finally:
+        _cleanup()
+
+
+def test_provision_rejects_invalid_build_location(tmp_path, stubs):
+    """An unknown build-location is rejected with exit 2 before any build."""
+    container_port = _free_port()
+    workdir = tmp_path / "badbuild"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    env = _base_apptainer_env(
+        "badbuild", storage, container_port, "computemcp-badbuild"
+    )
+    env["COMPUTEMCP_BUILD_LOCATION"] = "head"
+    env["PATH"] = stubs.slurm.shell_path
+
+    result = subprocess.run(
+        ["bash", str(PROVISION), "provision"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=workdir,
+    )
+    assert result.returncode == 2, (result.returncode, result.stderr)
+    assert "Invalid COMPUTEMCP_BUILD_LOCATION" in result.stderr, result.stderr
+    assert not (storage / "badbuild" / "sandbox").exists()
+
+
+def test_provision_compute_without_slurm_falls_back_to_login(tmp_path, stubs):
+    """Direct mode + build-location = compute warns and builds on the node.
+
+    There is no allocation to build on, so the helper falls back to the default
+    login-node build and still provisions successfully in direct mode.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "directcompute"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    published_port = _published_port(container_port)
+
+    env = _base_env("directcompute", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published_port)
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["COMPUTEMCP_BUILD_LOCATION"] = "compute"
+    env["PATH"] = stubs.direct.shell_path
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=workdir,
+        )
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert "requires Slurm" in result.stderr, result.stderr
+        # It fell back to a normal direct-mode build on this node.
+        assert _docker_counts(workdir / "docker.log")["build"] == 1
+    finally:
+        _cleanup()
+
+
+def test_job_sh_builds_sandbox_on_compute_node(tmp_path, stubs):
+    """build-location = compute: job.sh builds+configures before start.
+
+    The login node skipped the build, so the batch script (running on the first
+    allocated compute node) must build and configure the sandbox there before
+    starting the container.  The stub ``srun`` runs the start command, and the
+    log proves the build ran on the compute node.
+    """
+    APPTH = tmp_path / "apptainer-stub"
+    APPTH.mkdir()
+    call_log = tmp_path / "apptainer.log"
+    app = APPTH / "apptainer"
+    app.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'apptainer %s\\n\' "$*" >> {call_log}\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    app.chmod(0o755)
+
+    workdir = tmp_path / "jobbuild"
+    workdir.mkdir()
+    state = workdir / "state"
+    state.mkdir()
+    sandbox = workdir / "sandbox"
+    bundle = BUNDLE_DIR
+    settings = workdir / "settings"
+    settings.write_text(
+        "\n".join(
+            [
+                "export COMPUTEMCP_SYSTEM=archtest",
+                f"export COMPUTEMCP_STATE_DIR={state}",
+                f"export COMPUTEMCP_SANDBOX_DIR={sandbox}",
+                f"export COMPUTEMCP_HOST_HOME={workdir / 'home'}",
+                "export COMPUTEMCP_CONTAINER_RUNTIME=apptainer",
+                "export COMPUTEMCP_IMAGE=docker://ubuntu:24.04",
+                "export COMPUTEMCP_BUILD_LOCATION=compute",
+                "export COMPUTEMCP_SSH_PUBLIC_KEY='ssh-ed25519 AAAATEST fixture@test'",
+                "export COMPUTEMCP_SSH_USER=ubuntu",
+                "export COMPUTEMCP_SSH_WAIT_SECONDS=2",
+                f"export COMPUTEMCP_CONTAINER_PORT={_free_port()}",
+                f"export COMPUTEMCP_BUNDLE_DIR={bundle}",
+                "export COMPUTEMCP_SRUN_ARGS=''",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["SLURM_JOB_ID"] = "9876"
+    env["PATH"] = (
+        str(APPTH) + os.pathsep + stubs.slurm.shell_path
+    )
+    result = subprocess.run(
+        ["bash", str(JOB), str(settings)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=workdir,
+    )
+    calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+    # The batch script reached the compute-node container build path: the
+    # apptainer stub saw the build command.  The stub build makes no sandbox, so
+    # the single build command is the proof that the job owned the build (a real
+    # build produces the sandbox and its built-in configure installs the key).
+    assert "build" in calls, (calls, result.stderr, result.stdout)
+
+
+def test_job_sh_login_build_location_does_not_build(tmp_path, stubs):
+    """build-location = login: job.sh never builds on the compute node.
+
+    The default keeps the existing behavior exactly: the sandbox was built on
+    the login node, so the batch script only starts the container (the stub srun
+    records the start; no apptainer build call is made).
+    """
+    APPTH = tmp_path / "apptainer-stub"
+    APPTH.mkdir()
+    call_log = tmp_path / "apptainer.log"
+    app = APPTH / "apptainer"
+    app.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'apptainer %s\\n\' "$*" >> {call_log}\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    app.chmod(0o755)
+
+    workdir = tmp_path / "joblogin"
+    workdir.mkdir()
+    state = workdir / "state"
+    state.mkdir()
+    settings = workdir / "settings"
+    settings.write_text(
+        "\n".join(
+            [
+                "export COMPUTEMCP_SYSTEM=plain",
+                f"export COMPUTEMCP_STATE_DIR={state}",
+                f"export COMPUTEMCP_SANDBOX_DIR={workdir / 'sandbox'}",
+                "export COMPUTEMCP_CONTAINER_RUNTIME=apptainer",
+                "export COMPUTEMCP_IMAGE=docker://ubuntu:24.04",
+                "export COMPUTEMCP_BUILD_LOCATION=login",
+                "export COMPUTEMCP_SSH_WAIT_SECONDS=2",
+                f"export COMPUTEMCP_CONTAINER_PORT={_free_port()}",
+                f"export COMPUTEMCP_BUNDLE_DIR={BUNDLE_DIR}",
+                "export COMPUTEMCP_SRUN_ARGS=''",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["SLURM_JOB_ID"] = "9877"
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["PATH"] = str(APPTH) + os.pathsep + stubs.slurm.shell_path
+    result = subprocess.run(
+        ["bash", str(JOB), str(settings)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=workdir,
+    )
+    calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+    assert "build" not in calls, (calls, result.stderr)
+    # The start path was reached through the stub srun.
+    assert "srun" in (workdir / "slurm.log").read_text(encoding="utf-8")
+
+
 # --- Apptainer account provisioning ---------------------------------------
 
 _SANDBOX_PASSWD = (

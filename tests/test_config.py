@@ -1219,6 +1219,43 @@ def test_container_unknown_key_rejected():
         parse_config(base_raw(container={"runtime": "docker", "extra": 1}))
 
 
+def test_container_build_location_defaults_to_login():
+    ctr = parse_config(base_raw(container={"runtime": "apptainer"})).targets[
+        "hal"
+    ].container
+    assert ctr.build_location == "login"
+
+
+def test_container_build_location_compute_parsed_and_normalized():
+    ctr = parse_config(
+        base_raw(container={"runtime": "apptainer", "build-location": "compute"})
+    ).targets["hal"].container
+    assert ctr.build_location == "compute"
+    # The documented alias normalizes to the canonical value.
+    alias = parse_config(
+        base_raw(
+            container={"runtime": "apptainer", "build-location": "compute-node"}
+        )
+    ).targets["hal"].container
+    assert alias.build_location == "compute"
+    # Case/whitespace are normalized.
+    upper = parse_config(
+        base_raw(container={"runtime": "apptainer", "build-location": " LOGIN "})
+    ).targets["hal"].container
+    assert upper.build_location == "login"
+
+
+def test_container_build_location_invalid_rejected():
+    with pytest.raises(ConfigError, match="build-location"):
+        parse_config(
+            base_raw(container={"runtime": "apptainer", "build-location": "head"})
+        )
+    with pytest.raises(ConfigError, match="login"):
+        parse_config(
+            base_raw(container={"runtime": "apptainer", "build-location": 1})
+        )
+
+
 def test_back_compat_config_without_new_tables_loads():
     """Existing configs without [node]/[allocation]/[slurm]/[container] load unchanged."""
     cfg = parse_config(base_raw())

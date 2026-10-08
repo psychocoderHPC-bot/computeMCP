@@ -2742,6 +2742,8 @@ def test_build_provision_env_exact_contract():
     assert env["COMPUTEMCP_GPU_VENDORS"] == "nvidia"
     assert env["COMPUTEMCP_HOST_HOME"] == ""
     assert env["COMPUTEMCP_SANDBOX"] == "true"
+    # The build location defaults to the login/head node.
+    assert env["COMPUTEMCP_BUILD_LOCATION"] == "login"
     # The container hop dials this account; the helper creates/AllowUsers it.
     assert env["COMPUTEMCP_SSH_USER"] == "ubuntu"
 
@@ -2755,6 +2757,36 @@ def test_build_provision_env_emits_container_user_override():
     sbatch, srun = render_args(target, plan)
     env = build_provision_env(target, plan, sbatch, srun)
     assert env["COMPUTEMCP_SSH_USER"] == "dev"
+
+
+def test_build_provision_env_emits_compute_build_location():
+    """An explicit compute-node build location reaches the provisioner."""
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.config import ContainerConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target(
+        container=ContainerConfig(
+            runtime="apptainer",
+            storage_root="/scratch/agent/computemcp",
+            build_location="compute",
+        )
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_BUILD_LOCATION"] == "compute"
+
+
+def test_build_provision_env_build_location_defaults_to_login():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target()
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_BUILD_LOCATION"] == "login"
 
 
 def test_build_provision_env_omits_container_user_without_container():

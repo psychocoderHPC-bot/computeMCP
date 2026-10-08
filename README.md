@@ -968,6 +968,7 @@ Describes the container runtime for the provisioning bundle.
 | `gpus` | string array | Subset of `nvidia`, `amd`, `intel`. Missing device nodes are reported and skipped |
 | `host-home` | string | Host directory carrying `.ssh/authorized_keys` that the container trusts |
 | `sandbox` | boolean | Informational flag; the helper reads the actual sandbox path |
+| `build-location` | `"login"` or `"compute"` | Where the sandbox is built. `login` (default) builds it on the login/head node before submitting; `compute` builds it on the first allocated compute node. Use `compute` on an architecture-mismatched partition (e.g. an ARM partition whose login nodes are x86-64). `compute` requires Slurm, because the build happens inside the allocation |
 
 ### `[targets.X.bundle]`
 
@@ -977,7 +978,9 @@ container's authorized public key is derived from `client_key`.
 
 The bundle is the generic container provisioner: it builds and starts the
 container on the login node and submits a Slurm allocation when the target has
-one. `computemcp-container` is the canonical name; `computemcp-slurm` is the
+one. Set `container.build-location = "compute"` to build the sandbox on the
+compute node instead (required on an architecture-mismatched partition; Slurm
+only). `computemcp-container` is the canonical name; `computemcp-slurm` is the
 legacy alias and resolves to the same shipped bundle.
 
 | Key | Type | Notes |

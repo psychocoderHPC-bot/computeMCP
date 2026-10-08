@@ -117,6 +117,20 @@ HOST_HOME="${COMPUTEMCP_HOST_HOME:-$SYSTEM_DIR/home}"
 RUNTIME="${COMPUTEMCP_CONTAINER_RUNTIME:-}"
 IMAGE="${COMPUTEMCP_IMAGE:-}"
 GPU_VENDORS="${COMPUTEMCP_GPU_VENDORS:-}"
+# Where to build the sandbox: on the login/head node (default) or on the first
+# allocated compute node.  "compute" is required on an architecture-mismatched
+# partition (e.g. an ARM partition whose login nodes are x86-64): a sandbox built
+# on the login node would fail with an opaque "exec format error".  An optional
+# ``compute-node`` alias is normalized to the canonical ``compute``.
+BUILD_LOCATION="${COMPUTEMCP_BUILD_LOCATION:-login}"
+case "$BUILD_LOCATION" in
+    login|compute) ;;
+    compute-node) BUILD_LOCATION=compute ;;
+    *)
+        echo "Invalid COMPUTEMCP_BUILD_LOCATION: $BUILD_LOCATION (expected login or compute)." >&2
+        exit 2
+        ;;
+esac
 CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
 SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 PORT="${COMPUTEMCP_FORWARD_PORT:-2200}"
@@ -159,6 +173,7 @@ export COMPUTEMCP_HOST_HOME="$HOST_HOME"
 export COMPUTEMCP_CONTAINER_RUNTIME="$RUNTIME"
 export COMPUTEMCP_IMAGE="$IMAGE"
 export COMPUTEMCP_GPU_VENDORS="$GPU_VENDORS"
+export COMPUTEMCP_BUILD_LOCATION="$BUILD_LOCATION"
 export COMPUTEMCP_CONTAINER_PORT="$CONTAINER_PORT"
 export COMPUTEMCP_SSH_WAIT_SECONDS="$SSH_WAIT_SECONDS"
 export COMPUTEMCP_SSH_USER="${COMPUTEMCP_SSH_USER:-ubuntu}"
@@ -457,10 +472,40 @@ container_missing() {
     esac
 }
 
+# A compute-node build needs an allocation.  Slurm mode sets COMPUTE_BUILD=1 and
+# the login node then skips the build when the sandbox is missing; the batch job
+# builds and configures it on the first allocated node.  Direct mode has no
+# allocation, so ``build-location = compute`` is contradictory there: warn and
+# fall back to the default login-node build so direct mode keeps working.
+COMPUTE_BUILD=0
+if [ "$BUILD_LOCATION" = compute ]; then
+    if [ "$HAVE_SLURM" = 1 ]; then
+        COMPUTE_BUILD=1
+    else
+        echo "WARNING: build-location = compute requires Slurm; falling back to building on the login/remote node." >&2
+    fi
+fi
+
 ensure_container() {
     runtime_tool
     [ -n "$IMAGE" ] || { echo 'COMPUTEMCP_IMAGE is required.' >&2; exit 1; }
     resolve_ssh_key
+    # Compute-node build.  If the sandbox is missing, do NOT build it here: the
+    # architecture may differ from the compute node, and the batch job builds and
+    # configures it inside the allocation (so skip configure too -- there is
+    # nothing to edit yet).  If it already exists, configure still runs on the
+    # login node: configure only rewrites architecture-independent files with
+    # the host python3 (sandbox passwd/shadow and the container
+    # authorized_keys), so it is safe and refreshes the key before the job.
+    if [ "$COMPUTE_BUILD" = 1 ]; then
+        if container_missing; then
+            echo "Sandbox missing; it will be built on the compute node (build-location = compute)." >&2
+            return 0
+        fi
+        echo "Container present; configuring it on the login node." >&2
+        bash "$CONTAINER_SCRIPT" configure
+        return 0
+    fi
     if container_missing; then
         echo "Container missing; building it on the login node." >&2
         bash "$CONTAINER_SCRIPT" build
@@ -535,6 +580,7 @@ write_settings() {
         printf 'export COMPUTEMCP_CONTAINER_RUNTIME=%q\n' "$RUNTIME"
         printf 'export COMPUTEMCP_IMAGE=%q\n' "$IMAGE"
         printf 'export COMPUTEMCP_GPU_VENDORS=%q\n' "$GPU_VENDORS"
+        printf 'export COMPUTEMCP_BUILD_LOCATION=%q\n' "$BUILD_LOCATION"
         printf 'export COMPUTEMCP_CPUS_PER_NODE=%q\n' "${COMPUTEMCP_CPUS_PER_NODE:-}"
         printf 'export COMPUTEMCP_GPUS_PER_NODE=%q\n' "${COMPUTEMCP_GPUS_PER_NODE:-}"
         printf 'export COMPUTEMCP_MEMORY_PER_NODE_MIB=%q\n' "${COMPUTEMCP_MEMORY_PER_NODE_MIB:-}"

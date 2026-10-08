@@ -108,12 +108,13 @@ values.
 | `gpus` | GPU vendors to expose; missing devices are reported and skipped |
 | `host-home` | Directory whose `.ssh/authorized_keys` the container trusts |
 | `sandbox` | Informational request flag; the helper reads the actual path |
+| `build-location` | `login` (default) builds the sandbox on the login/head node; `compute` builds it on the first allocated compute node (use on an architecture-mismatched partition such as an ARM partition with x86-64 login nodes). `compute` requires Slurm |
 
 The gateway exports the resolved values as `COMPUTEMCP_SYSTEM`,
 `COMPUTEMCP_STORAGE_ROOT`, `COMPUTEMCP_IMAGE`, `COMPUTEMCP_GPU_VENDORS`,
-`COMPUTEMCP_HOST_HOME`, `COMPUTEMCP_CONTAINER_RUNTIME`, and
-`COMPUTEMCP_SANDBOX`.  It also exports `COMPUTEMCP_NODES`,
-`COMPUTEMCP_CPUS_PER_NODE`, `COMPUTEMCP_GPUS_PER_NODE`,
+`COMPUTEMCP_HOST_HOME`, `COMPUTEMCP_CONTAINER_RUNTIME`,
+`COMPUTEMCP_BUILD_LOCATION`, and `COMPUTEMCP_SANDBOX`.  It also exports
+`COMPUTEMCP_NODES`, `COMPUTEMCP_CPUS_PER_NODE`, `COMPUTEMCP_GPUS_PER_NODE`,
 `COMPUTEMCP_MEMORY_PER_NODE_MIB`, `COMPUTEMCP_EXCLUSIVE`, `COMPUTEMCP_MODE`,
 `COMPUTEMCP_SBATCH_ARGS`, and `COMPUTEMCP_SRUN_ARGS`.
 

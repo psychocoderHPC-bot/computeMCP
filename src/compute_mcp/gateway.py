@@ -93,6 +93,13 @@ def _container_env_fields(target: TargetConfig) -> dict[str, str]:
         "COMPUTEMCP_SANDBOX": (
             "true" if container is not None and container.sandbox else "false"
         ),
+        # Where the provisioning helper builds the sandbox: "login" (default)
+        # builds on the login/head node; "compute" lets the batch job build it
+        # on the compute node (required on an architecture-mismatched partition).
+        # Kept in this shared helper so the dial and provision paths cannot drift.
+        "COMPUTEMCP_BUILD_LOCATION": (
+            container.build_location if container is not None else "login"
+        ),
     }
     if target.container is not None or target.bundle is not None:
         # The container sshd allows only its own login account (default

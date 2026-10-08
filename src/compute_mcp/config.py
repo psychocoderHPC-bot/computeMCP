@@ -246,6 +246,14 @@ class ContainerConfig:
     ``image`` are optional.  ``host_home`` and ``sandbox`` are optional
     overrides for values the gateway would otherwise derive; they stay optional
     and minimal on purpose.
+
+    ``build_location`` selects where the Apptainer sandbox is built:
+    ``"login"`` (the default) builds/configure it on the login/head node before
+    submitting the allocation; ``"compute"`` skips the login-node build and
+    builds it on the first allocated compute node.  The compute-node setting is
+    required on an architecture-mismatched partition (e.g. an ARM partition
+    whose login nodes are x86-64) and requires Slurm.  ``"compute-node"`` is an
+    accepted alias and is normalized to ``"compute"``.
     """
 
     runtime: str
@@ -254,6 +262,7 @@ class ContainerConfig:
     gpus: tuple[str, ...] = ()
     host_home: str | None = None
     sandbox: bool = False
+    build_location: str = "login"
 
     def __post_init__(self) -> None:
         if self.runtime not in ("apptainer", "docker"):
@@ -281,6 +290,20 @@ class ContainerConfig:
             if invalid:
                 raise ConfigError("container.gpus entries must be non-empty strings")
             object.__setattr__(self, "gpus", vendors)
+        if not isinstance(self.build_location, str):
+            raise ConfigError(
+                "container.build-location must be 'login' or 'compute', "
+                f"got {self.build_location!r}"
+            )
+        normalized = self.build_location.strip().lower()
+        if normalized == "compute-node":
+            normalized = "compute"
+        if normalized not in ("login", "compute"):
+            raise ConfigError(
+                "container.build-location must be 'login' or 'compute', "
+                f"got {self.build_location!r}"
+            )
+        object.__setattr__(self, "build_location", normalized)
 
 
 @dataclass(frozen=True)
@@ -539,6 +562,7 @@ def _load_container_config(name: str, value: dict | None) -> ContainerConfig | N
             "gpus",
             "host-home",
             "sandbox",
+            "build-location",
         }
     )
     if unknown:
@@ -553,6 +577,7 @@ def _load_container_config(name: str, value: dict | None) -> ContainerConfig | N
         gpus=tuple(value.get("gpus", ())),
         host_home=value.get("host-home"),
         sandbox=bool(value.get("sandbox", False)),
+        build_location=value.get("build-location", "login"),
     )
 
 

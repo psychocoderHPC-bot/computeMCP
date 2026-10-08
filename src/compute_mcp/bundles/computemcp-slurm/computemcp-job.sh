@@ -80,6 +80,29 @@ trap cleanup EXIT
 trap 'exit 0' TERM INT
 rm -f "$READY"
 
+# Compute-node build.  When the gateway configures ``build-location = compute``
+# (an architecture-mismatched partition, e.g. an ARM partition whose login nodes
+# are x86-64), the login node skipped the build and this batch script -- which
+# runs ON the first allocated node -- builds and configures the sandbox here, so
+# the sandbox matches the compute architecture.  build_location = login (the
+# default) is a strict no-op: the existing container is started below.  The
+# settings file already exported COMPUTEMCP_SSH_PUBLIC_KEY (or the provision
+# helper's resolve_ssh_key fallback ran on the login node), so configure installs
+# the key.  The sandbox path falls back the same way as the other scripts.
+if [ "${COMPUTEMCP_BUILD_LOCATION:-login}" = compute ]; then
+    BUILD_SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-}"
+    if [ -z "$BUILD_SANDBOX" ]; then
+        BUILD_SANDBOX="${COMPUTEMCP_STORAGE_ROOT:?COMPUTEMCP_SANDBOX_DIR or COMPUTEMCP_STORAGE_ROOT is required}/${COMPUTEMCP_SYSTEM:?COMPUTEMCP_SYSTEM is required}/sandbox"
+    fi
+    if [ ! -d "$BUILD_SANDBOX" ]; then
+        echo "Sandbox missing; building and configuring it on the compute node (build-location = compute)." >&2
+        # ``build`` runs the runtime build and the immediate configure (the
+        # container script's build action ends in configure for both runtimes),
+        # so the SSH key from the settings file is installed here too.
+        bash "$CONTAINER_SCRIPT" build
+    fi
+fi
+
 # Launch the container step explicitly through srun.  The step carries only the
 # rendered SRUN_ARGS; sbatch settings are never copied here.  A restrictive
 # sbatch --export policy (e.g. --export=SLURM_SUBMIT_DIR=...) can strip this

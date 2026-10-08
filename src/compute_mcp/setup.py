@@ -493,6 +493,7 @@ def render_target_block(answers: TargetAnswers) -> str:
                 ("host-home", f"$HOME/computemcp/{answers.name}/home")
             )
         container_entries.append(("sandbox", False))
+        container_entries.append(("build-location", "login"))
         container_active = {
             key
             for key, present in (
