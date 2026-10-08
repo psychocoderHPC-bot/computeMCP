@@ -135,7 +135,21 @@ case "$BUILD_LOCATION" in
 esac
 CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
 SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
-PORT="${COMPUTEMCP_FORWARD_PORT:-2200}"
+# Login-node relay port.  A fixed default collides when two bundle targets share
+# one login node, so by default the helper asks the relay for an ephemeral port
+# (0) and learns the concrete port from the ready file.  An explicit
+# COMPUTEMCP_FORWARD_PORT overrides the dynamic choice verbatim (legacy/hand
+# use); it is validated here so an invalid value fails with exit 2.
+FORWARD_PORT_OVERRIDE="${COMPUTEMCP_FORWARD_PORT:-}"
+PORT=0
+if [ -n "$FORWARD_PORT_OVERRIDE" ]; then
+    if ! { [[ "$FORWARD_PORT_OVERRIDE" =~ ^[0-9]+$ ]] &&
+           (( FORWARD_PORT_OVERRIDE >= 1 && FORWARD_PORT_OVERRIDE <= 65535 )); }; then
+        echo "Invalid COMPUTEMCP_FORWARD_PORT: $FORWARD_PORT_OVERRIDE (expected an integer 1..65535)." >&2
+        exit 2
+    fi
+    PORT="$FORWARD_PORT_OVERRIDE"
+fi
 WAIT_SECONDS="${COMPUTEMCP_WAIT_SECONDS:-900}"
 NODES="${COMPUTEMCP_NODES:-1}"
 
@@ -259,7 +273,10 @@ fi
 for VALUE in "$CONTAINER_PORT" "$SSH_WAIT_SECONDS" "$PORT" "$WAIT_SECONDS"; do
     [[ "$VALUE" =~ ^[0-9]+$ ]] || { echo "Expected integer: $VALUE" >&2; exit 2; }
 done
-(( CONTAINER_PORT >= 1024 && CONTAINER_PORT <= 65535 && PORT >= 1024 && PORT <= 65535 &&
+# PORT == 0 means "ephemeral, choose it on the login node"; the concrete port is
+# learned from the relay ready file before it is ever reported.  An explicit
+# override was already validated to 1..65535 above.
+(( CONTAINER_PORT >= 1024 && CONTAINER_PORT <= 65535 && PORT >= 0 && PORT <= 65535 &&
    SSH_WAIT_SECONDS > 0 && WAIT_SECONDS > 0 )) || {
     echo 'Invalid timeout or port configuration.' >&2
     exit 2
@@ -408,12 +425,23 @@ relay_running() {
         tr '\0' '\n' < "/proc/$PID/cmdline" |
         grep -Fxq -e "$RELAY" -e "$STATE/relay.py"
 }
+# Read the relay's ready file ("<pid> <port>\n") and echo the concrete bound
+# port.  Returns non-zero when the file is missing or malformed, so callers can
+# fall back rather than trusting a stale or empty value.
+relay_ready_port() {
+    local LINE READY_PID READY_PORT
+    [ -s "$STATE/relay.ready" ] || return 1
+    read -r READY_PID READY_PORT < "$STATE/relay.ready" || true
+    [[ "$READY_PORT" =~ ^[0-9]+$ ]] || return 1
+    (( READY_PORT >= 1 && READY_PORT <= 65535 )) || return 1
+    printf '%s\n' "$READY_PORT"
+}
 stop_relay() {
     if relay_running; then
         kill "$(cat "$STATE/relay.pid")"
         for (( I = 0; I < 50; I++ )); do relay_running || break; sleep 0.1; done
     fi
-    rm -f "$STATE/relay.pid" "$STATE/tunnel-job" "$STATE/relay.ready"
+    rm -f "$STATE/relay.pid" "$STATE/tunnel-job" "$STATE/relay.ready" "$STATE/relay.port"
 }
 
 # --- Non-provision actions --------------------------------------------------
@@ -448,7 +476,17 @@ if [ "$ACTION" = status ]; then
     if [ -s "$STATE/ready-$JOBID" ]; then
         printf 'node: %s\n' "$(cat "$STATE/ready-$JOBID")"
     fi
-    printf 'endpoint: 127.0.0.1:%s\n' "$PORT"
+    # Slurm mode reports the persisted concrete relay port, not the request
+    # value (which may be the ephemeral sentinel 0 before a relay runs).
+    STATUS_PORT="$(relay_ready_port 2>/dev/null || true)"
+    if [ -z "$STATUS_PORT" ] && [ -s "$STATE/relay.port" ]; then
+        STATUS_PORT="$(head -n 1 "$STATE/relay.port" 2>/dev/null || true)"
+    fi
+    if [ -z "$STATUS_PORT" ] && [ -n "$FORWARD_PORT_OVERRIDE" ]; then
+        STATUS_PORT="$FORWARD_PORT_OVERRIDE"
+    fi
+    [ -n "$STATUS_PORT" ] || STATUS_PORT=none
+    printf 'endpoint: 127.0.0.1:%s\n' "$STATUS_PORT"
     exit 0
 fi
 
@@ -676,6 +714,24 @@ if [ "$ACTION" = provision ]; then
     [ -n "$NODE" ] || { echo "Timed out waiting for job $JOBID; it stays tracked for the next call." >&2; exit 1; }
     [[ "$NODE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "Invalid node name: $NODE" >&2; exit 1; }
 
+    # Resolve the login-node relay port.  Explicit override wins (already
+    # validated).  Otherwise reuse the recorded port when the tracked relay is
+    # still running, so a reconnect does not churn the relay or move the
+    # endpoint; every other case asks the relay for a fresh ephemeral port.
+    if [ -z "$FORWARD_PORT_OVERRIDE" ]; then
+        if relay_running && [ -s "$STATE/relay.port" ]; then
+            RECORDED_PORT="$(head -n 1 "$STATE/relay.port" 2>/dev/null || true)"
+            if [[ "$RECORDED_PORT" =~ ^[0-9]+$ ]] &&
+               (( RECORDED_PORT >= 1 && RECORDED_PORT <= 65535 )); then
+                PORT="$RECORDED_PORT"
+            else
+                PORT=0
+            fi
+        else
+            PORT=0
+        fi
+    fi
+
     WANTED="$JOBID $NODE $PORT $CONTAINER_PORT"
     if ! relay_running || [ "$(cat "$STATE/tunnel-job" 2>/dev/null || true)" != "$WANTED" ]; then
         stop_relay
@@ -692,8 +748,31 @@ if [ "$ACTION" = provision ]; then
             stop_relay
             exit 1
         fi
-        printf '%s\n' "$WANTED" > "$STATE/tunnel-job"
     fi
+
+    # The relay owns the concrete port (it may have chosen an ephemeral one).
+    # Read it back from the ready file and persist it, then use it everywhere
+    # below so ENDPOINT and --check never carry the request value 0.
+    PARSED_PORT="$(relay_ready_port || true)"
+    if [ -z "$PARSED_PORT" ]; then
+        echo "Relay ready file $STATE/relay.ready is missing or malformed." >&2
+        if [ -n "$FORWARD_PORT_OVERRIDE" ]; then
+            PORT="$FORWARD_PORT_OVERRIDE"
+        else
+            echo "Cannot determine the relay port; see $STATE/relay.log" >&2
+            stop_relay
+            exit 1
+        fi
+    else
+        PORT="$PARSED_PORT"
+    fi
+    # Persist the concrete port only after the relay is confirmed started; a
+    # fresh provision after stop removes it and picks a new ephemeral port.
+    PORT_TMP="$STATE/relay.port.tmp.$$"
+    printf '%s\n' "$PORT" > "$PORT_TMP"
+    mv -f "$PORT_TMP" "$STATE/relay.port"
+    WANTED="$JOBID $NODE $PORT $CONTAINER_PORT"
+    printf '%s\n' "$WANTED" > "$STATE/tunnel-job"
 
     READY=0
     for (( I = 0; I < 3; I++ )); do

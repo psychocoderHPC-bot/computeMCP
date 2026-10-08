@@ -119,10 +119,18 @@ def serve(conn):
 
 with socket.socket() as listener:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Port 0 asks the kernel for an ephemeral port.  The helper runs on the
+    # login node and delegates the choice to this process, so two targets that
+    # share a login node never collide on a fixed default.  Read the concrete
+    # port back and publish it in the ready file so the helper can dial it.
     listener.bind(('127.0.0.1', int(port)))
     listener.listen(32)
+    bound_port = listener.getsockname()[1]
+    # Ready file: "<pid> <port>\n".  Existing readers only check for its
+    # existence/size, so the extra field is backward compatible.  Written
+    # before the accept loop so the helper never sees a missing file.
     with open(ready, 'w') as status:
-        status.write(str(os.getpid()) + '\n')
+        status.write(str(os.getpid()) + ' ' + str(bound_port) + '\n')
     while True:
         conn, _ = listener.accept()
         threading.Thread(target=serve, args=(conn,), daemon=True).start()

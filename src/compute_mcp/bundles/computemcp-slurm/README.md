@@ -198,9 +198,24 @@ the calculated plan is not silently submitted.  When both are empty, Slurm
 defaults apply.
 
 Useful variables when running by hand: `COMPUTEMCP_CONTAINER_PORT` (container
-SSH port, default 2222), `COMPUTEMCP_FORWARD_PORT` (login-node relay port,
-default 2200), `COMPUTEMCP_WAIT_SECONDS` (job wait, default 900), and
+SSH port, default 2222), `COMPUTEMCP_FORWARD_PORT` (optional explicit
+login-node relay port; by default the port is chosen dynamically, see below),
+`COMPUTEMCP_WAIT_SECONDS` (job wait, default 900), and
 `COMPUTEMCP_SSH_WAIT_SECONDS` (banner wait, default 120).
+
+## Relay port allocation
+
+The helper runs on the login/route node and is the authority for what is free
+there, so it lets the relay bind an ephemeral loopback port by default (binding
+port `0` and reading the concrete port back from `state/relay.ready`).  Two
+bundle targets that share one login node therefore never collide, which a fixed
+default port would.  The resolved concrete port is persisted to
+`state/relay.port`; a reconnect against the same state directory reuses it as
+long as the tracked relay is still running, so the endpoint does not move and
+the relay is not restarted.  `stop`/`close` remove `state/relay.port` with the
+other relay state, so a fresh provision after a stop picks a new port.
+Setting `COMPUTEMCP_FORWARD_PORT` to an integer `1..65535` overrides this
+dynamic choice and is used verbatim; any other value fails with exit 2.
 
 ## Lifecycle
 

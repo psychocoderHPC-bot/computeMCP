@@ -3059,3 +3059,179 @@ def test_docker_build_collapses_doubled_docker_prefix(tmp_path, stubs):
         assert "docker://" not in dockerfile, dockerfile
     finally:
         _cleanup()
+
+
+# --- Dynamic relay-port allocation -----------------------------------------
+#
+# A fixed login-node relay port collides when two bundle targets share one login
+# node (the second relay fails with EADDRINUSE).  The helper now asks the relay
+# to bind an ephemeral port and learns the concrete port from its ready file,
+# persisting it to ``state/relay.port`` so a reconnect reuses it.
+
+
+def _endpoint_port(stdout: str) -> int:
+    """Parse the port from the helper's ``ENDPOINT 127.0.0.1:<port>`` line."""
+    for line in stdout.splitlines():
+        if line.strip().startswith("ENDPOINT"):
+            host_port = line.split()[-1]
+            return int(host_port.rsplit(":", 1)[1])
+    raise AssertionError(f"no ENDPOINT line in stdout:\n{stdout}")
+
+
+def _slurm_env(tmp_path, stubs, system, container_port, forward_port=None):
+    """Build a gateway-style Slurm environment with its own work/storage tree."""
+    workdir = tmp_path / system
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / system / "state"
+    env = _base_env(system, storage, container_port)
+    # The default is dynamic allocation; only pin the override when asked.
+    env.pop("COMPUTEMCP_FORWARD_PORT", None)
+    if forward_port is not None:
+        env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["SLURM_JOB_OUT"] = str(workdir / "slurm-job.out")
+    env["SLURM_JOBID_FILE"] = str(state_dir / "jobid")
+    env["PATH"] = stubs.slurm.shell_path
+    return workdir, storage, state_dir, env
+
+
+def _run_provision(env, workdir, *args):
+    return subprocess.run(
+        ["bash", str(PROVISION), *args],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=workdir,
+    )
+
+
+def test_slurm_distinct_state_dirs_get_distinct_relay_ports(tmp_path, stubs):
+    """Two targets on one login node must not collide on a fixed relay port.
+
+    Each provision has its own state directory but runs against the same stubbed
+    host, so the relays would share a login node in production.  The dynamic
+    allocation must yield different ports and both relays must actually listen.
+    """
+    container_a, container_b = _free_port(), _free_port()
+    wd_a, _storage_a, _state_a, env_a = _slurm_env(tmp_path, stubs, "uniqa", container_a)
+    wd_b, _storage_b, _state_b, env_b = _slurm_env(tmp_path, stubs, "uniqb", container_b)
+
+    def teardown():
+        for wd in (wd_a, wd_b):
+            pid_file = Path(wd / "slurm-job.out.pid")
+            if pid_file.exists():
+                with contextlib.suppress(OSError, ValueError):
+                    os.kill(int(pid_file.read_text().strip()), 15)
+        _cleanup()
+
+    try:
+        result_a = _run_provision(env_a, wd_a, "provision")
+        result_b = _run_provision(env_b, wd_b, "provision")
+        assert result_a.returncode == 0, (result_a.returncode, result_a.stderr)
+        assert result_b.returncode == 0, (result_b.returncode, result_b.stderr)
+        port_a = _endpoint_port(result_a.stdout)
+        port_b = _endpoint_port(result_b.stdout)
+        assert port_a != port_b, (result_a.stdout, result_b.stdout)
+        assert _wait_port(port_a, timeout=15), port_a
+        assert _wait_port(port_b, timeout=15), port_b
+    finally:
+        teardown()
+
+
+def test_slurm_repeated_provision_reuses_recorded_relay_port(tmp_path, stubs):
+    """A reconnect against the same state reuses the port and keeps the relay."""
+    container_port = _free_port()
+    workdir, _storage, state_dir, env = _slurm_env(
+        tmp_path, stubs, "reuseport", container_port
+    )
+    job_pid_file = Path(env["SLURM_JOB_OUT"] + ".pid")
+
+    def teardown():
+        if job_pid_file.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(job_pid_file.read_text().strip()), 15)
+        _cleanup()
+
+    try:
+        first = _run_provision(env, workdir, "provision")
+        assert first.returncode == 0, (first.returncode, first.stderr)
+        port = _endpoint_port(first.stdout)
+        relay_pid = (state_dir / "relay.pid").read_text().strip()
+        recorded = (state_dir / "relay.port").read_text().strip()
+        assert recorded == str(port), (recorded, port)
+
+        second = _run_provision(env, workdir, "provision")
+        assert second.returncode == 0, (second.returncode, second.stderr)
+        assert _endpoint_port(second.stdout) == port
+        assert (state_dir / "relay.port").read_text().strip() == str(port)
+        # The relay was reused, not restarted: the pid is unchanged.
+        assert (state_dir / "relay.pid").read_text().strip() == relay_pid
+        assert _wait_port(port, timeout=15), port
+    finally:
+        teardown()
+
+
+def test_slurm_explicit_forward_port_override_is_honored(tmp_path, stubs):
+    """COMPUTEMCP_FORWARD_PORT is used verbatim and reported in ENDPOINT."""
+    container_port = _free_port()
+    forward_port = _free_port()
+    workdir, _storage, state_dir, env = _slurm_env(
+        tmp_path, stubs, "overrideport", container_port, forward_port=forward_port
+    )
+    job_pid_file = Path(env["SLURM_JOB_OUT"] + ".pid")
+
+    def teardown():
+        if job_pid_file.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(job_pid_file.read_text().strip()), 15)
+        _cleanup()
+
+    try:
+        result = _run_provision(env, workdir, "provision")
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert _endpoint_port(result.stdout) == forward_port
+        assert (state_dir / "relay.port").read_text().strip() == str(forward_port)
+    finally:
+        teardown()
+
+
+def test_slurm_ready_file_carries_pid_and_port_never_zero(tmp_path, stubs):
+    """The ready file holds ``<pid> <port>`` and ENDPOINT is never ``:0``."""
+    container_port = _free_port()
+    workdir, _storage, state_dir, env = _slurm_env(
+        tmp_path, stubs, "readyformat", container_port
+    )
+    job_pid_file = Path(env["SLURM_JOB_OUT"] + ".pid")
+
+    def teardown():
+        if job_pid_file.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(job_pid_file.read_text().strip()), 15)
+        _cleanup()
+
+    try:
+        result = _run_provision(env, workdir, "provision")
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        fields = (state_dir / "relay.ready").read_text().split()
+        assert len(fields) == 2, fields
+        relay_pid, bound_port = int(fields[0]), int(fields[1])
+        assert bound_port >= 1
+        assert relay_pid > 0
+        port = _endpoint_port(result.stdout)
+        assert port == bound_port, (port, bound_port)
+        assert ":0" not in result.stdout, result.stdout
+        # The readiness check must work against the new ready-file format.
+        check = subprocess.run(
+            ["python3", str(BUNDLE_DIR / "computemcp-relay.py"), "--check", str(port)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert check.returncode == 0, (check.returncode, check.stderr)
+    finally:
+        teardown()
+

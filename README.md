@@ -1698,7 +1698,10 @@ config-driven bundle ships as
 the container and either submits the allocation from the gateway-rendered
 arguments (see "Slurm allocation and container configuration") or starts the
 container directly on a host without a scheduler; on the Slurm path it starts a
-relay and prints the endpoint. Use the bundle for new targets; the
+relay and prints the endpoint. The relay binds an ephemeral login-node port by
+default and persists the concrete port, so multiple targets can share one login
+node without colliding; `COMPUTEMCP_FORWARD_PORT` remains an optional explicit
+override. Use the bundle for new targets; the
 operator-written example below remains useful when the site scripts already own
 the job.
 
@@ -1715,7 +1718,9 @@ rosi5 login node
 ```
 
 `provision_command` does the middle step (submit/wait for the job and create the
-login-node forward) and prints `127.0.0.1:2200`; the gateway then dials it
+login-node forward) and prints the endpoint (the shipped bundle picks the relay
+port dynamically per target, so several targets can share one login node; set
+`COMPUTEMCP_FORWARD_PORT` to override it explicitly); the gateway then dials it
 through `ssh_targets`.
 
 Config:
