@@ -259,6 +259,7 @@ apptainer_configure() {
     # the helper keeps stdout clean for the gateway's ENDPOINT parse.
     python3 - "$SANDBOX" "$CONTAINER_PORT" "$SSH_USER" >&2 <<'CONFIGURE'
 import os
+import re
 import shutil
 import stat
 import sys
@@ -311,13 +312,36 @@ rows = [line.split(":") for line in passwd.read_text().splitlines()]
 # ``ubuntu`` account and must reconfigure the already-renamed one in place
 # instead of aborting.  Exactly one candidate is accepted; anything else
 # (neither, both, duplicates) is ambiguous and rejected.
+#
+# A change of the configured container user (e.g. the default moved from
+# ``agent`` to ``ubuntu``) must not require rebuilding the sandbox.  When
+# neither the base ``ubuntu`` account nor one already named ``user`` exists, a
+# previously-managed account is detected by its computeMCP shell path
+# ``/usr/local/bin/computemcp-<name>-shell``; it is renamed in place, so no
+# marker file is needed and old sandboxes keep working.
 ubuntu_accounts = [row for row in rows if row[0] == "ubuntu"]
 user_accounts = [row for row in rows if row[0] == user]
+managed = [
+    row for row in rows
+    if len(row) == 7
+    and re.fullmatch(r"/usr/local/bin/computemcp-.+-shell", row[6])
+]
 candidates = []
 if len(ubuntu_accounts) == 1 and len(ubuntu_accounts[0]) == 7:
     candidates.append(ubuntu_accounts[0])
-if user != "ubuntu" and len(user_accounts) == 1 and len(user_accounts[0]) == 7:
+if (
+    user != "ubuntu"
+    and len(user_accounts) == 1
+    and len(user_accounts[0]) == 7
+    and user_accounts[0] not in candidates
+):
     candidates.append(user_accounts[0])
+if (
+    len(managed) == 1
+    and managed[0] not in candidates
+    and managed[0][2] != "0"
+):
+    candidates.append(managed[0])
 if len(candidates) != 1:
     found = ", ".join(f"{row[0]}(uid={row[2]})" for row in rows)
     raise SystemExit(

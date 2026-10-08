@@ -1735,6 +1735,110 @@ def test_apptainer_configure_ubuntu_is_idempotent(tmp_path):
     ).read_bytes() == original_backup
 
 
+def _make_previously_managed_sandbox(
+    root: Path, managed_name: str = "agent"
+) -> Path:
+    """Build a sandbox as if an earlier configure renamed ``ubuntu``.
+
+    Mirrors a sandbox configured when the container user was ``managed_name``:
+    the base ``ubuntu`` account is gone and the managed account carries the
+    computeMCP shell path ``/usr/local/bin/computemcp-<name>-shell``.
+    """
+    sandbox = _make_fake_sandbox(root)
+    passwd = sandbox / "etc/passwd"
+    text = passwd.read_text(encoding="utf-8")
+    text = text.replace(
+        "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash",
+        f"{managed_name}:x:1000:1000:Ubuntu:/home/{managed_name}:"
+        f"/usr/local/bin/computemcp-{managed_name}-shell",
+    )
+    passwd.write_text(text, encoding="utf-8")
+    shadow = sandbox / "etc/shadow"
+    shadow.write_text(
+        "root:*:19000:0:99999:7:::\n"
+        f"{managed_name}:*:19000:0:99999:7:::\n",
+        encoding="utf-8",
+    )
+    return sandbox
+
+
+def test_apptainer_configure_reconfigures_managed_account_to_new_user(tmp_path):
+    """A change of the configured container user must not need a rebuild.
+
+    Regression: a sandbox built and configured while the container user was
+    ``agent`` has no ``ubuntu`` account, so reconnecting with the new default
+    ``ubuntu`` aborted ("Expected exactly one 'ubuntu' or 'ubuntu' account").
+    The previously-managed account is detected by its computeMCP shell path and
+    renamed in place, keeping the UID/GID and leaving the base-image backup.
+    """
+    root = tmp_path / "apptainer"
+    sandbox = _make_previously_managed_sandbox(root, "agent")
+    before = (sandbox / "etc/passwd").read_bytes()
+    result, sandbox, _ = _run_apptainer_configure(
+        tmp_path, "ubuntu", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode == 0, (
+        f"configure exited {result.returncode}\n"
+        f"stdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    accounts = _passwd_account(sandbox)
+    assert "ubuntu" in accounts, accounts
+    assert "agent" not in accounts, accounts
+    line = accounts["ubuntu"]
+    assert line[2] == "1000" and line[3] == "1000", line
+    assert line[5] == "/home/ubuntu", line
+    assert line[6] == "/usr/local/bin/computemcp-ubuntu-shell", line
+    backup = sandbox / "etc/passwd.computemcp-backup"
+    assert backup.read_bytes() == before, "backup must be the pre-configure passwd"
+
+
+def test_apptainer_configure_reconfigures_managed_account_to_explicit_user(tmp_path):
+    """A previously-managed sandbox can be moved to any explicit user in place."""
+    root = tmp_path / "apptainer"
+    sandbox = _make_previously_managed_sandbox(root, "agent")
+    before = (sandbox / "etc/passwd").read_bytes()
+    result, sandbox, _ = _run_apptainer_configure(
+        tmp_path, "dev", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode == 0, (
+        f"configure exited {result.returncode}\n"
+        f"stdout:{result.stdout}\nstderr:{result.stderr}"
+    )
+    accounts = _passwd_account(sandbox)
+    assert "dev" in accounts, accounts
+    assert "agent" not in accounts, accounts
+    line = accounts["dev"]
+    assert line[2] == "1000", line
+    assert line[6] == "/usr/local/bin/computemcp-dev-shell", line
+    assert (sandbox / "etc/passwd.computemcp-backup").read_bytes() == before
+    # A second run with the same user is idempotent (candidate source 2).
+    original_backup = (sandbox / "etc/passwd.computemcp-backup").read_bytes()
+    second, sandbox2, _ = _run_apptainer_configure(
+        tmp_path, "dev", _free_port(), sandbox=sandbox
+    )
+    assert second.returncode == 0, (
+        f"second configure exited {second.returncode}\n"
+        f"stdout:{second.stdout}\nstderr:{second.stderr}"
+    )
+    assert sandbox2 == sandbox
+    assert "dev" in _passwd_account(sandbox)
+    assert (sandbox / "etc/passwd.computemcp-backup").read_bytes() == original_backup
+
+
+def test_apptainer_configure_rejects_ambiguous_managed_accounts(tmp_path):
+    """Two computeMCP-managed accounts are ambiguous and must be rejected."""
+    root = tmp_path / "apptainer"
+    sandbox = _make_previously_managed_sandbox(root, "agent")
+    with (sandbox / "etc/passwd").open("a", encoding="utf-8") as stream:
+        stream.write("dev:x:1001:1001:Dev:/home/dev:/usr/local/bin/computemcp-dev-shell\n")
+    result, _, _ = _run_apptainer_configure(
+        tmp_path, "ubuntu", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode != 0, result
+    assert "Expected exactly one" in result.stderr, result.stderr
+    assert "ubuntu" in result.stderr, result.stderr
+
+
 def test_apptainer_configure_rejects_ambiguous_accounts(tmp_path):
     """Two ``ubuntu`` accounts are ambiguous and must be rejected clearly."""
     root = tmp_path / "apptainer"
