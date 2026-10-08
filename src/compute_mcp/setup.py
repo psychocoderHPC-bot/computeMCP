@@ -410,7 +410,7 @@ def render_target_block(answers: TargetAnswers) -> str:
     root_entries.append(("route_host_key_sha256", "SHA256:REPLACE_WITH_FINGERPRINT"))
     if answers.host_key_check == "on":
         root_entries.append(("host_key_check", "on"))
-    root_entries.append(("host_key_algorithms", []))
+    root_entries.append(("host_key_algorithms", ["ssh-ed25519"]))
     if answers.transport == "tunnel":
         root_entries.append(("proxy_jump", ""))
     root_entries += [
@@ -770,9 +770,16 @@ def collect_target(wizard: Wizard, existing: set[str]) -> TargetAnswers:
     ) or None
     if answers.host_key_sha256 is None:
         answers.host_key_check = "off"
+        # host_key_check = "off" disables identity verification, not algorithm
+        # negotiation: asyncssh still negotiates a host-key algorithm and may
+        # pick one the container sshd cannot complete key exchange with.
+        # Default to the ed25519 algorithm so the rendered target always
+        # carries an explicit restriction.
+        answers.host_key_algorithms = ("ssh-ed25519",)
         wizard.say(
             "  Blank fingerprint: host-key verification is disabled "
-            '(host_key_check = "off").'
+            '(host_key_check = "off"); host_key_algorithms defaults to '
+            '["ssh-ed25519"].'
         )
     else:
         algorithms = wizard.ask(

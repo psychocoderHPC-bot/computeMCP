@@ -235,6 +235,10 @@ def test_target_block_commented_defaults_present():
     assert "# sandbox = false" in block
     assert "# auto-deploy = true" in block
     assert "# gpus = []" in block
+    # A hand-built target that leaves algorithms unset shows the correct
+    # commentable default (the wizard always sets the value itself now).
+    assert '# host_key_algorithms = ["ssh-ed25519"]' in block
+    assert "# host_key_algorithms = []" not in block
 
 
 def test_target_block_no_duplicate_key_across_comment_and_active():
@@ -910,6 +914,42 @@ def test_collect_target_blank_fingerprint_disables_verification():
     answers = collect_target(w, set())
     assert answers.host_key_sha256 is None
     assert answers.host_key_check == "off"
+    # host_key_check = "off" disables identity verification but not algorithm
+    # negotiation, so the wizard must still pin a workable algorithm.
+    assert answers.host_key_algorithms == ("ssh-ed25519",)
+
+
+def test_collect_target_blank_fingerprint_renders_active_algorithms(tmp_path):
+    from compute_mcp.setup import collect_target
+
+    w = _wizard(
+        ["rosi", "tunnel", "rosi", "agent", "/home/u/.ssh/k", "", "n", "y", "n", "n"]
+    )
+    answers = collect_target(w, set())
+    block = render_target_block(answers)
+    assert 'host_key_algorithms = ["ssh-ed25519"]' in block
+    active = [line for line in block.splitlines() if not line.startswith("#")]
+    assert any(
+        line.strip() == 'host_key_algorithms = ["ssh-ed25519"]' for line in active
+    )
+    # The rendered target must load through the real loader.
+    config_path = tmp_path / "config.toml"
+    token_path = tmp_path / "tokens.toml"
+    token_path.write_text('[tokens]\n"alpaka" = "sha256:' + "a" * 64 + '"\n')
+    config_path.write_text(
+        render_gateway_config(
+            listen="127.0.0.1",
+            port=2222,
+            allow_enrollment=True,
+            client_id="alpaka",
+            client_targets=("*",),
+            client_label=None,
+            token_file=str(token_path),
+            include=[target_relative_path(answers.name)],
+        )
+    )
+    write_target_file(tmp_path, answers)
+    load_config(config_path)
 
 
 def test_collect_target_pin_sets_algorithms():
