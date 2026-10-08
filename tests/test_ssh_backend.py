@@ -5,6 +5,8 @@ import asyncio
 
 import pytest
 
+import asyncssh
+
 from compute_mcp.ssh_backend import InteractiveSSHClient
 
 
@@ -226,3 +228,317 @@ async def test_factor_prompter_never_leaks_secret_in_repr(caplog):
             await prompter("Password: ", False)
     assert "TOP-SECRET" not in repr(prompter)
     assert "TOP-SECRET" not in caplog.text
+
+
+async def test_empty_route_user_uses_asyncssh_sentinel(monkeypatch):
+    """An empty user must be passed as (), not None.
+
+    asyncssh's "unset" sentinel is ``()`` (fall back to the SSH config alias /
+    local account); passing ``None`` raises TypeError inside saslprep.
+    """
+    from compute_mcp.ssh_backend import dial_route
+
+    seen = {}
+
+    async def fake_connect(host, **connect_kwargs):
+        seen.update(connect_kwargs)
+        return _FakeSSHClient()
+
+    monkeypatch.setattr("compute_mcp.ssh_backend.asyncssh.connect", fake_connect)
+    await dial_route(
+        name="route",
+        host="127.0.0.1",
+        port=22,
+        username=(),
+        client_keys=None,
+        passphrase=None,
+        prompter=None,
+        host_key_sha256=None,
+        known_hosts=None,
+        host_key_algorithms=(),
+        host_key_check="on",
+    )
+    assert seen["username"] == ()
+    assert seen["username"] is not None
+
+
+# -- container hop uses the container login user, not the route user ---------
+
+def _container_target(**overrides):
+    from compute_mcp.config import TargetConfig, TransportConfig
+
+    kwargs = dict(
+        name="hal",
+        user="rwidera",
+        transport=TransportConfig(
+            kind="direct", remote_host="127.0.0.1", remote_port=2222
+        ),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    kwargs.update(overrides)
+    return TargetConfig(**kwargs)
+
+
+async def _capture_container_dial(monkeypatch, target):
+    seen = {}
+
+    async def fake_connect(host, **connect_kwargs):
+        seen["host"] = host
+        seen.update(connect_kwargs)
+        return _FakeSSHClient()
+
+    monkeypatch.setattr("compute_mcp.ssh_backend.asyncssh.connect", fake_connect)
+    from compute_mcp.ssh_backend import SSHBackend
+
+    await SSHBackend()._dial(target, "127.0.0.1", 2222)
+    return seen
+
+
+async def test_container_dial_defaults_to_ubuntu(monkeypatch):
+    """The container hop dials ``ubuntu`` by default, not the route login user.
+
+    This is the bug fix: the route account (``target.user``, here ``rwidera``)
+    authenticates the gateway -> login hop, but the container sshd's
+    ``AllowUsers`` only accepts the container account.  Dialing ``target.user``
+    inside the container failed with ``Permission denied``.
+    """
+    seen = await _capture_container_dial(monkeypatch, _container_target())
+    assert seen["username"] == "ubuntu"
+    assert seen["username"] != "rwidera"
+
+
+async def test_container_dial_uses_container_user_override(monkeypatch):
+    """An explicit ``container_user`` is dialed inside the container."""
+    seen = await _capture_container_dial(
+        monkeypatch, _container_target(container_user="dev")
+    )
+    assert seen["username"] == "dev"
+
+
+async def test_container_dial_honors_env_override(monkeypatch):
+    """``COMPUTEMCP_SSH_USER`` is honored when ``container_user`` is unset."""
+    monkeypatch.setenv("COMPUTEMCP_SSH_USER", "siteagent")
+    seen = await _capture_container_dial(monkeypatch, _container_target())
+    assert seen["username"] == "siteagent"
+
+
+# -- in-process container acceptance: the wrong account fails, the container
+#    account succeeds.  This stands up a real asyncssh server whose
+#    ``validate_public_key`` mirrors the container sshd's ``AllowUsers``.
+_container_server_support = hasattr(asyncssh, "listen") and hasattr(
+    asyncssh, "SSHServer"
+)
+
+
+class _ContainerServer(asyncssh.SSHServer):
+    def __init__(self, allowed_user: str, key) -> None:
+        self.allowed_user = allowed_user
+        self.key = key
+
+    def public_key_auth_supported(self) -> bool:
+        return True
+
+    async def validate_public_key(self, username, key) -> bool:
+        # Mirror ``AllowUsers $SSH_USER``: only the container account is allowed.
+        return username == self.allowed_user
+
+
+# -- connection cache: endpoint-keyed invalidation --------------------------
+#
+# The container's published SSH port can change between container restarts
+# (docker/podman re-publish a fresh ephemeral port on `-p/tcp:2222`).  A
+# gateway-level refresh re-provisions to the new endpoint; the SSHBackend's
+# per-target cache must follow the endpoint, not just the target name, or
+# exec/files/sessions keep dialing the stale port (502).
+
+class _FakeSessionConn:
+    """Minimal stand-in for an orchestrator-level asyncssh.SSHClientConnection."""
+
+    def __init__(self) -> None:
+        self._closed = False
+
+    def is_closed(self):
+        return self._closed
+
+    def close(self):
+        self._closed = True
+
+    async def wait_closed(self):
+        return None
+
+
+def _tunnel_target_for_cache(name="hal", endpoint=("127.0.0.1", 2222)):
+    from compute_mcp.config import TargetConfig, TransportConfig
+
+    host, port = endpoint
+    return TargetConfig(
+        name=name,
+        user="agent",
+        transport=TransportConfig(
+            kind="direct", remote_host=host, remote_port=port
+        ),
+    )
+
+
+async def test_connection_cache_reuses_same_endpoint(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = _tunnel_target_for_cache(endpoint=("127.0.0.1", 2222))
+    dialed = []
+    conns = []
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _FakeSessionConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+
+    backend = SSHBackend()
+    c1 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c1 is conns[0]
+
+    # Same endpoint: reuse the cached connection (no redial).
+    c1b = await backend.connection(target, "127.0.0.1", 2222)
+    assert c1b is c1
+    assert dialed == [("127.0.0.1", 2222)]
+
+
+async def test_connection_cache_invalidated_on_endpoint_change(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = _tunnel_target_for_cache(endpoint=("127.0.0.1", 2222))
+    dialed = []
+    conns = []
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _FakeSessionConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+
+    backend = SSHBackend()
+    c0 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c0 is conns[0]
+
+    # Re-provision changed the published port to 3001: MUST NOT reuse.
+    c1 = await backend.connection(target, "127.0.0.1", 3001)
+    assert c1 is not c0
+    assert c1 is conns[1]
+    assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 3001)]
+
+    # Route change (host, port unchanged) also invalidates: the connection
+    # was opened toward a specific (host, port) on the old route.
+    c2 = await backend.connection(target, "10.0.0.5", 3001)
+    assert c2 is not c1
+    assert c2 is conns[2]
+    assert dialed == [
+        ("127.0.0.1", 2222),
+        ("127.0.0.1", 3001),
+        ("10.0.0.5", 3001),
+    ]
+
+    # Restore the second endpoint: the top-of-stack cache is the 10.0.0.5 one,
+    # so this still redials (no entry is indexed by a separate key).
+    c3 = await backend.connection(target, "127.0.0.1", 3001)
+    assert c3 is not c2
+    assert c3 is conns[3]
+    assert len(dialed) == 4
+
+
+async def test_disconnect_drops_endpoint_keyed_cache(monkeypatch):
+    """Even when the endpoint did not change, an explicit `disconnect` from the
+    gateway's refresh path must empty the cache so the redial happens."""
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = _tunnel_target_for_cache(endpoint=("127.0.0.1", 2222))
+    dialed = []
+    conns = []
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _FakeSessionConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+
+    backend = SSHBackend()
+    c0 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c0 is conns[0]
+
+    await backend.disconnect("hal")
+    assert backend.known_targets() == []
+
+    # Redial, even for the same endpoint we just disconnected from.
+    c1 = await backend.connection(target, "127.0.0.1", 2222)
+    assert c1 is conns[1]
+    assert c1 is not c0
+    assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 2222)]
+
+
+@pytest.mark.skipif(
+    not _container_server_support, reason="asyncssh server support unavailable"
+)
+async def test_container_dial_wrong_account_fails_but_container_account_ok(
+    tmp_path_factory,
+):
+    import asyncio
+    import os
+
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+    host_key = asyncssh.generate_private_key("ssh-ed25519")
+    client_key = asyncssh.generate_private_key("ssh-ed25519")
+    tmp = tmp_path_factory.mktemp("container")
+    host_path = os.path.join(str(tmp), "host_key")
+    client_path = os.path.join(str(tmp), "client_key")
+    host_key.write_private_key(host_path)
+    client_key.write_private_key(client_path)
+
+    server = await asyncssh.listen(
+        "127.0.0.1",
+        0,
+        server_host_keys=[host_path],
+        server_factory=lambda: _ContainerServer("agent", client_key),
+        encoding=None,
+    )
+    port = server.get_port()
+    pin = host_key.get_fingerprint("sha256")
+
+    def target(container_user):
+        return TargetConfig(
+            name="c",
+            user="rwidera",
+            container_user=container_user,
+            transport=TransportConfig(
+                kind="direct", remote_host="127.0.0.1", remote_port=port
+            ),
+            client_key=client_path,
+            host_key_sha256=pin,
+        )
+
+    backend = SSHBackend()
+    try:
+        # The container sshd allows only ``agent``; dialing the route account
+        # (container_user unset would still resolve to ``ubuntu``, so use an
+        # explicit wrong account) is refused -> the 502 root cause.
+        with pytest.raises(SSHError):
+            await asyncio.wait_for(
+                backend.open_connection(target("dev"), "127.0.0.1", port), 10.0
+            )
+        # The container account succeeds.
+        conn = await asyncio.wait_for(
+            backend.open_connection(target("agent"), "127.0.0.1", port), 10.0
+        )
+        assert not conn.is_closed()
+        await SSHBackend.close_connection(conn)
+    finally:
+        server.close()
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            await server.wait_closed()

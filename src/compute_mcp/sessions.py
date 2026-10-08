@@ -218,10 +218,7 @@ class SessionManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await reader
         with contextlib.suppress(Exception):
-            try:
-                session.process.terminate()
-            except Exception:
-                pass
+            session.process.terminate()
         with contextlib.suppress(Exception):
             await asyncio.wait_for(session.process.wait_closed(), timeout=3)
         if session.dedicated_conn is not None:

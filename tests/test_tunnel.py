@@ -504,10 +504,299 @@ async def test_provision_on_route_sets_endpoint(monkeypatch):
         mgr.release(tunnel)
 
 
+async def test_open_for_route_forwards_provisioned_when_provisioning_ran(monkeypatch):
+    """When provisioning ran, the forward targets the PROVISIONED endpoint,
+    not the value in the target's static transport.
+
+    The static transport (remote_host:remote_port) is the placeholder the
+    config author wrote; provisioning resolves the container's real published
+    port, which can differ (and does, after a container restart).
+    """
+    mgr = TunnelManager(SSHConfig(internal_port_min=31550, internal_port_max=31560))
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    # A static endpoint that differs from what provisioning will report, so we
+    # can prove provisioning wins.
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("hal",), remote_host="127.0.0.1", remote_port=2299
+        ),
+        provision_command=("printf", "cn7:4321\n"),
+    )
+
+    class _SessionConn(_FakeConn):
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(0, b"cn7:4321\n", b"")
+
+    conn = _SessionConn(("127.0.0.1", 22))
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target)
+    try:
+        assert tunnel.provisioned_endpoint == ("cn7", 4321)
+        # Forward uses the provisioned endpoint, NOT the static 127.0.0.1:2299.
+        assert conn.forwarded == [
+            ("127.0.0.1", tunnel.local_port, "cn7", 4321)
+        ]
+        dests = {(h, p) for (_, _, h, p) in conn.forwarded}
+        assert ("127.0.0.1", 2299) not in dests
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
+async def test_open_for_route_forwards_static_when_no_provisioning(monkeypatch):
+    """Without a provision command (and no bundle) the forward targets the
+    target's STATIC transport, and no endpoint is reported as provisioned."""
+    mgr = TunnelManager(SSHConfig(internal_port_min=31560, internal_port_max=31570))
+    target = make_target("hal", ["hal"])
+    import dataclasses
+
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("hal",), remote_host="10.0.0.4", remote_port=2244
+        ),
+    )
+    # No provision_command, no bundle: provisioning never runs.
+
+    conn = _FakeConn(("127.0.0.1", 22))
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target)
+    try:
+        # No provisioning ran, so nothing was "provisioned".
+        assert tunnel.provisioned_endpoint is None
+        # The forward targets the static transport endpoint from config.
+        assert conn.forwarded == [
+            ("127.0.0.1", tunnel.local_port, "10.0.0.4", 2244)
+        ]
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
+async def test_bundle_target_deploys_and_runs_derived_argv(monkeypatch):
+    """A bundle target deploys over the route, then runs the deployed helper."""
+    import dataclasses
+
+    from compute_mcp import bundle as bundle_module
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31560, internal_port_max=31570))
+    target = make_target("rosi", ["rosi"])
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("rosi",), remote_port=2222
+        ),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+
+    commands: list[str] = []
+    deployed: list[str] = []
+
+    async def fake_ensure(conn, tgt, **kwargs):
+        deployed.append(bundle_module.resolve_deploy_dir(tgt))
+        return deployed[-1]
+
+    monkeypatch.setattr(bundle_module, "ensure_deployed", fake_ensure)
+
+    class _SessionConn(_FakeConn):
+        async def run(self, command, **kwargs):
+            commands.append(command)
+            return _FakeRunResult(0, b"cn9:4321\n", b"")
+
+    conn = _SessionConn(("127.0.0.1", 22))
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        return conn
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target)
+    try:
+        assert deployed == ["/scratch/agent/computemcp/bundle"]
+        provision = next(c for c in commands if "computemcp-provision.sh" in c)
+        assert provision.endswith(
+            "/scratch/agent/computemcp/bundle/computemcp-provision.sh provision"
+        )
+        assert tunnel.provisioned_endpoint == ("cn9", 4321)
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
+async def test_close_command_derives_bundle_stop_when_unset(monkeypatch):
+    """A bundle target without close_command releases the allocation via the bundle."""
+    import dataclasses
+
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31580, internal_port_max=31590))
+    target = make_target("rosi", ["rosi"])
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("rosi",), remote_port=2222
+        ),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+
+    seen: list[str] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    await mgr.run_close_command(target, "rosi", connection=_Conn())
+    assert seen and seen[0].endswith(
+        "/scratch/agent/computemcp/bundle/computemcp-provision.sh stop"
+    )
+
+
+async def test_close_command_bundle_prefixes_provision_env():
+    """A derived bundle stop carries the COMPUTEMCP_* exports.
+
+    Regression: the gateway ran the helper ``stop`` with no environment, so the
+    helper exited 2 ("must be apptainer or docker") and the container leaked.
+    The close command must be prefixed with the same shell-quoted exports the
+    provision path emits.
+    """
+    import dataclasses
+
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31580, internal_port_max=31590))
+    target = make_target("rosi", ["rosi"])
+    target = dataclasses.replace(
+        target,
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("rosi",), remote_port=2222
+        ),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+
+    seen: list[str] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    env = {
+        "COMPUTEMCP_SYSTEM": "rosi",
+        "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+        "COMPUTEMCP_STORAGE_ROOT": "/scratch/agent/computemcp",
+        "COMPUTEMCP_STATE_DIR": "/scratch/agent/computemcp/rosi/state",
+        "COMPUTEMCP_CONTAINER_PORT": "2222",
+        "COMPUTEMCP_SANDBOX": "true",
+        "COMPUTEMCP_HOST_HOME": "",
+        "COMPUTEMCP_IMAGE": "",
+        "COMPUTEMCP_GPU_VENDORS": "",
+        "COMPUTEMCP_PROVISION_ENV": "",
+    }
+    await mgr.run_close_command(
+        target, "rosi", connection=_Conn(), provision_env=env
+    )
+    assert len(seen) == 1
+    command = seen[0]
+    assert "export COMPUTEMCP_CONTAINER_RUNTIME=apptainer;" in command
+    assert "export COMPUTEMCP_STATE_DIR=/scratch/agent/computemcp/rosi/state;" in command
+    assert "export COMPUTEMCP_SYSTEM=rosi;" in command
+    # The exports precede the helper argv.
+    assert command.endswith(
+        "bash /scratch/agent/computemcp/bundle/computemcp-provision.sh stop"
+    )
+
+
+async def test_run_close_command_without_provision_env_unchanged():
+    """An explicit close_command with no env keeps the previous exact shape."""
+    import dataclasses
+
+    mgr = TunnelManager(SSHConfig(internal_port_min=31600, internal_port_max=31610))
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), close_command=("scancel", "--name", "x")
+    )
+    seen: list[str] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            seen.append(command)
+            return _FakeRunResult(0, b"", b"")
+
+    await mgr.run_close_command(target, "hal", connection=_Conn())
+    assert seen == ["scancel --name x"]
+
+
 # ---------------------------------------------------------------------------
 # run_connect_command failure paths (advisory, never fatal)
 # ---------------------------------------------------------------------------
-
 async def test_run_connect_command_nonzero_exit_is_logged_not_raised(caplog):
     mgr = TunnelManager(SSHConfig(internal_port_min=31600, internal_port_max=31610))
     import dataclasses
@@ -673,3 +962,85 @@ async def test_open_for_route_forward_failure_releases_port(monkeypatch):
         await mgr.connect(target)
     assert conn.is_closed()
     assert mgr.reserved == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# format_provision_env: shell-quoted export statements
+# ---------------------------------------------------------------------------
+
+def test_format_provision_env_none_empty_and_plain_values():
+    from compute_mcp.tunnel import format_provision_env
+
+    assert format_provision_env(None) == ""
+    assert format_provision_env({}) == ""
+    text = format_provision_env(
+        {"COMPUTEMCP_SYSTEM": "hal", "COMPUTEMCP_NODES": "1"}
+    )
+    # Simple word-safe values need no quoting (shlex.quote is a no-op for them).
+    assert text == "export COMPUTEMCP_SYSTEM=hal; export COMPUTEMCP_NODES=1;"
+
+
+def test_format_provision_env_quotes_values_with_spaces_newlines_and_shell_words():
+    from compute_mcp.tunnel import format_provision_env
+
+    # The SBATCH args value is one complete argument per line (no trailing
+    # newline) plus shell metacharacters: the whole value must survive as a
+    # single quoted word so the provision command sees it verbatim.
+    value = "--gres=gpu:2\n--mem=378000M --job-name='my job' $(reboot) ;"
+    text = format_provision_env({"COMPUTEMCP_SBATCH_ARGS": value})
+    assert text.count("export ") == 1
+    assert text.startswith("export COMPUTEMCP_SBATCH_ARGS=")
+    assert text.endswith(";")
+    # The quoted value must reproduce the exact byte sequence.
+    quoted = text[len("export COMPUTEMCP_SBATCH_ARGS=") : -1]
+    assert quoted.startswith("'") and quoted.endswith("'")
+    # shlex.quote: a raw newline embedded inside a single-quoted value.
+    assert "\n" in quoted and "$" in quoted
+
+
+def test_format_provision_env_empty_value_is_quoted_empty():
+    from compute_mcp.tunnel import format_provision_env
+
+    text = format_provision_env(
+        {"COMPUTEMCP_SBATCH_ARGS": "", "COMPUTEMCP_SANDBOX": "false"}
+    )
+    assert text == "export COMPUTEMCP_SBATCH_ARGS=''; export COMPUTEMCP_SANDBOX=false;"
+
+
+def test_format_provision_env_rejects_nul():
+    from compute_mcp.tunnel import TunnelError, format_provision_env
+
+    with pytest.raises(TunnelError, match="NUL"):
+        format_provision_env({"COMPUTEMCP_X": "a\x00b"})
+    with pytest.raises(TunnelError, match="NUL"):
+        format_provision_env({"COMPUTEMCP_X\x00": "a"})
+
+
+async def test_dial_hop_empty_user_uses_asyncssh_sentinel(monkeypatch):
+    """An empty target user must reach asyncssh as (), never None.
+
+    _dial_hop resolves the username from the SSH config alias then the target
+    fallback; when both are empty it must pass asyncssh's () sentinel so the
+    local account is used, because None raises inside saslprep.
+    """
+    from compute_mcp import tunnel as tunnel_module
+    from compute_mcp.config import SSHConfig
+
+    seen = {}
+
+    async def fake_dial_route(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(tunnel_module, "dial_route", fake_dial_route)
+    await tunnel_module._dial_hop(
+        {"hostname": "127.0.0.1", "port": 22, "user": ""},
+        tunnel=None,
+        client_keys=[],
+        prompter=None,
+        pin=None,
+        ssh=SSHConfig(),
+        name="route",
+        fallback_user="",
+    )
+    assert seen["username"] == ()

@@ -26,7 +26,7 @@ from pathlib import Path
 import aiohttp
 
 DEFAULT_HOST = "host.containers.internal"
-DEFAULT_PORT = 2223
+DEFAULT_PORT = 2222
 POLL_INTERVAL = 3.0
 BEGIN_MARK = "# >>> computeMCP >>"
 END_MARK = "# <<< computeMCP <<"
@@ -143,7 +143,7 @@ def _mcp_snippet(url: str, token: str) -> str:
     return (
         '  "compute": {\n'
         '    "type": "local",\n'
-        '    "command": ["/home/dev/.local/bin/computeMCP-mcp"],\n'
+        '    "command": ["computeMCP-mcp"],\n'
         '    "enabled": true,\n'
         '    "environment": {\n'
         f'      "COMPUTEMCP_GATEWAY": {json.dumps(url)},\n'

@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 
 import asyncssh
 
+from . import bundle as bundle_module
 from .config import SSHConfig, TargetConfig, TransportConfig
 from .ssh_backend import (
     SSHError,
@@ -57,6 +58,30 @@ _ENDPOINT_RE = re.compile(
     r"^(?:ENDPOINT\s+)?(?P<host>[A-Za-z0-9_.\-]+):(?P<port>\d{1,5})\s*$",
     re.IGNORECASE,
 )
+
+
+def format_provision_env(provision_env: dict[str, str] | None) -> str:
+    """Render ``provision_env`` as quoted ``export`` statements for one command.
+
+    The gateway cannot rely on SSH ``AcceptEnv`` (a site may not forward an
+    arbitrary variable), so the resolved values are shipped as shell-quoted
+    ``export NAME='value';`` statements prepended to the trusted provision
+    command.  ``shlex.quote`` protects embedded whitespace and newlines; the
+    command itself is still executed as a shell command string over the route
+    connection, exactly as before.  Every value is validated to contain no NUL,
+    which a shell string cannot carry safely.
+    """
+    if not provision_env:
+        return ""
+    statements: list[str] = []
+    for name, value in provision_env.items():
+        text = "" if value is None else str(value)
+        if "\x00" in name or "\x00" in text:
+            raise TunnelError(
+                f"provisioning environment {name!r} contains a NUL byte"
+            )
+        statements.append(f"export {name}={shlex.quote(text)};")
+    return " ".join(statements)
 
 
 def parse_provision_endpoint(output: str) -> tuple[str, int] | None:
@@ -301,7 +326,9 @@ async def _dial_hop(
     """Dial one route hop, optionally through an already-open jump connection."""
     host = info["hostname"]
     port = info["port"]
-    username = info["user"] or fallback_user
+    # asyncssh's "unset" sentinel is (), not None: passing None crashes in
+    # saslprep.  An empty user lets the SSH config alias / local account decide.
+    username = info["user"] or fallback_user or ()
     keys = list(client_keys) if client_keys else None
     if tunnel is None:
         # First hop: use the dedicated route primitive (pin + prompter aware).
@@ -443,6 +470,7 @@ class TunnelManager:
         *,
         factor: str | None = None,
         provision: bool = True,
+        provision_env: dict[str, str] | None = None,
     ) -> RouteTunnel:
         """Open a route connection and forward ``local_port`` to the endpoint.
 
@@ -452,6 +480,12 @@ class TunnelManager:
         that command runs on the freshly opened route connection and its
         ``host:port`` output replaces the endpoint; the parsed value is exposed
         as :attr:`RouteTunnel.provisioned_endpoint`.
+
+        ``provision_env`` is the resolved allocation/container environment
+        contract (see gateway).  When set, shell-quoted ``export NAME='value';``
+        statements are prepended to the provision command string, before the
+        trusted argv.  The argv itself is unchanged; SSH ``AcceptEnv`` is never
+        relied on.
         """
         transport = transport or target.transport
 
@@ -503,11 +537,31 @@ class TunnelManager:
         provisioned: tuple[str, int] | None = None
         dest_host = transport.remote_host
         dest_port = transport.remote_port
-        if provision and target.provision_command:
-            command = " ".join(shlex.quote(p) for p in target.provision_command)
+        if provision and (target.provision_command or target.bundle):
+            resolved_dir: str | None = None
+            if target.bundle:
+                # Deploy the shipped bundle over the live route, then run it
+                # from the deploy directory.  The upload is skipped when the
+                # remote content marker matches; explicit provision_command or
+                # close_command still take precedence over the bundle.
+                try:
+                    resolved_dir = await bundle_module.ensure_deployed(conn, target)
+                except (bundle_module.BundleError, asyncssh.Error, OSError) as exc:
+                    for opened_conn in reversed(opened):
+                        await _close_connection(opened_conn)
+                    raise TunnelError(
+                        f"target {target.name!r} bundle deploy on route "
+                        f"{route!r} failed: {exc}"
+                    ) from exc
+            argv_tuple = bundle_module.provision_argv(
+                target, "provision", deploy_dir=resolved_dir
+            )
+            argv = " ".join(shlex.quote(p) for p in argv_tuple)
+            prefix = format_provision_env(provision_env)
+            command = f"{prefix} {argv}" if prefix else argv
             log.info(
                 "target %s: provisioning on route %s: %s",
-                target.name, route, " ".join(target.provision_command),
+                target.name, route, " ".join(argv_tuple),
             )
             try:
                 result = await conn.run(
@@ -583,6 +637,7 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         connection: asyncssh.SSHClientConnection | None,
+        provision_env: dict[str, str] | None = None,
     ) -> None:
         """Run a trusted advisory command on the remote route host.
 
@@ -590,6 +645,10 @@ class TunnelManager:
         machine that hosts the development container) so the gateway can
         forward stdout/stderr.  Exit status and output are logged but never
         fatal: the caller decides what to do next.
+
+        ``provision_env`` mirrors the provision path: for a bundle target the
+        derived ``stop`` argv needs the same ``COMPUTEMCP_*`` environment, so it
+        is rendered as shell-quoted exports and prefixed to the command.
 
         Callers must pass the live ``connection`` (the route connection stored
         on the tunnel).  When it is missing the call is a logged no-op.
@@ -600,7 +659,9 @@ class TunnelManager:
                 target.name, label,
             )
             return
-        command = " ".join(shlex.quote(p) for p in argv)
+        argv_text = " ".join(shlex.quote(p) for p in argv)
+        prefix = format_provision_env(provision_env)
+        command = f"{prefix} {argv_text}" if prefix else argv_text
         log.info(
             "target %s: running %s via %s: %s",
             target.name, label, route, " ".join(argv),
@@ -638,6 +699,7 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         connection: asyncssh.SSHClientConnection | None = None,
+        provision_env: dict[str, str] | None = None,
     ) -> None:
         """Run the target's trusted ``connect_command`` on the route host.
 
@@ -646,6 +708,9 @@ class TunnelManager:
         forward stdout/stderr.  It is used to bring a stopped container back up.
         Exit status and output are logged but never fatal: the caller re-tries
         the connection to decide whether recovery worked.
+
+        ``provision_env`` is forwarded for a bundle-backed recovery command so it
+        sees the same ``COMPUTEMCP_*`` environment as the provision path.
 
         Signature changed for the route-first model: callers must pass the live
         ``connection`` (the route connection stored on the tunnel).  When it is
@@ -658,6 +723,7 @@ class TunnelManager:
             target,
             route,
             connection,
+            provision_env,
         )
 
     async def run_close_command(
@@ -665,6 +731,7 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         connection: asyncssh.SSHClientConnection | None = None,
+        provision_env: dict[str, str] | None = None,
     ) -> None:
         """Run the target's trusted ``close_command`` on the route host.
 
@@ -673,14 +740,36 @@ class TunnelManager:
         torn down.  Exit status and output are advisory: a non-zero exit or
         timeout is logged and teardown still proceeds.  When there is no live
         ``connection`` the call is a logged no-op.
+
+        ``provision_env`` carries the ``COMPUTEMCP_*`` contract for a derived
+        bundle ``stop``; without it the helper would exit because an empty
+        container-runtime variable cannot be resolved.
         """
+        argv = target.close_command
+        if not argv and target.bundle is not None and connection is not None:
+            # Resolve $HOME for the derived bundle stop; a failure here is
+            # advisory (teardown still proceeds).
+            try:
+                resolved = await bundle_module.resolve_remote_dir(
+                    connection, bundle_module.resolve_deploy_dir(target)
+                )
+                argv = bundle_module.provision_argv(
+                    target, "stop", deploy_dir=resolved
+                )
+            except Exception as exc:  # noqa: BLE001 - advisory, never fatal
+                log.warning(
+                    "target %s: could not resolve bundle stop path: %s",
+                    target.name, exc,
+                )
+                argv = bundle_module.provision_argv(target, "stop")
         await self._run_advisory_command(
             "close_command",
-            target.close_command,
+            argv,
             target.close_command_timeout,
             target,
             route,
             connection,
+            provision_env,
         )
 
     async def connect(
@@ -690,6 +779,7 @@ class TunnelManager:
         transport: TransportConfig | None = None,
         *,
         factor: str | None = None,
+        provision_env: dict[str, str] | None = None,
     ) -> RouteTunnel:
         """Try each configured route in order; return the first working tunnel.
 
@@ -699,14 +789,21 @@ class TunnelManager:
         is not run again; otherwise a target ``provision_command`` runs on the
         route connection.  Failover always follows the target's own
         ``transport.ssh_targets``.
+
+        ``provision_env`` is forwarded verbatim to :meth:`open_for_route` so the
+        resolved allocation/container export statements reach the provision
+        command.
         """
 
         override = transport is not None
         transport = transport or target.transport
+        # Only forward ``provision_env`` when set, so the existing call shape
+        # for a target without an allocation/container description is unchanged.
+        env_kwargs = {"provision_env": provision_env} if provision_env is not None else {}
         if transport.kind == "direct":
             return await self.open_for_route(
                 target, "direct", transport.remote_port, transport,
-                factor=factor, provision=False,
+                factor=factor, provision=False, **env_kwargs,
             )
 
         last_error: Exception | None = None
@@ -716,6 +813,7 @@ class TunnelManager:
                 tunnel = await self.open_for_route(
                     target, route, local_port, transport,
                     factor=factor, provision=not override,
+                    **env_kwargs,
                 )
                 log.info("target %s connected via route %s on 127.0.0.1:%d",
                          target.name, route, local_port)

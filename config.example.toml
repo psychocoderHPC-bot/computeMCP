@@ -10,6 +10,22 @@
 # Replace every "/home/USER" placeholder with your real home directory.  A
 # literal "USER" path parses fine but makes every exec/session fail with
 # "[Errno 2] No such file or directory".
+#
+# ---------------------------------------------------------------------------
+# Configuration includes (optional).
+# A top-level `include` key splits the gateway configuration across files.
+# Place it before any other table.  Relative paths resolve against the
+# directory of this file, not the process working directory; absolute paths
+# are used as-is.  Two files assigning the same leaf value are rejected (the
+# error names both files); a missing include file or a cycle is a load error.
+# `include` keys are stripped from the merged result, so an entry file that
+# only carries `include` plus the tables below still loads as a normal config.
+# ---------------------------------------------------------------------------
+# include = [
+#     "systems/rosi.toml",
+#     "systems/hal.toml",
+#     "/opt/computeMCP-gateway/systems/other.toml",
+# ]
 
 [server]
 # Bind address. On the host that Terok/Podman reaches via
@@ -23,8 +39,8 @@ exec_timeout = 900.0
 max_body_bytes = 268435456
 # Interactive enrollment (computeMCP-handshake).  /v1/enroll is unauthenticated but
 # grants nothing until an operator approves on the console; these bound it.
-# Set allow_enrollment = false to remove the endpoint entirely.
-allow_enrollment = true
+# Disabled by default: set allow_enrollment = true to expose the endpoint.
+allow_enrollment = false
 enroll_ttl = 600.0
 enroll_max_pending = 32
 
@@ -233,3 +249,279 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # connect_mode = "dedicated"
 # host_key_sha256 = "SHA256:..."
 # client_key = "/home/USER/.ssh/computemcp_container"
+
+# ---------------------------------------------------------------------------
+# Slurm target: Apptainer container inside the allocation
+#
+# A Slurm-allocation target that uses the shipped provisioning bundle.  The
+# gateway computes the resource plan on the host, renders the per-stage Slurm
+# arguments, and exports them as COMPUTEMCP_SBATCH_ARGS / COMPUTEMCP_SRUN_ARGS
+# (and the plan/container variables) around the provisioning command.
+#
+# With a [targets.X.bundle] block the gateway deploys the bundle itself.  It
+# opens the route connection, uploads the four helper files into deploy-dir over
+# SFTP only when the remote content marker differs, derives the container's
+# authorized public key from client_key, and runs the deployed helper.  The
+# copy is versioned: after a gateway upgrade the changed bundle is re-deployed
+# on the next connect.  The deploy directory must be on storage visible to the
+# login AND compute nodes (the batch step runs the container script there), so
+# it defaults to <container.storage-root>/bundle; /tmp is not shared on most
+# clusters and is a poor choice.
+#
+# Without a [bundle] block, set provision_command/close_command yourself and
+# place the bundle on the target by hand, as before.
+#
+# The bundle is config-driven: it builds the sandbox if missing, submits a
+# single-node allocation, starts the container, and runs a relay from the
+# login node to the container SSH port on the compute node.
+#
+# Multi-node allocations are not yet end-to-end: the gateway-side plan,
+# mappings, and preview are live for nodes > 1, and the rendered args carry
+# --nodes=N, but the helper exits with "multi-node not yet supported" before
+# sbatch when the request has more than one node.  Use nodes = 1 until the
+# container-startup path lands in a later change.
+# ---------------------------------------------------------------------------
+# [targets.rosi]
+# ssh_targets = ["rosi"]                # login-node alias
+# user = "agent"
+# client_key = "/home/USER/.ssh/computemcp_container"
+# host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+# host_key_algorithms = ["ssh-ed25519"]
+# sharing = "exclusive"                 # a whole Slurm allocation is ours
+# auto_connect = true
+# # The operator CLI wait for connect/refresh is provision_timeout + margin.
+# provision_timeout = 960.0
+#
+# # Let the gateway deploy and run the shipped bundle.  deploy-dir is optional
+# # and defaults to <container.storage-root>/bundle.  auto-deploy = true
+# # (default) uploads when the content marker differs; set it to false to pin
+# # the copy already deployed on the login node, even after a gateway upgrade.
+# # provision-env is an optional array of shell lines run on the remote before
+# # the container runtime is used (once on the login/route node before build and
+# # again inside the container-start path on the job node); an empty array is a
+# # no-op.  With a bundle block, provision_command is not required.
+# [targets.rosi.bundle]
+# source = "computemcp-container"
+# # deploy-dir = "/scratch/USER/computemcp/bundle"
+# # auto-deploy = true
+# # provision-env = ["module load apptainer", "source /etc/profile.d/spack.sh"]
+#
+# # Allocatable resources of one compute node (descriptions, not constraints;
+# # all fields are optional).  cpus are Slurm CPUs under the site/SMT policy,
+# # gpus are the scheduler-visible GPU units, memory is allocatable host memory
+# # with a Slurm unit (a bare integer is MiB).  Not installed RAM, not GPU memory.
+# [targets.rosi.node]
+# cpus = 24
+# gpus = 4
+# memory = "378000M"
+#
+# # Allocation policy.  One node is the default; a GPU system requests one
+# # GPU per node (default-gpus is accepted; currently the mode fixes the count).
+# # `single-node` takes
+# # any of gpu-proportional | cpu-proportional | full | exclusive; `multi-node`
+# # is limited to full | exclusive.  max-nodes is the hard bound on the request.
+# [targets.rosi.allocation]
+# default-gpus = 1
+# single-node = "gpu-proportional"
+# multi-node = "exclusive"
+# max-nodes = 4
+#
+# # Manual submission options.  Keys are Slurm option names without leading --;
+# # values are a string/integer (rendered --key=value), a boolean (true emits
+# # --key, false omits) or an array (repeated --key=value).  Protocol options
+# # the helper owns (parsable, quiet, wrap) are rejected here.
+# # The dedicated `account` key is the scheduler account passed as
+# # `sbatch -A`/`--account`; an empty string or an omitted key emits no
+# # --account argument at all.
+# [targets.rosi.slurm.sbatch]
+# partition = "REPLACE_WITH_PARTITION_NAME"   # nested table under [slurm]
+# time = "02:00:00"
+# account = "REPLACE_WITH_ACCOUNT"            # omitted -> no -A/--account
+# mem = "100G"           # fixed memory; when a manual option is present the
+#                        # memory-per-node mapping is refused (conflict error)
+# ntasks-per-node = 1    # = 1 so the cpus-per-task mapping below is valid
+#
+# # Calculated values -> scheduler options.  Keys are the calculated fields
+# # (nodes, gpus-per-node, cpus-per-node, memory-per-node, exclusive) and the
+# # value selects the representation.  gpus-per-node maps to gres or
+# # gpus-per-node; cpus-per-node maps to cpus-per-task (one task per node only);
+# # memory-per-node maps to mem (whole MiB, M unit); exclusive maps to exclusive
+# # (emitted only when the plan is exclusive).  Omit a mapping to leave the
+# # scheduler default.  The `sbatch`/`srun` stages are rendered independently;
+# # nothing is copied between them.
+# [targets.rosi.slurm.sbatch-map]
+# nodes = "nodes"
+# gpus-per-node = "gres"
+# cpus-per-node = "cpus-per-task"
+# exclusive = "exclusive"
+# # No memory mapping: the manual mem option above is authoritative.
+#
+# # Manual job-step options and their mappings (independent from sbatch).
+# [targets.rosi.slurm.srun]
+# ntasks-per-node = 1
+# cpu-bind = "none"
+#
+# [targets.rosi.slurm.srun-map]
+# nodes = "nodes"
+# cpus-per-node = "cpus-per-task"
+#
+# # Container runtime for the provisioning bundle. `runtime` is apptainer or
+# # docker. `storage-root` is the base for the sandbox, home, and state dirs;
+# # the bundle default is $HOME/.local/share/computemcp. `image` is the base
+# # (docker://<ref> for Apptainer, plain reference for Docker). `gpus` is a
+# # vendor list (subset of nvidia, amd, intel). `host-home` is the host dir whose
+# # .ssh/authorized_keys the container trusts. `sandbox` is informational.
+# # `build-location` is "login" (default) or "compute": "login" builds the
+# # Apptainer sandbox on the login/head node before submitting the allocation,
+# # while "compute" builds it on the first allocated compute node.  Set "compute"
+# # on an architecture-mismatched partition (e.g. an ARM partition whose login
+# # nodes are x86-64); it requires Slurm, because the compute-node build happens
+# # inside the allocation.  "compute" is meaningful for the Apptainer runtime (an
+# # architecture-mismatched partition); with the Docker runtime it is orthogonal
+# # because the image is pulled and started where it runs.
+# [targets.rosi.container]
+# runtime = "apptainer"
+# storage-root = "/scratch/USER/computemcp"
+# image = "docker://ubuntu:24.04"
+# gpus = ["nvidia"]
+# host-home = "/scratch/USER/computemcp/home"
+# sandbox = true
+# build-location = "compute"
+#
+# # Operator preview of the allocation without connecting:
+# #   computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2 --dry-run
+# # The preview prints the plan, per-stage manual options, the rendered
+# # per-stage arguments, the fields not emitted, and the final
+# # COMPUTEMCP_SBATCH_ARGS / COMPUTEMCP_SRUN_ARGS.
+
+# ---------------------------------------------------------------------------
+# Slurm target: CPU-only node with a Docker container
+#
+# No GPUs on the node, so the target uses cpu-proportional (request the full
+# per-node CPU capacity by default; default-cpus applies when node.cpus is
+# unset) and lets the cpus-per-node / memory-per-node mappings emit the CPU
+# and memory requests.  The container runtime is Docker and `gpus` is empty,
+# so the helper adds no GPU device flags.
+# ---------------------------------------------------------------------------
+# [targets.cpuhost]
+# ssh_targets = ["cpuhost"]
+# user = "agent"
+# client_key = "/home/USER/.ssh/computemcp_container"
+# host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+# host_key_algorithms = ["ssh-ed25519"]
+# auto_connect = false
+# provision_timeout = 600.0
+#
+# [targets.cpuhost.bundle]
+# source = "computemcp-container"
+# # deploy-dir = "/scratch/USER/computemcp/bundle"
+#
+# [targets.cpuhost.node]
+# cpus = 16
+# memory = "128G"
+# # No `gpus` key: the node is CPU-only.
+#
+# [targets.cpuhost.allocation]
+# default-cpus = 4
+# single-node = "cpu-proportional"
+#
+# [targets.cpuhost.slurm.sbatch]
+# partition = "REPLACE_WITH_PARTITION_NAME"
+# time = "01:00:00"
+# account = "REPLACE_WITH_ACCOUNT"      # empty/omitted -> no --account
+# ntasks-per-node = 1
+#
+# [targets.cpuhost.slurm.sbatch-map]
+# cpus-per-node = "cpus-per-task"      # one task per node (ntasks-per-node = 1)
+# memory-per-node = "mem"              # emit --mem=<MiB>M from the plan
+#
+# [targets.cpuhost.slurm.srun]
+# ntasks-per-node = 1
+# cpu-bind = "none"
+#
+# [targets.cpuhost.slurm.srun-map]
+# cpus-per-node = "cpus-per-task"
+#
+# [targets.cpuhost.container]
+# runtime = "docker"
+# storage-root = "/scratch/USER/computemcp"
+# image = "ubuntu:24.04"               # plain reference for the Docker path
+# # `gpus` unset: no GPU vendor is exposed, so the helper adds no device flags.
+
+# ---------------------------------------------------------------------------
+# Non-Slurm target: a Docker host that uses the provisioning bundle
+#
+# The shipped bundle is not Slurm-specific: on a host without a scheduler the
+# helper skips sbatch/srun, builds or reuses the container on the route node,
+# and starts it there.  There is no node/allocation/slurm block, and
+# provision_command is not required: a [targets.X.bundle] block supplies the
+# provisioning path.  provision-env runs the site setup before the runtime is
+# used.
+# ---------------------------------------------------------------------------
+# [targets.hal-docker]
+# ssh_targets = ["hal"]                 # a plain SSH route, no scheduler
+# user = "agent"
+# client_key = "/home/USER/.ssh/computemcp_container"
+# host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
+# host_key_algorithms = ["ssh-ed25519"]
+# auto_connect = true
+#
+# [targets.hal-docker.bundle]
+# source = "computemcp-container"
+# deploy-dir = "$HOME/computemcp/bundle"
+# # provision-env = ["source /etc/profile.d/docker.sh"]
+#
+# [targets.hal-docker.container]
+# runtime = "docker"
+# storage-root = "/scratch/USER/computemcp"
+# image = "ubuntu:24.04"
+# gpus = ["nvidia"]
+
+# ---------------------------------------------------------------------------
+# Copy-paste skeleton blocks for a Slurm target.
+#
+# The blocks below are commented-out but valid TOML once the leading `# ` is
+# removed.  They are the same keys the loader validates; no key here is
+# invented.  Replace X with a real target name, set the string values, then
+# delete the blocks you do not need.  `bundle` needs `client_key` (on the
+# target) and, unless `deploy-dir` is set, a `container.storage-root` to
+# derive the deployment directory from.  `node`/`allocation`/`slurm` are all
+# optional; without them a target is a plain container host.
+# ---------------------------------------------------------------------------
+# [targets.X.bundle]
+# source = "computemcp-container"
+# deploy-dir = "/scratch/USER/computemcp/bundle"
+# auto-deploy = true
+# provision-env = ["module load apptainer", "source /etc/profile.d/spack.sh"]
+#
+# [targets.X.container]
+# runtime = "apptainer"
+# storage-root = "/scratch/USER/computemcp"
+# image = "docker://ubuntu:24.04"
+# gpus = ["nvidia"]
+# host-home = "/scratch/USER/computemcp/home"
+# sandbox = true
+#
+# [targets.X.node]
+# cpus = 24
+# gpus = 4
+# memory = "378000M"
+#
+# [targets.X.allocation]
+# default-gpus = 1
+# default-cpus = 4
+# single-node = "gpu-proportional"
+# multi-node = "exclusive"
+# max-nodes = 4
+#
+# [targets.X.slurm.sbatch]
+# partition = "REPLACE_WITH_PARTITION_NAME"
+# time = "02:00:00"
+# account = "REPLACE_WITH_ACCOUNT"      # empty/omitted -> no --account
+# ntasks-per-node = 1
+#
+# [targets.X.slurm.sbatch-map]
+# nodes = "nodes"
+# gpus-per-node = "gres"
+# cpus-per-node = "cpus-per-task"
+

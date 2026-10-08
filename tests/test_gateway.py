@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from compute_mcp.auth import hash_token
 from compute_mcp.config import (
     ClientConfig,
+    ConfigError,
     GatewayConfig,
     ServerConfig,
     SessionConfig,
@@ -865,12 +866,66 @@ async def test_headless_interactive_target_raises_clear_error(monkeypatch):
     monkeypatch.setattr(gw.backend, "connection", boom)
     monkeypatch.setattr(gw, "ensure_connected", no_connect)
     monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 9))
+    # A dial failure while a factor is still outstanding stays a 2FA error.
+    gw.runtimes["hal"].awaiting_factor = True
 
     with pytest.raises(InteractiveAuthRequired):
         await gw._open_container_conn("hal")
 
 
-async def test_interactive_target_connects_with_factor(monkeypatch):
+async def test_connected_target_with_stale_factor_surfaces_real_dial_error(monkeypatch):
+    """A stale awaiting_factor on a live target must not mask a real dial error.
+
+    The invariant after a successful connect is ``state == "connected"`` and
+    ``awaiting_factor is False`` together.  If a stale flag remains (e.g. from a
+    factor-less refresh), a container-dial ``SSHError`` must surface as-is rather
+    than being mapped to the 2FA 503.
+    """
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, target = _interactive_gateway()
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.tunnel = _FakeTunnel(target, route="hal", local_port=2222, alive=True)
+    # Simulate the stale window: connected + live tunnel, flag still set.
+    runtime.awaiting_factor = True
+
+    async def fake_ensure(name):
+        return runtime
+
+    async def boom(target, host, port):
+        raise SSHError("container dial refused")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 2222))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    with pytest.raises(SSHError, match="container dial refused"):
+        await gw._open_container_conn("hal")
+
+
+async def test_genuinely_awaiting_factor_still_yields_2fa_503(monkeypatch):
+    """A factor that is genuinely outstanding (target not connected) stays a 503."""
+    from compute_mcp.gateway import InteractiveAuthRequired
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, target = _interactive_gateway()
+    runtime = gw.runtimes["hal"]
+    runtime.state = "disconnected"
+    runtime.awaiting_factor = True
+
+    async def fake_ensure(name):
+        return runtime
+
+    async def boom(target, host, port):
+        raise SSHError("container dial refused")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 2222))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    with pytest.raises(InteractiveAuthRequired):
+        await gw._open_container_conn("hal")
     """An interactive target dials the route with the supplied factor."""
     import dataclasses
 
@@ -1286,6 +1341,9 @@ async def _enroll_flow(tmp_path, monkeypatch):
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         """
+        [server]
+        allow_enrollment = true
+
         [clients.ci]
         token = "ci-secret"
         targets = ["hal"]
@@ -1381,6 +1439,76 @@ async def test_enroll_rejects_existing_client_and_unknown_target(tmp_path, monke
         await client.close()
 
 
+async def test_enroll_approve_include_based_config_succeeds(tmp_path, monkeypatch):
+    """Targets living in an included file must approve through /enroll."""
+    from compute_mcp.config import load_config
+    from compute_mcp.gateway import Gateway
+
+    cfg = tmp_path / "config.toml"
+    included = tmp_path / "systems" / "hal.toml"
+    included.parent.mkdir(parents=True, exist_ok=True)
+    included.write_text(
+        """
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    cfg.write_text(
+        """
+        include = ["systems/hal.toml"]
+
+        [server]
+        allow_enrollment = true
+
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+        """
+    )
+    gw = Gateway(load_config(cfg))
+    before_included = included.read_text()
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/enroll", json={"client_id": "newci", "targets": ["hal"]}
+        )
+        assert resp.status == 200, await resp.text()
+        rid = (await resp.json())["request_id"]
+        resp = await client.post(
+            f"/v1/enroll-requests/{rid}/approve", headers=auth("admin-token")
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        assert body["client_id"] == "newci"
+        assert body["targets"] == ["hal"]
+        assert "[clients.newci]" in cfg.read_text()
+        # Only the entry file was written to; the include file is untouched.
+        assert included.read_text() == before_included
+        loaded = load_config(cfg)
+        assert loaded.clients["newci"].may_access("hal")
+    finally:
+        await client.close()
+
+
+async def test_enroll_approve_unknown_request_id_returns_404(tmp_path, monkeypatch):
+    """A stale/unknown id must yield 404, not a 500 from the middleware."""
+    gw, _ = await _enroll_flow(tmp_path, monkeypatch)
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/enroll-requests/00000000000/approve", headers=auth("admin-token")
+        )
+        assert resp.status == 404
+        assert resp.status != 500
+        assert "unknown enrollment request" in await resp.text()
+    finally:
+        await client.close()
+
+
 async def test_enroll_disabled_returns_403(tmp_path):
     from compute_mcp.config import load_config
     from compute_mcp.gateway import Gateway
@@ -1404,6 +1532,86 @@ async def test_enroll_disabled_returns_403(tmp_path):
         """
     )
     gw = Gateway(load_config(cfg))
+    client = await make_client(gw)
+    try:
+        resp = await client.post("/v1/enroll", json={"client_id": "x", "targets": []})
+        assert resp.status == 403
+    finally:
+        await client.close()
+
+
+def _colliding_gateway():
+    """Two clients share a token: a limited one and an admin one."""
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    cfg = GatewayConfig(
+        server=ServerConfig(),
+        ssh=SSHConfig(),
+        sessions=SessionConfig(),
+        targets={"hal": target},
+        clients={
+            "limited": ClientConfig(
+                client_id="limited",
+                token_sha256=hash_token("shared-token"),
+                targets=("hal",),
+            ),
+            "extra": ClientConfig(
+                client_id="extra",
+                token_sha256=hash_token("shared-token"),
+                allow_all=True,
+            ),
+        },
+    )
+    return Gateway(cfg)
+
+
+async def test_second_client_with_duplicate_token_cannot_overreach():
+    gw = _colliding_gateway()
+    client = await make_client(gw)
+    try:
+        # The colliding token must not authenticate at all: no union/upgrade.
+        resp = await client.get("/v1/targets", headers=auth("shared-token"))
+        assert resp.status == 401
+    finally:
+        await client.close()
+
+
+async def test_admin_acl_not_widened_by_token_collision():
+    gw = _colliding_gateway()
+    client = await make_client(gw)
+    try:
+        # A request that the admin ACL would allow still fails closed.
+        resp = await client.get("/v1/clients", headers=auth("shared-token"))
+        assert resp.status == 401
+    finally:
+        await client.close()
+
+
+async def test_enroll_disabled_by_default_returns_403():
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    cfg = GatewayConfig(
+        server=ServerConfig(),
+        ssh=SSHConfig(),
+        sessions=SessionConfig(),
+        targets={"hal": target},
+        clients={
+            "admin": ClientConfig(
+                client_id="admin",
+                token_sha256=hash_token("admin-token"),
+                allow_all=True,
+            ),
+        },
+    )
+    gw = Gateway(cfg)
     client = await make_client(gw)
     try:
         resp = await client.post("/v1/enroll", json={"client_id": "x", "targets": []})
@@ -2027,6 +2235,79 @@ async def test_open_container_conn_maps_to_interactive_when_awaiting(monkeypatch
         await gw._open_container_conn("hal")
 
 
+async def test_http_exec_surfaces_real_dial_error_not_2fa(monkeypatch):
+    """F1 regression: a connected interactive target whose container hop fails
+    must return the real dial error (502), never the misleading 2FA 503."""
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, _ = _interactive_gateway()
+    # Connected, factor already satisfied -> awaiting_factor stays False.  The
+    # container dial itself then fails for an unrelated reason.
+    gw.runtimes["hal"].state = "connected"
+    assert gw.runtimes["hal"].awaiting_factor is False
+
+    async def fake_ensure(name):
+        return gw.runtimes[name]
+
+    async def boom(t, host, port, prompter=None):
+        raise SSHError("container hop refused: connection reset by peer")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 9))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/exec",
+            headers=auth("alpaka-token"),
+            json={"target": "hal", "command": "hostname"},
+        )
+        assert resp.status == 502
+        text = await resp.text()
+        assert "connection reset by peer" in text
+        assert "requires interactive authentication" not in text
+    finally:
+        await client.close()
+
+
+async def test_http_exec_still_returns_2fa_when_awaiting(monkeypatch):
+    """The complementary case: while a factor is genuinely outstanding the
+    actionable 2FA 503 is still returned."""
+    from compute_mcp.ssh_backend import SSHError
+
+    gw, _ = _interactive_gateway()
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].awaiting_factor = True
+
+    async def fake_ensure(name):
+        return gw.runtimes[name]
+
+    async def boom(t, host, port, prompter=None):
+        raise SSHError("container hop refused")
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda rt: ("127.0.0.1", 9))
+    monkeypatch.setattr(gw.backend, "connection", boom)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/exec",
+            headers=auth("alpaka-token"),
+            json={"target": "hal", "command": "hostname"},
+        )
+        assert resp.status == 503
+        text = await resp.text()
+        assert "requires interactive authentication" in text
+        assert "--2fa" in text
+        # The underlying dial error is included so the operator sees why the
+        # container hop failed even in the awaiting-factor case.
+        assert "container hop refused" in text
+    finally:
+        await client.close()
+
+
 def test_public_status_exposes_awaiting_factor():
     gw, _ = _interactive_gateway()
     assert gw.public_status("hal")["awaiting_factor"] is False
@@ -2200,13 +2481,14 @@ def _close_gateway(close_command=("scancel", "--name", "terok-dev")):
 def _record_close(gw, monkeypatch, calls=None, *, boom=False):
     calls = calls if calls is not None else []
 
-    async def fake_run_close_command(target, route, connection=None):
+    async def fake_run_close_command(target, route, connection=None, **kwargs):
         calls.append(
             {
                 "target": target.name,
                 "route": route,
                 "connection": connection,
                 "tunnel_alive": gw.runtimes[target.name].tunnel is not None,
+                "provision_env": kwargs.get("provision_env"),
             }
         )
         if boom:
@@ -2240,13 +2522,14 @@ async def test_stop_target_runs_close_command_before_teardown(monkeypatch):
     assert calls[0]["connection"] is conn
     # It ran while the route connection was still alive, before teardown.
     assert calls[0]["tunnel_alive"] is True
+    # A non-bundle close_command carries no derived provision env.
+    assert calls[0]["provision_env"] is None
     assert gw.runtimes["hal"].tunnel is None
     assert live.stopped is True
 
 
 async def test_refresh_target_runs_close_command(monkeypatch):
     gw, target = _close_gateway()
-    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
     monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
     rec = {"calls": []}
     _install_fake_connect(monkeypatch, gw, rec)
@@ -2280,6 +2563,45 @@ async def test_refresh_interactive_no_factor_does_not_run_close(monkeypatch):
     assert calls == []
     assert result["awaiting_factor"] is True
     assert gw.runtimes["hal"].tunnel is not None
+
+
+async def test_stop_target_runs_bundle_stop_when_close_command_unset(monkeypatch):
+    """A bundle target with no close_command still releases on stop.
+
+    Regression: `_run_close_command` used to return early when close_command was
+    empty, so a deployed-bundle allocation leaked on stop/refresh.
+    """
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    gw = make_gateway()
+    target = _tunnel_target(
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    conn = object()
+    _connect_fake_tunnel(gw, target, conn)
+    calls = _record_close(gw, monkeypatch)
+
+    await gw.stop_target("hal")
+
+    assert len(calls) == 1
+    assert calls[0]["route"] == "hal"
+    assert calls[0]["tunnel_alive"] is True
+    assert gw.runtimes["hal"].tunnel is None
+    # The bundle close must carry the COMPUTEMCP_* contract, not an empty env:
+    # without it the helper exits "must be apptainer or docker".
+    env = calls[0]["provision_env"]
+    assert env is not None
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == "apptainer"
+    assert env["COMPUTEMCP_STORAGE_ROOT"] == "/scratch/agent/computemcp"
+    assert env["COMPUTEMCP_SYSTEM"] == "hal"
 
 
 async def test_gateway_stop_runs_close_command_for_connected_target(monkeypatch):
@@ -2379,3 +2701,999 @@ async def test_factor_not_leaked_on_route_dial_failure(monkeypatch, caplog):
     assert gw.runtimes["hal"].last_error is not None
     assert "TOP-SECRET" not in gw.runtimes["hal"].last_error
     assert "TOP-SECRET" not in json.dumps(gw.public_status("hal"))
+
+
+# ============================================================================
+# Slurm allocation: provision env, plan signature, preview, refresh gating
+# ============================================================================
+
+def _allocation_target(name="hal", **overrides):
+    from compute_mcp.config import (
+        AllocationConfig,
+        ContainerConfig,
+        NodeConfig,
+        SlurmConfig,
+        SlurmStageConfig,
+    )
+
+    kwargs = {
+        "name": name,
+        "user": "agent",
+        "transport": TransportConfig(
+            kind="direct", remote_host="127.0.0.1", remote_port=9
+        ),
+        "host_key_sha256": "SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+        "node": NodeConfig(cpus=24, gpus=4, memory="378000M"),
+        "allocation": AllocationConfig(single_node="gpu-proportional"),
+        "slurm": SlurmConfig(
+            sbatch=SlurmStageConfig(
+                options={"ntasks-per-node": 1},
+                mapping={"nodes": "nodes", "gpus-per-node": "gres"},
+            ),
+            srun=SlurmStageConfig(),
+        ),
+        "container": ContainerConfig(
+            runtime="apptainer",
+            image="docker://ubuntu:24.04",
+            gpus=("nvidia",),
+            sandbox=True,
+        ),
+    }
+    kwargs.update(overrides)
+    return TargetConfig(**kwargs)
+
+
+def _allocation_gateway(**target_overrides):
+    """Gateway whose `hal` carries a full allocation/container description."""
+    gw = make_gateway()
+    target = _allocation_target(**target_overrides)
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    return gw, target
+
+
+def test_build_provision_env_includes_derived_public_key_for_bundle(tmp_path):
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.config import BundleConfig, ContainerConfig
+    from compute_mcp.config import TransportConfig as TR
+    from compute_mcp.gateway import build_provision_env
+
+    key = tmp_path / "id_ed25519"
+    key.write_text("PRIVATE\n")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA test@host\n")
+    target = _allocation_target(
+        client_key=str(key),
+        transport=TR(kind="tunnel", ssh_targets=("hal",), remote_port=2222),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_SSH_PUBLIC_KEY"] == "ssh-ed25519 AAAA test@host"
+
+
+def test_build_provision_env_omits_public_key_without_bundle(tmp_path):
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    key = tmp_path / "id_ed25519"
+    key.write_text("PRIVATE\n")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA test@host\n")
+    target = _allocation_target(client_key=str(key))
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert "COMPUTEMCP_SSH_PUBLIC_KEY" not in env
+
+
+def test_build_provision_env_joins_bundle_provision_env(tmp_path):
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.config import BundleConfig, ContainerConfig
+    from compute_mcp.config import TransportConfig as TR
+    from compute_mcp.gateway import build_provision_env
+
+    key = tmp_path / "id_ed25519"
+    key.write_text("PRIVATE\n")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA test@host\n")
+    target = _allocation_target(
+        client_key=str(key),
+        transport=TR(kind="tunnel", ssh_targets=("hal",), remote_port=2222),
+        container=ContainerConfig(
+            runtime="apptainer", storage_root="/scratch/agent/computemcp"
+        ),
+        bundle=BundleConfig(
+            source="computemcp-slurm",
+            provision_env=("module load apptainer", "source /etc/profile.d/spack.sh"),
+        ),
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_PROVISION_ENV"] == (
+        "module load apptainer\nsource /etc/profile.d/spack.sh"
+    )
+
+
+def test_build_provision_env_provision_env_absent_without_bundle():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target()
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert "COMPUTEMCP_PROVISION_ENV" not in env
+
+
+def test_env_configured_includes_bundle_only_target():
+    from compute_mcp.config import BundleConfig, ContainerConfig
+    from compute_mcp.config import TargetConfig as TC
+    from compute_mcp.config import TransportConfig as TR
+
+    target = TC(
+        name="b",
+        user="agent",
+        transport=TR(kind="tunnel", ssh_targets=("b",)),
+        client_key="/home/user/.ssh/key",
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+        container=ContainerConfig(runtime="apptainer", storage_root="/scratch/b"),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    assert Gateway._env_configured(target) is True
+
+
+def test_build_provision_env_exact_contract():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target()
+    plan = compute_plan(target, {"gpus-per-node": 2})
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_SYSTEM"] == "hal"
+    assert env["COMPUTEMCP_NODES"] == "1"
+    assert env["COMPUTEMCP_CPUS_PER_NODE"] == "12"
+    assert env["COMPUTEMCP_GPUS_PER_NODE"] == "2"
+    assert env["COMPUTEMCP_MEMORY_PER_NODE_MIB"] == "189000"
+    assert env["COMPUTEMCP_EXCLUSIVE"] == "false"
+    assert env["COMPUTEMCP_MODE"] == "gpu-proportional"
+    assert env["COMPUTEMCP_SBATCH_ARGS"] == "\n".join(sbatch)
+    assert env["COMPUTEMCP_SRUN_ARGS"] == ""
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == "apptainer"
+    assert env["COMPUTEMCP_IMAGE"] == "docker://ubuntu:24.04"
+    assert env["COMPUTEMCP_STORAGE_ROOT"] == ""
+    assert env["COMPUTEMCP_GPU_VENDORS"] == "nvidia"
+    assert env["COMPUTEMCP_HOST_HOME"] == ""
+    assert env["COMPUTEMCP_SANDBOX"] == "true"
+    # The build location defaults to the login/head node.
+    assert env["COMPUTEMCP_BUILD_LOCATION"] == "login"
+    # The container hop dials this account; the helper creates/AllowUsers it.
+    assert env["COMPUTEMCP_SSH_USER"] == "ubuntu"
+
+
+def test_build_provision_env_emits_container_user_override():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target(container_user="dev")
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_SSH_USER"] == "dev"
+
+
+def test_build_provision_env_emits_compute_build_location():
+    """An explicit compute-node build location reaches the provisioner."""
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.config import ContainerConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target(
+        container=ContainerConfig(
+            runtime="apptainer",
+            storage_root="/scratch/agent/computemcp",
+            build_location="compute",
+        )
+    )
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_BUILD_LOCATION"] == "compute"
+
+
+def test_build_provision_env_build_location_defaults_to_login():
+    from compute_mcp.allocation import compute_plan, render_args
+    from compute_mcp.gateway import build_provision_env
+
+    target = _allocation_target()
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    env = build_provision_env(target, plan, sbatch, srun)
+    assert env["COMPUTEMCP_BUILD_LOCATION"] == "login"
+
+
+def test_build_provision_env_omits_container_user_without_container():
+    """A plain target with no container/bundle does not emit the key."""
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="rwidera",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    env = build_provision_env(target, ResolvedPlan(nodes=1), (), ())
+    assert "COMPUTEMCP_SSH_USER" not in env
+
+
+def test_target_provision_env_emits_container_user():
+    """The fallback helper emits the same key/value as build_provision_env."""
+    gw = make_gateway()
+
+    def _boom(target, overrides):
+        raise ValueError("no allocation")
+
+    gw._resolve_allocation = _boom
+    assert (
+        gw._target_provision_env(_allocation_target(container_user="dev"))[
+            "COMPUTEMCP_SSH_USER"
+        ]
+        == "dev"
+    )
+    assert (
+        gw._target_provision_env(_allocation_target())["COMPUTEMCP_SSH_USER"]
+        == "ubuntu"
+    )
+
+
+def test_build_provision_env_empty_args_and_missing_plan_values():
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    plan = ResolvedPlan(nodes=1)
+    env = build_provision_env(target, plan, (), ())
+    assert env["COMPUTEMCP_SYSTEM"] == "bare"
+    assert env["COMPUTEMCP_NODES"] == "1"
+    assert env["COMPUTEMCP_CPUS_PER_NODE"] == ""
+    assert env["COMPUTEMCP_GPUS_PER_NODE"] == ""
+    assert env["COMPUTEMCP_MEMORY_PER_NODE_MIB"] == ""
+    assert env["COMPUTEMCP_EXCLUSIVE"] == "false"
+    assert env["COMPUTEMCP_SBATCH_ARGS"] == ""
+    assert env["COMPUTEMCP_SRUN_ARGS"] == ""
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == ""
+    assert env["COMPUTEMCP_STORAGE_ROOT"] == ""
+    assert env["COMPUTEMCP_IMAGE"] == ""
+    assert env["COMPUTEMCP_GPU_VENDORS"] == ""
+    assert env["COMPUTEMCP_HOST_HOME"] == ""
+    assert env["COMPUTEMCP_SANDBOX"] == "false"
+
+
+def test_build_provision_env_rejects_null_and_carriage_return_in_values():
+    """CR must be refused alongside NUL in every provision-env value (the
+    NUL-only check left a CR-in-value shell-line-smuggling hole)."""
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import ConfigError, TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    plan = ResolvedPlan(nodes=1)
+    for bad_sbatch, bad_srun in (
+        ("x\0y", ()),
+        ("x\ry", ()),
+    ):
+        with pytest.raises(ConfigError, match="COMPUTEMCP_SBATCH_ARGS"):
+            build_provision_env(target, plan, bad_sbatch, bad_srun)
+    # A CR smuggled into the srun deck is refused just as thoroughly.
+    with pytest.raises(ConfigError, match="COMPUTEMCP_SRUN_ARGS"):
+        build_provision_env(target, plan, (), ("x\ry",))
+
+
+def test_build_provision_env_allows_newlines_in_arg_decks():
+    """Newlines are the intentional delimiter of the two ARGS decks and must
+    NOT be refused; only NUL and CR are."""
+    from compute_mcp.allocation import ResolvedPlan
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.gateway import build_provision_env
+
+    target = TargetConfig(
+        name="bare",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=9),
+        host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    plan = ResolvedPlan(nodes=1)
+    env = build_provision_env(target, plan, ("--nodes=2", "--gres=gpu:1"), ("--overlap",))
+    assert env["COMPUTEMCP_SBATCH_ARGS"] == "--nodes=2\n--gres=gpu:1"
+    assert env["COMPUTEMCP_SRUN_ARGS"] == "--overlap"
+
+
+async def test_connect_with_invalid_override_leaves_state_failed_not_connecting():
+    """A connect with a bad --set override on an allocation target must not
+    leave the runtime wedged in state=='connecting'; last_error records what
+    failed and the exception propagates (mapped to 400 at the HTTP layer)."""
+    gw, target = _allocation_gateway()
+    rt = gw.runtimes["hal"]
+    assert rt.state == "disconnected"
+    with pytest.raises(ConfigError, match="unknown --set key"):
+        await gw.connect_target("hal", overrides={"bogus": 1})
+    # The regression: state must NOT be "connecting" after a failed connect.
+    assert rt.state != "connecting"
+    assert rt.state in ("failed", "disconnected")
+    assert "unknown --set key" in (rt.last_error or "")
+
+
+async def test_connect_with_invalid_override_propagates_on_http_endpoint(monkeypatch):
+    """The HTTP edge maps the same ConfigError to a 400 and leaves the
+    runtime in a terminal error state, not "connecting"."""
+    gw, target = _allocation_gateway()
+    rt = gw.runtimes["hal"]
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/targets/hal/connect", headers=auth("alpaka-token"),
+            json={"set": {"bogus": 1}},
+        )
+        assert resp.status == 400
+    finally:
+        await client.close()
+    assert rt.state != "connecting"
+    assert rt.state in ("failed", "disconnected")
+    assert rt.last_error and "unknown --set key" in rt.last_error
+
+
+def test_plan_signature_stability_and_none():
+    from compute_mcp.gateway import plan_signature
+
+    summary = {
+        "plan": {
+            "nodes": 2,
+            "cpus_per_node": 16,
+            "gpus_per_node": 1,
+            "memory_per_node_mib": 94500,
+            "exclusive": False,
+            "mode": "full",
+        }
+    }
+    assert plan_signature(summary) == (2, 16, 1, 94500, False, "full")
+    assert plan_signature(summary) == plan_signature(dict(summary))
+    assert plan_signature(None) is None
+    assert plan_signature({"plan": {}}) == (None, None, None, None, None, None)
+
+
+def test_preview_target_without_override_on_disconnected_target():
+    gw, target = _allocation_gateway()
+    assert gw.runtimes["hal"].state == "disconnected"
+    result = gw.preview_target("hal")
+    assert result["target"] == "hal"
+    assert result["connected"] is False
+    assert "needs_refresh" not in result
+    planned = result["planned"]["plan"]
+    assert planned["gpus_per_node"] == 1
+    assert planned["cpus_per_node"] == 6
+    assert planned["memory_per_node_mib"] == 94500
+    assert result["sbatch_args"]
+    assert result["srun_args"] == []
+    assert result["provision_env"]["COMPUTEMCP_NODES"] == "1"
+
+
+def test_preview_connected_target_with_differing_override_needs_refresh():
+    """A preview that differs from the active allocation requires a refresh."""
+    gw, target = _allocation_gateway()
+
+    # Manually wire a connected runtime via the real resolution path:
+    rt = gw.runtimes["hal"]
+    from compute_mcp.allocation import plan_summary
+
+    plan, _ = gw._resolve_allocation(target, None)
+    rt.state = "connected"
+    rt.resolved_plan = plan_summary(target, plan)
+    rt.resolved_overrides = dict(plan.overrides)
+
+    # Same effective settings: no refresh flag.
+    result = gw.preview_target("hal")
+    assert result["connected"] is True
+    assert "needs_refresh" not in result
+
+    # Differing settings: flagged.
+    result = gw.preview_target("hal", overrides={"gpus-per-node": 2})
+    assert result["needs_refresh"] is True
+    assert "target-refresh" in result["warning"]
+    assert result["planned"]["plan"]["gpus_per_node"] == 2
+
+    # The preview must never disturb the retained allocation.
+    assert rt.state == "connected"
+    assert rt.resolved_plan["plan"]["gpus_per_node"] == 1
+
+def test_validate_config_allocations_rejects_conflicting_config():
+    """A gateway must not start with a mapping/manual conflict in any target."""
+    from compute_mcp.config import ConfigError
+    from compute_mcp.config import (
+        GatewayConfig as GwCfg,
+        ServerConfig,
+        SessionConfig,
+        SSHConfig as SshCfg,
+        SlurmConfig,
+        SlurmStageConfig,
+    )
+    from compute_mcp.gateway import validate_config_allocations
+
+    base = GwCfg(
+        server=ServerConfig(),
+        ssh=SshCfg(),
+        sessions=SessionConfig(),
+        targets={
+            "hal": TargetConfig(
+                name="hal",
+                user="agent",
+                transport=TransportConfig(
+                    kind="direct", remote_host="127.0.0.1", remote_port=9
+                ),
+                host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+            )
+        },
+        clients={
+            "admin": ClientConfig(
+                client_id="admin", token_sha256=hash_token("admin-token"),
+                allow_all=True,
+            )
+        },
+    )
+    validate_config_allocations(base)
+
+    bad_target = dataclasses.replace(
+        base.targets["hal"],
+        slurm=SlurmConfig(
+            sbatch=SlurmStageConfig(
+                options={"mem": "64G"}, mapping={"memory-per-node": "mem"}
+            ),
+            srun=SlurmStageConfig(),
+        ),
+    )
+    bad = dataclasses.replace(base, targets={"hal": bad_target})
+    with pytest.raises(ConfigError, match="conflicts"):
+        validate_config_allocations(bad)
+    # Gateway construction fails closed on the same config.
+    with pytest.raises(ConfigError, match="conflicts"):
+        Gateway(bad)
+
+
+async def test_http_preview_endpoint_returns_plan_and_needs_refresh(monkeypatch):
+    gw, target = _allocation_gateway()
+    rt = gw.runtimes["hal"]
+    from compute_mcp.allocation import plan_summary
+
+    plan, _ = gw._resolve_allocation(target, None)
+    rt.state = "connected"
+    rt.resolved_plan = plan_summary(target, plan)
+    rt.resolved_overrides = dict(plan.overrides)
+
+    client = await make_client(gw)
+    try:
+        # Plain preview of the active settings: no refresh required.
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": {"gpus-per-node": 1}
+            }
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        assert body["connected"] is True
+        assert "needs_refresh" not in body
+        assert body["planned"]["plan"]["gpus_per_node"] == 1
+
+        # A different effective request flags the refresh.
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": {"gpus-per-node": 2}
+            }
+        )
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+        assert body["needs_refresh"] is True
+        assert "COMPUTEMCP_SBATCH_ARGS" in body["provision_env"]
+
+        # Unknown override keys are a 400 (allocation layer validation).
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": {"bogus": 1}
+            }
+        )
+        assert resp.status == 400
+
+        # A non-object "set" is a 400.
+        resp = await client.post(
+            "/v1/targets/hal/preview", headers=auth("alpaka-token"), json={
+                "set": [1]
+            }
+        )
+        assert resp.status == 400
+    finally:
+        await client.close()
+
+
+async def test_connect_with_overrides_on_connected_target_warns_and_keeps_allocation(monkeypatch):
+    """connect with differing overrides on a live target must not swap it."""
+    gw, target = _allocation_gateway()
+    rec = {"dials": 0, "teardowns": 0}
+
+    class _Tunnel:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def is_alive(self):
+            return True
+
+        async def stop(self):
+            rec["teardowns"] += 1
+
+    async def fake_connect(t, on_route=None, transport=None, factor=None, **kwargs):
+        rec["dials"] += 1
+        raise AssertionError("a connect on a live target must not dial")
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    rt = gw.runtimes["hal"]
+    rt.tunnel = _Tunnel(connection=object())
+    rt.active_route = "hal"
+    rt.local_port = 31990
+    from compute_mcp.allocation import plan_summary
+
+    plan, _ = gw._resolve_allocation(target, None)
+    rt.state = "connected"
+    rt.resolved_plan = plan_summary(target, plan)
+    rt.resolved_overrides = dict(plan.overrides)
+
+    # Same effective settings: plain no-op (defaults_used is not stable per
+    # request, but the effective request tuple is, so no refresh is flagged).
+    result = await gw.connect_target("hal", overrides={"gpus-per-node": 1})
+    assert result["state"] == "connected"
+    assert result["needs_refresh"] is False
+
+    # Different settings: warning, no dial, no teardown.
+    result = await gw.connect_target("hal", overrides={"gpus-per-node": 2})
+    assert result["state"] == "connected"
+    assert result["needs_refresh"] is True
+    assert "target-refresh" in result.get("warning", "")
+    assert rec == {"dials": 0, "teardowns": 0}
+
+
+
+# ============================================================================
+# --bootstrap dispatch (setup wizard, no server start)
+# ============================================================================
+
+def test_parser_accepts_bootstrap_flags():
+    from compute_mcp.gateway import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["--bootstrap", "--config-dir", "/tmp/cfg", "--force"])
+    assert args.bootstrap is True
+    assert args.config_dir == "/tmp/cfg"
+    assert args.force is True
+    args = parser.parse_args(["--bootstrap", "--non-interactive"])
+    assert args.non_interactive is True
+
+
+def test_bootstrap_dispatches_to_setup(monkeypatch, tmp_path):
+    import compute_mcp.gateway as gateway_mod
+    import compute_mcp.setup as setup_mod
+
+    seen = {}
+
+    def fake_run_bootstrap(config_path, *, force=False, wizard=None):
+        seen["path"] = str(config_path)
+        seen["force"] = force
+        seen["terminal"] = wizard.terminal if wizard is not None else None
+        return 0
+
+    def explode(*a, **k):  # the server must never start
+        raise AssertionError("gateway server must not start during --bootstrap")
+
+    monkeypatch.setattr(setup_mod, "run_bootstrap", fake_run_bootstrap)
+    monkeypatch.setattr(gateway_mod, "_amain", explode)
+
+    rc = gateway_mod.main(["--bootstrap", "--config-dir", str(tmp_path)])
+    assert rc == 0
+    assert seen["path"] == str(tmp_path / "config.toml")
+    assert seen["force"] is False
+    # Without --non-interactive the wizard's terminal state follows isatty().
+    assert seen["terminal"] in (True, False)
+
+
+def test_bootstrap_non_interactive_disables_terminal(monkeypatch, tmp_path):
+    import compute_mcp.gateway as gateway_mod
+    import compute_mcp.setup as setup_mod
+
+    seen = {}
+
+    def fake_run_bootstrap(config_path, *, force=False, wizard=None):
+        seen["terminal"] = wizard.terminal
+        return 0
+
+    monkeypatch.setattr(setup_mod, "run_bootstrap", fake_run_bootstrap)
+    rc = gateway_mod.main(
+        ["--bootstrap", "--config-dir", str(tmp_path), "--non-interactive"]
+    )
+    assert rc == 0
+    assert seen["terminal"] is False
+
+
+def test_bootstrap_abort_returns_2(monkeypatch, tmp_path):
+    import compute_mcp.gateway as gateway_mod
+    import compute_mcp.setup as setup_mod
+
+    def fake_run_bootstrap(config_path, *, force=False, wizard=None):
+        raise setup_mod.WizardAbort("stop")
+
+    monkeypatch.setattr(setup_mod, "run_bootstrap", fake_run_bootstrap)
+    rc = gateway_mod.main(["--bootstrap", "--config-dir", str(tmp_path)])
+    assert rc == 2
+
+
+# ============================================================================
+# Bundle target provisioning idempotency ("setup if needed / start if not
+# running / connect")
+# ============================================================================
+def _bundle_target(**overrides):
+    """A bundle-only target with a container block: no provision_command."""
+    from compute_mcp.config import BundleConfig, ContainerConfig
+
+    base = _tunnel_target(
+        container=ContainerConfig(runtime="docker", storage_root="/scratch/hal"),
+        bundle=BundleConfig(source="computemcp-slurm"),
+    )
+    if overrides:
+        base = dataclasses.replace(base, **overrides)
+    return base
+
+
+def test_bundle_target_without_provision_command_uses_helper_argv():
+    """A bundle target needs no provision_command: the argv is the deployed helper."""
+    from compute_mcp.bundle import provision_argv, public_key_for
+
+    target = _bundle_target()
+    assert target.provision_command == ()
+    argv = provision_argv(target, "provision")
+    assert argv and argv[0] == "bash"
+    assert argv[-1] == "provision"
+    assert "computemcp-provision.sh" in argv[1]
+    # It is the helper, not an empty argv, that makes the tunnel gate run.
+    assert argv != (
+        target.provision_command
+    )
+
+
+def test_bundle_only_target_resolves_allocation_without_node_block():
+    """Container+bundle with no node/allocation/slurm still resolves an env."""
+    from compute_mcp.gateway import Gateway, build_provision_env
+
+    gw = make_gateway()
+    target = _bundle_target()
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    assert Gateway._env_configured(target) is True
+    plan, env = gw._resolve_allocation(target, None)
+    assert plan is not None
+    # An empty provision-env is a no-op, but the key is present for a bundle.
+    assert env["COMPUTEMCP_PROVISION_ENV"] == ""
+    assert env["COMPUTEMCP_CONTAINER_RUNTIME"] == "docker"
+
+
+async def test_target_connect_provisions_then_reuses(monkeypatch):
+    """connect_target provisions once; a second call reuses the live tunnel.
+
+    This is the build-if-needed / start-if-not-running / connect contract: the
+    first connect goes through the provision path (which runs the helper), a
+    second connect while still connected must not re-run provisioning.
+    """
+    gw = make_gateway()
+    target = _bundle_target()
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    calls = {"connect": 0}
+
+    async def fake_connect(target, on_route=None, factor=None, **kwargs):
+        calls["connect"] += 1
+        return _FakeTunnel(
+            target, route="hal", local_port=32000,
+            provisioned_endpoint=("127.0.0.1", 2222),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+
+    first = await gw.connect_target("hal")
+    assert first["state"] == "connected"
+    assert calls["connect"] == 1
+
+    second = await gw.connect_target("hal")
+    assert second["state"] == "connected"
+    # Reuse: an already-connected target must not be provisioned again.
+    assert calls["connect"] == 1
+
+    assert gw.public_status("hal")["provisioned_endpoint"] == "127.0.0.1:2222"
+
+
+# ============================================================================
+# Endpoint lifecycle hardening on connect/refresh.  A container restart can
+# change the published SSH port; a refresh re-provisions to the new endpoint.
+# The runtime must track the latest successful provision and a reconnect must
+# dial the NEW port, not the cached connection's stale one.
+# ============================================================================
+
+
+def _endpoint_gateway(kind="tunnel", **target_overrides):
+    """A provision-capable target (non-Slurm docker shape) wired into the gw."""
+    gw = make_gateway()
+    if kind == "tunnel":
+        base = _tunnel_target(provision_command=("printf", "127.0.0.1:3010\n"))
+    elif kind == "direct":
+        base = TargetConfig(
+            name="hal",
+            user="agent",
+            transport=TransportConfig(
+                kind="direct", remote_host="127.0.0.1", remote_port=3010
+            ),
+            provision_command=("printf", "127.0.0.1:3010\n"),
+            host_key_sha256="SHA256:abcdefghijklmnopqrstuvwxyz0123456789",
+        )
+    else:
+        raise ValueError(kind)
+    final = dataclasses.replace(base, **target_overrides) if target_overrides else base
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": final}
+    )
+    return gw, final
+
+
+def _wire_refresh_noops(gw, monkeypatch):
+    """Null out close_command / sessions during a refresh so it stays pure."""
+    monkeypatch.setattr(gw.tunnels, "run_close_command", _async_noop_kw)
+    monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
+    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
+
+
+async def test_stop_locked_clears_provisioned_endpoint(monkeypatch):
+    """Tearing down a connected tunnel drops the retained endpoint.
+
+    A later reconnect that skips re-provision must not dial the previous
+    (possibly re-published) container port.
+    """
+    gw, _ = _endpoint_gateway()
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].active_route = "hal"
+    gw.runtimes["hal"].local_port = 31000
+    gw.runtimes["hal"].provisioned_endpoint = "127.0.0.1:3010"
+    gw.runtimes["hal"].tunnel = _FakeTunnel(
+        gw.config.targets["hal"], route="hal", local_port=31000,
+        provisioned_endpoint=("127.0.0.1", 3010),
+    )
+
+    await gw._stop_locked("hal")
+
+    assert gw.runtimes["hal"].state == "disconnected"
+    assert gw.runtimes["hal"].provisioned_endpoint is None
+    assert gw.runtimes["hal"].local_port is None
+
+
+async def test_connect_locked_reprovisions_and_updates_endpoint(monkeypatch):
+    """A re-connect / re-provision overwrites a stale runtime.endpoint with
+    the fresh tunnel endpoints, even when the old one was non-None."""
+    gw, target = _endpoint_gateway()
+    # A previous provision left this endpoint behind.
+    gw.runtimes["hal"].provisioned_endpoint = "127.0.0.1:3010"
+    runtime = gw.runtimes["hal"]
+
+    async def fake_connect(target2, on_route=None, factor=None, **kwargs):
+        return _FakeTunnel(
+            target2, route="hal", local_port=31000,
+            provisioned_endpoint=("10.0.0.9", 9001),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    await gw._connect_locked(target, runtime)
+
+    # The freshly resolved endpoint is authoritative.
+    assert runtime.provisioned_endpoint == "10.0.0.9:9001"
+    assert runtime.state == "connected"
+
+
+async def test_refresh_reprovisions_and_dials_new_tunnel_forward(monkeypatch):
+    """Tunnel target: an endpoint-changing refresh re-dials the NEW loopback
+    forward port and does not hand out the connection cached on the previous
+    forward.  The provisioned (published host) endpoint is tracked on the
+    runtime.
+    """
+    gw, target = _endpoint_gateway(kind="tunnel")
+    # Publish ports: first connect -> 3010, refresh -> 9501.
+    provisioned = iterator = iter([
+        ("127.0.0.1", 3010),
+        ("127.0.0.1", 9501),
+    ])
+
+    async def fake_connect(t2, on_route=None, factor=None, **kwargs):
+        ep = next(iterator)
+        # Each tunnel gets a FRESH loopback forward port (31000 then 31100).
+        return _FakeTunnel(
+            t2, route="hal", local_port=(31000 if ep == ("127.0.0.1", 3010) else 31100),
+            provisioned_endpoint=ep, connection=object(),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    _wire_refresh_noops(gw, monkeypatch)
+
+    # First connect: published port 3010, loopback forward 31000.
+    result1 = await gw.connect_target("hal")
+    assert result1["provisioned_endpoint"] == "127.0.0.1:3010"
+    assert gw.runtimes["hal"].local_port == 31000
+
+    # An exec while connected dials the current forward (127.0.0.1:31000).
+    dialed = []
+
+    async def fake_conn(t, host, port, prompter=None):
+        dialed.append((host, port))
+        return f"CONN-{host}-{port}"
+
+    monkeypatch.setattr(gw.backend, "connection", fake_conn)
+    await gw._open_container_conn("hal")
+    assert dialed == [("127.0.0.1", 31000)]
+    dialed.clear()
+
+    # Refresh: re-provision publishes 9501 via the NEW forward 31100.
+    result2 = await gw.refresh_target("hal")
+    assert result2["state"] == "connected"
+    # The runtime endpoint is replaced by the freshest provision.
+    assert result2["provisioned_endpoint"] == "127.0.0.1:9501"
+    assert gw.runtimes["hal"].local_port == 31100
+    # The next exec dials the NEW forward, not the old loopback.
+    await gw._open_container_conn("hal")
+    assert dialed == [("127.0.0.1", 31100)]
+
+
+async def test_refresh_drops_cached_container_conn_real_backend(monkeypatch):
+    """502 guard, tunnel target, production cache.
+
+    After an exec caches a container connection on the current loopback
+    forward, a refresh re-provisions to a NEW published port via a NEW forward.
+    The next exec must NOT be handed the cached connection dialled to the old
+    forward: the production ``SSHBackend`` cache is keyed to the (host, port)
+    it dialed, so it dials the new forward and the old entry is dropped.
+    """
+    from compute_mcp.ssh_backend import SSHBackend
+
+    gw, target = _endpoint_gateway(kind="tunnel")
+    # Provision order: connect publishes 3010 (forward 31000); refresh
+    # re-publishes 3500 (forward 31100).  The container hops always arrive at
+    # the gateway via the loopback forward (127.0.0.1:local_port).
+    provisioned = iter([
+        (("127.0.0.1", 3010), 31000),
+        (("127.0.0.1", 3500), 31100),
+    ])
+
+    async def fake_connect(t2, on_route=None, factor=None, **kwargs):
+        (ep, forward) = next(provisioned)
+        return _FakeTunnel(
+            t2, route="hal", local_port=forward,
+            provisioned_endpoint=ep, connection=object(),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+    _wire_refresh_noops(gw, monkeypatch)
+
+    # Track each real dial through the production SSHBackend._dial.
+    dialed = []
+    minted = []
+
+    class _ConnStub:
+        def __init__(self, n):
+            self.n = n
+            self._closed = False
+
+        def is_closed(self):
+            return self._closed
+
+        def close(self):
+            self._closed = True
+
+        async def wait_closed(self):
+            return None
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _ConnStub(len(minted))
+        minted.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+    assert isinstance(gw.backend, SSHBackend)  # exercise the real cache
+
+    result1 = await gw.connect_target("hal")
+    assert result1["provisioned_endpoint"] == "127.0.0.1:3010"
+
+    # First exec opens+gates the cached container connection on forward 31000.
+    _, first_conn = await gw._open_container_conn("hal")
+    assert dialed == [("127.0.0.1", 31000)]
+    assert first_conn is minted[0]
+
+    # Refresh while the cached connection is still "live": re-provision moves
+    # the forward to 31100.  The old cache entry must be dropped so the next
+    # exec cannot reuse it.
+    result2 = await gw.refresh_target("hal")
+    assert result2["state"] == "connected"
+    assert result2["provisioned_endpoint"] == "127.0.0.1:3500"
+
+    # Second exec: a fresh dial to the NEW forward, and a NEW connection object
+    # (the cached 31000 one was invalidated, not returned).
+    _, second_conn = await gw._open_container_conn("hal")
+    assert dialed == [("127.0.0.1", 31000), ("127.0.0.1", 31100)]
+    assert second_conn is minted[1]
+    assert second_conn is not first_conn
+    # The STALE connection was closed by the invalidation.
+    assert first_conn.is_closed()
+
+
+async def test_connect_target_early_return_keeps_endpoint(monkeypatch):
+    """A plain connect while connected does NOT re-provision (idempotency);
+    an explicit refresh DOES re-provision and updates the endpoint."""
+    gw, target = _endpoint_gateway(kind="tunnel")
+    # Already connected with a previously resolved endpoint.
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].active_route = "hal"
+    gw.runtimes["hal"].local_port = 31000
+    gw.runtimes["hal"].provisioned_endpoint = "127.0.0.1:3010"
+    gw.runtimes["hal"].tunnel = _FakeTunnel(
+        target, route="hal", local_port=31000,
+        provisioned_endpoint=("127.0.0.1", 3010),
+    )
+
+    connect_calls = 0
+
+    async def fake_connect(t2, on_route=None, factor=None, **kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        # If a plain connect sneaked past the early return, we would re-provision.
+        return _FakeTunnel(
+            t2, route="hal", local_port=31000,
+            provisioned_endpoint=("127.0.0.1", 3010),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
+
+    # Plain connect: returns early, no re-provision, keeps the endpoint it
+    # already holds.
+    result = await gw.connect_target("hal")
+    assert result["state"] == "connected"
+    assert result["provisioned_endpoint"] == "127.0.0.1:3010"
+    assert connect_calls == 0, "plain connect while connected must not re-provision"
+
+    # Explicit refresh re-provisions and moves the endpoint.
+    _wire_refresh_noops(gw, monkeypatch)
+
+    async def fake_connect9501(t2, on_route=None, factor=None, **kwargs):
+        return _FakeTunnel(
+            t2, route="hal", local_port=31000,
+            provisioned_endpoint=("127.0.0.1", 9501),
+        )
+
+    monkeypatch.setattr(gw.tunnels, "connect", fake_connect9501)
+    result = await gw.refresh_target("hal")
+    assert result["state"] == "connected"
+    assert result["provisioned_endpoint"] == "127.0.0.1:9501"

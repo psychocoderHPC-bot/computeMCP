@@ -18,6 +18,12 @@ from pathlib import Path
 
 TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
+# The login account inside the container.  The helper bundle enforces the same
+# shape (``computemcp-container.sh``): a lowercase shell identifier that is not
+# ``root``.  ``root`` is a valid SSH login on many systems but the bundle refuses
+# to create a root login, so accepting it here would only defer the failure.
+CONTAINER_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
+
 VALID_STATES = ("disconnected", "connecting", "connected", "failed")
 
 # Default location used when the operator does not point at a file explicitly.
@@ -25,6 +31,10 @@ VALID_STATES = ("disconnected", "connecting", "connected", "failed")
 DEFAULT_CONFIG_DIR = "computeMCP-gateway"
 DEFAULT_CONFIG_NAME = "config.toml"
 DEFAULT_TOKEN_NAME = "tokens.toml"
+# Host-local plaintext operator token written by --bootstrap (mode 0600).  It is
+# separate from tokens.toml, which holds hashes only, so the operator CLI can
+# authenticate without the operator exporting anything.
+OPERATOR_TOKEN_NAME = "operator.token"
 
 
 class ConfigError(ValueError):
@@ -45,10 +55,34 @@ def default_token_path() -> Path:
     return _xdg_config_home() / DEFAULT_CONFIG_DIR / DEFAULT_TOKEN_NAME
 
 
+def default_operator_token_path() -> Path:
+    """Return the default operator token path next to the default config."""
+    return _xdg_config_home() / DEFAULT_CONFIG_DIR / OPERATOR_TOKEN_NAME
+
+
 def validate_target_name(name: str) -> str:
     if not isinstance(name, str) or not TARGET_NAME_RE.match(name):
         raise ConfigError(f"invalid target name {name!r}")
     return name
+
+
+def container_login_user(target: "TargetConfig") -> str:
+    """The account the gateway logs into INSIDE the container.
+
+    ``container_user`` is the source of truth.  When it is unset the explicit
+    ``COMPUTEMCP_SSH_USER`` environment override is honored (so an operator who
+    already exports it keeps working), otherwise the helper default ``ubuntu``
+    is used.  Both the container dial (``ssh_backend``) and the provision
+    environment (``gateway``) resolve through this one function so they cannot
+    drift: if the gateway dials one account but tells the helper another, the
+    container sshd's ``AllowUsers`` rejects the login.
+    """
+    if target.container_user:
+        return target.container_user
+    override = os.environ.get("COMPUTEMCP_SSH_USER")
+    if override:
+        return override
+    return "ubuntu"
 
 
 @dataclass(frozen=True)
@@ -80,11 +114,509 @@ class TransportConfig:
             raise ConfigError("proxy_jump is only valid with tunnel transport")
 
 
+# Allocation policy modes.  The single-node policy accepts any of them; the
+# multi-node policy is intentionally restricted initially (see the design doc).
+ALLOCATION_MODES = ("gpu-proportional", "cpu-proportional", "full", "exclusive")
+MULTI_NODE_MODES = ("full", "exclusive")
+
+# Supported mapping vocabulary: calculated value -> output representations.
+# A missing mapping emits nothing; a present entry is validated against this
+# bounded table before the plan/emit stages (T2/T3) are ever reached.
+MAPPING_VOCABULARY: dict[str, frozenset[str]] = {
+    "nodes": frozenset({"nodes"}),
+    "gpus-per-node": frozenset({"gres", "gpus-per-node"}),
+    "cpus-per-node": frozenset({"cpus-per-task"}),
+    "memory-per-node": frozenset({"mem"}),
+    "exclusive": frozenset({"exclusive"}),
+}
+
+# Bundle identifiers shipped inside the ``compute_mcp.bundles`` package.  The
+# gateway deploys the exact revision it was built from; a target names one of
+# these instead of pointing provision_command at a hand-placed copy.
+# ``computemcp-container`` is the canonical generic provisioner (builds and
+# starts the container on the login node, with or without a Slurm scheduler);
+# ``computemcp-slurm`` is the legacy alias and resolves to the same bundle.
+KNOWN_BUNDLES = ("computemcp-container", "computemcp-slurm")
+
+
+@dataclass(frozen=True)
+class NodeConfig:
+    """Allocatable resources of a single compute node.
+
+    ``cpus`` are Slurm CPUs under the site/SMT policy (not necessarily physical
+    cores); ``memory`` is allocatable host memory in any Slurm memory unit
+    (e.g. "378000M"); ``gpus`` are the scheduler-visible GPU units.  All fields
+    are optional descriptions: an unset field simply carries no capacity
+    information and is not an error.
+    """
+
+    cpus: int | None = None
+    gpus: int | None = None
+    memory: str | None = None
+
+    def __post_init__(self) -> None:
+        for label, value in (("cpus", self.cpus), ("gpus", self.gpus)):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ConfigError(f"node.{label} must be a positive integer")
+        if self.memory is not None and (
+            not isinstance(self.memory, str) or not self.memory.strip()
+        ):
+            raise ConfigError("node.memory must be a non-empty string (e.g. '378000M')")
+
+
+@dataclass(frozen=True)
+class AllocationConfig:
+    """Defaults and allocation policies for Slurm allocations.
+
+    ``single_node`` selects the mode used when one node is allocated (one node
+    is the default).  ``multi_node`` is the mode used when several nodes are
+    allocated; initially only ``full`` and ``exclusive`` are admitted there.
+    ``max_nodes`` bounds the allocation and defaults to one node.
+    """
+
+    default_gpus: int | None = None
+    default_cpus: int | None = None
+    single_node: str | None = None
+    multi_node: str | None = None
+    max_nodes: int | None = None
+
+    def __post_init__(self) -> None:
+        prefix = "allocation."
+        for label, value in (("default_gpus", self.default_gpus), ("default_cpus", self.default_cpus)):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ConfigError(f"{prefix}{label} must be a positive integer")
+        if self.single_node is not None and self.single_node not in ALLOCATION_MODES:
+            raise ConfigError(
+                f"{prefix}single_node must be one of {', '.join(ALLOCATION_MODES)}"
+            )
+        if self.multi_node is not None and self.multi_node not in MULTI_NODE_MODES:
+            raise ConfigError(
+                f"{prefix}multi_node must be one of {', '.join(MULTI_NODE_MODES)}"
+            )
+        if self.max_nodes is not None and (
+            not isinstance(self.max_nodes, int)
+            or isinstance(self.max_nodes, bool)
+            or self.max_nodes <= 0
+        ):
+            raise ConfigError(f"{prefix}max_nodes must be a positive integer")
+
+
+@dataclass(frozen=True)
+class SlurmStageConfig:
+    """One Slurm stage: manual options plus an optional value mapping.
+
+    ``options`` are the free-form manual options, e.g.
+    ``ntasks-per-node = 1`` -- key spelling is preserved exactly and each value
+    is a scalar, bool, or array (arrays repeat the option).  ``mapping`` maps
+    calculated values to output representations, e.g.
+    ``gpus-per-node = "gres"``; only the ``MAPPING_VOCABULARY`` is accepted.
+
+    ``account`` is the scheduler account passed as ``sbatch -A``/``--account``.
+    It is a first-class field per stage so ``slurm.sbatch`` and ``slurm.srun``
+    stay independent (nothing is copied between stages).  ``None`` and an empty
+    string both mean "emit no ``--account``"; any other string is stored as-is.
+    """
+
+    options: dict[str, object] = field(default_factory=dict)
+    mapping: dict[str, str] = field(default_factory=dict)
+    account: str | None = None
+
+
+@dataclass(frozen=True)
+class SlurmConfig:
+    """Slurm options for the two stages: ``sbatch`` (submission) and ``srun``
+    (job step).  The stages are independent: nothing is copied between them.
+    Each stage independently carries its manual options and its mapping."""
+
+    sbatch: SlurmStageConfig
+    srun: SlurmStageConfig
+
+
+@dataclass(frozen=True)
+class ContainerConfig:
+    """Container runtime description for a target.
+
+    ``runtime`` is required whenever the block is present.  ``gpus`` names the
+    GPU vendors the container can expose and must be a subset of
+    ``nvidia``/``amd``/``intel`` (empty means none).  ``storage_root`` and
+    ``image`` are optional.  ``host_home`` and ``sandbox`` are optional
+    overrides for values the gateway would otherwise derive; they stay optional
+    and minimal on purpose.
+
+    ``build_location`` selects where the Apptainer sandbox is built:
+    ``"login"`` (the default) builds/configure it on the login/head node before
+    submitting the allocation; ``"compute"`` skips the login-node build and
+    builds it on the first allocated compute node.  The compute-node setting is
+    required on an architecture-mismatched partition (e.g. an ARM partition
+    whose login nodes are x86-64) and requires Slurm.  ``"compute-node"`` is an
+    accepted alias and is normalized to ``"compute"``.
+    """
+
+    runtime: str
+    storage_root: str | None = None
+    image: str | None = None
+    gpus: tuple[str, ...] = ()
+    host_home: str | None = None
+    sandbox: bool = False
+    build_location: str = "login"
+
+    def __post_init__(self) -> None:
+        if self.runtime not in ("apptainer", "docker"):
+            raise ConfigError(
+                f"container.runtime must be 'apptainer' or 'docker', "
+                f"got {self.runtime!r}"
+            )
+        for label, value in (
+            ("storage_root", self.storage_root),
+            ("image", self.image),
+            ("host_home", self.host_home),
+        ):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ConfigError(f"container.{label} must be a non-empty string")
+        if self.gpus:
+            vendors = tuple(dict.fromkeys(self.gpus))
+            if not all(isinstance(v, str) for v in vendors):
+                raise ConfigError("container.gpus must be a list of vendor names")
+            unknown = sorted(set(vendors) - {"nvidia", "amd", "intel"})
+            if unknown:
+                raise ConfigError(
+                    f"container.gpus contains unknown vendor(s): {', '.join(unknown)}"
+                )
+            invalid = sorted({v for v in set(vendors) if not v or not v.strip()})
+            if invalid:
+                raise ConfigError("container.gpus entries must be non-empty strings")
+            object.__setattr__(self, "gpus", vendors)
+        if not isinstance(self.build_location, str):
+            raise ConfigError(
+                "container.build-location must be 'login' or 'compute', "
+                f"got {self.build_location!r}"
+            )
+        normalized = self.build_location.strip().lower()
+        if normalized == "compute-node":
+            normalized = "compute"
+        if normalized not in ("login", "compute"):
+            raise ConfigError(
+                "container.build-location must be 'login' or 'compute', "
+                f"got {self.build_location!r}"
+            )
+        object.__setattr__(self, "build_location", normalized)
+
+
+@dataclass(frozen=True)
+class BundleConfig:
+    """Deployable helper bundle for a target.
+
+    ``source`` names a bundle shipped in the ``compute_mcp.bundles`` package.
+    ``deploy_dir`` is the remote directory on storage visible to login and
+    compute nodes; the gateway derives a default from the container
+    ``storage_root`` when it is unset.  ``auto_deploy`` controls whether the
+    gateway uploads the bundle when the remote hash marker differs; setting it
+    to false pins whatever copy is already deployed.  ``provision_env`` holds
+    shell lines that run on the remote before the container runtime is used;
+    an empty tuple is a no-op.
+    """
+
+    source: str
+    deploy_dir: str | None = None
+    auto_deploy: bool = True
+    provision_env: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.source not in KNOWN_BUNDLES:
+            raise ConfigError(
+                f"bundle.source must be one of {', '.join(KNOWN_BUNDLES)}, "
+                f"got {self.source!r}"
+            )
+        for line in self.provision_env:
+            if not isinstance(line, str) or not line.strip():
+                raise ConfigError(
+                    "bundle.provision-env entries must be non-empty strings"
+                )
+            if "\x00" in line or "\r" in line:
+                raise ConfigError(
+                    "bundle.provision-env entries must not contain a NUL byte "
+                    "or carriage return"
+                )
+        if self.deploy_dir is not None:
+            if not isinstance(self.deploy_dir, str) or not self.deploy_dir.strip():
+                raise ConfigError("bundle.deploy_dir must be a non-empty string")
+            # ``$HOME``/``~`` are expanded by the remote helper; anything else
+            # must be absolute so a typo cannot resolve relative to the CWD.
+            if not self.deploy_dir.startswith(("/", "$HOME", "~")):
+                raise ConfigError(
+                    "bundle.deploy_dir must be absolute or start with $HOME/~"
+                )
+        if not isinstance(self.auto_deploy, bool):
+            raise ConfigError("bundle.auto_deploy must be true or false")
+
+
+def _validate_slurm_mapping(mapping: dict, stage: str, options: dict, target: str) -> None:
+    """Validate a stage mapping against the bounded vocabulary.
+
+    ``cpus-per-node -> cpus-per-task`` additionally requires the stage's manual
+    options to declare exactly one task per node (``ntasks-per-node = 1`` or
+    ``ntasks = 1``); a mismatched task layout is an error, not a silent
+    translation.
+    """
+    where = f"targets.{target}.slurm.{stage}-map"
+    if not isinstance(mapping, dict):
+        raise ConfigError(f"[{where}] must be a table")
+    for key, value in mapping.items():
+        allowed = MAPPING_VOCABULARY.get(key)
+        if allowed is None:
+            raise ConfigError(
+                f"{where}: unknown mapping key {key!r}; valid keys: "
+                f"{', '.join(sorted(MAPPING_VOCABULARY))}"
+            )
+        if not isinstance(value, str) or value not in allowed:
+            raise ConfigError(
+                f"{where}: mapping for {key!r} must be one of "
+                f"{', '.join(sorted(allowed))}"
+            )
+        if key == "cpus-per-node":
+            effective = _effective_tasks_per_node(options)
+            if effective == 0 or effective > 1:
+                raise ConfigError(
+                    f"{where}: mapping cpus-per-node -> cpus-per-task is only "
+                    "valid with exactly one task per node; set ntasks-per-node = 1 "
+                    f"(or ntasks = 1) in [targets.{target}.slurm.{stage}] "
+                    f"(found an effective task count of {effective})"
+                )
+
+
+def _effective_tasks_per_node(options: dict) -> int:
+    """Effective Slurm task count of a stage from its manual options.
+
+    ``ntasks-per-node`` (or ``ntasks``), when present, wins; otherwise the
+    options do not constrain the layout and zero is returned (the mapping
+    precondition then fails with an actionable hint to set the option).
+    """
+    for key in ("ntasks-per-node", "ntasks"):
+        if key in options:
+            raw = options[key]
+            if isinstance(raw, (list, tuple)):
+                raw = raw[0] if raw else None
+            if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+                raise ConfigError(
+                    f"slurm {key} must be a positive integer when set"
+                )
+            return raw
+    return 0
+
+
+def _load_node_config(name: str, value: dict | None) -> NodeConfig | None:
+    if value is None:
+        return None
+    key = f"[targets.{name}.node]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a table")
+    unknown = sorted(set(value) - {"cpus", "gpus", "memory"})
+    if unknown:
+        raise ConfigError(f"{key} has unknown key(s): {', '.join(unknown)}")
+    return NodeConfig(
+        cpus=value.get("cpus"),
+        gpus=value.get("gpus"),
+        memory=value.get("memory"),
+    )
+
+
+def _load_allocation_config(name: str, value: dict | None) -> AllocationConfig | None:
+    if value is None:
+        return None
+    key = f"[targets.{name}.allocation]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a table")
+    unknown = sorted(
+        set(value) - {"default-gpus", "default-cpus", "single-node", "multi-node", "max-nodes"}
+    )
+    if unknown:
+        raise ConfigError(f"{key} has unknown key(s): {', '.join(unknown)}")
+    return AllocationConfig(
+        default_gpus=value.get("default-gpus"),
+        default_cpus=value.get("default-cpus"),
+        single_node=value.get("single-node"),
+        multi_node=value.get("multi-node"),
+        max_nodes=value.get("max-nodes"),
+    )
+
+
+def _parse_account(raw: object, name: str, stage: str) -> str | None:
+    """Validate the optional per-stage scheduler account.
+
+    ``None`` and an empty/whitespace-only string mean "omit ``--account``" and
+    normalize to ``None``.  A non-string (int, bool, list, ...) is an error, as
+    is a string containing whitespace, a newline, a carriage return or a NUL;
+    those would inject into the rendered argument list.  A valid string is
+    returned verbatim.
+    """
+    where = f"targets.{name}.slurm.{stage}.account"
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ConfigError(f"{where} must be a string")
+    if not raw.strip():
+        return None
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        raise ConfigError(
+            f"{where} must not contain whitespace, newlines, carriage returns "
+            "or NUL"
+        )
+    return raw
+
+
+def _load_slurm_stage(
+    name: str,
+    stage: str,
+    options: dict | None,
+    mapping_raw: dict | None,
+) -> SlurmStageConfig | None:
+    """Load and validate one stage's manual options plus its mapping.
+
+    ``options``/``mapping_raw`` are the parsed ``slurm.<stage>`` dict and the
+    ``slurm.<stage>-map`` dict respectively; either may be ``None``.  When both
+    are ``None`` the stage is absent and ``None`` is returned so T2/T3 emit
+    nothing for it.  ``options`` keys are preserved verbatim (e.g.
+    ``ntasks-per-node``); each value is a scalar, bool, or array of them.  The
+    reserved ``account`` key is pulled out of ``options`` into the first-class
+    ``account`` field and never appears in ``options``.  ``mapping_raw`` is
+    validated against ``MAPPING_VOCABULARY``.
+    """
+    if options is None and mapping_raw is None:
+        return None
+    if options is not None and not isinstance(options, dict):
+        raise ConfigError(f"[targets.{name}.slurm.{stage}] must be a table")
+    if mapping_raw is not None:
+        if not isinstance(mapping_raw, dict):
+            raise ConfigError(f"[targets.{name}.slurm.{stage}-map] must be a table")
+        mapping = {str(k): v for k, v in mapping_raw.items()}
+    else:
+        mapping = {}
+    manual = dict(options or {})
+    account = _parse_account(manual.pop("account", None), name, stage)
+    _validate_slurm_mapping(mapping, stage, manual, name)
+    return SlurmStageConfig(
+        options=manual,
+        mapping=mapping,
+        account=account,
+    )
+
+
+def _load_slurm_config(name: str, value: dict | None) -> SlurmConfig | None:
+    """Split the per-target ``[slurm]`` table into sbatch/srun stages.
+
+    The accepted TOML uses nested tables::
+
+        [targets.X.slurm.sbatch]   # manual submission options
+        [targets.X.slurm.sbatch-map]  # calculated value -> output representation
+        [targets.X.slurm.srun]     # manual job-step options
+        [targets.X.slurm.srun-map] # calculated value -> output representation
+
+    After ``tomllib`` the parsed dict has exactly the keys ``sbatch``,
+    ``sbatch-map``, ``srun``, ``srun-map`` (each a dict).  Each stage is
+    independent: nothing is copied between them, so T2/T3 can decide
+    per-stage whether to emit any resource arguments.
+    """
+    if value is None:
+        return None
+    key = f"[targets.{name}.slurm]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a table")
+    known = {"sbatch", "sbatch-map", "srun", "srun-map"}
+    unknown = sorted(set(value) - known)
+    if unknown:
+        raise ConfigError(f"{key} has unknown key(s): {', '.join(unknown)}")
+    for sub_name, sub in value.items():
+        if not isinstance(sub, dict):
+            raise ConfigError(f"[{key}.{sub_name}] must be a table")
+    sbatch_stage = _load_slurm_stage(
+        name, "sbatch", value.get("sbatch"), value.get("sbatch-map")
+    )
+    srun_stage = _load_slurm_stage(
+        name, "srun", value.get("srun"), value.get("srun-map")
+    )
+    if sbatch_stage is None and srun_stage is None:
+        # An empty `[slurm]` table is equivalent to no slurm block at all.
+        return None
+    return SlurmConfig(
+        sbatch=sbatch_stage or SlurmStageConfig(),
+        srun=srun_stage or SlurmStageConfig(),
+    )
+
+
+def _load_container_config(name: str, value: dict | None) -> ContainerConfig | None:
+    if value is None:
+        return None
+    key = f"[targets.{name}.container]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a table")
+    unknown = sorted(
+        set(value)
+        - {
+            "runtime",
+            "storage-root",
+            "image",
+            "gpus",
+            "host-home",
+            "sandbox",
+            "build-location",
+        }
+    )
+    if unknown:
+        raise ConfigError(f"{key} has unknown key(s): {', '.join(unknown)}")
+    runtime = value.get("runtime")
+    if runtime is None:
+        raise ConfigError(f"{key} requires 'runtime'")
+    return ContainerConfig(
+        runtime=runtime,
+        storage_root=value.get("storage-root"),
+        image=value.get("image"),
+        gpus=tuple(value.get("gpus", ())),
+        host_home=value.get("host-home"),
+        sandbox=bool(value.get("sandbox", False)),
+        build_location=value.get("build-location", "login"),
+    )
+
+
+def _load_bundle_config(name: str, value: dict | None) -> BundleConfig | None:
+    if value is None:
+        return None
+    key = f"[targets.{name}.bundle]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{key} must be a table")
+    unknown = sorted(
+        set(value) - {"source", "deploy-dir", "auto-deploy", "provision-env"}
+    )
+    if unknown:
+        raise ConfigError(f"{key} has unknown key(s): {', '.join(unknown)}")
+    source = value.get("source")
+    if source is None:
+        raise ConfigError(f"{key} requires 'source'")
+    raw_env = value.get("provision-env", ())
+    if not isinstance(raw_env, (list, tuple)):
+        raise ConfigError(f"{key}.provision-env must be an array of strings")
+    return BundleConfig(
+        source=source,
+        deploy_dir=value.get("deploy-dir"),
+        auto_deploy=value.get("auto-deploy", True),
+        provision_env=tuple(raw_env),
+    )
+
+
 @dataclass(frozen=True)
 class TargetConfig:
     name: str
     user: str
     transport: TransportConfig
+    # Account the gateway logs into INSIDE the container.  ``user`` is the
+    # LOGIN/ROUTE account (e.g. the site account used for the gateway -> login
+    # hop); the container sshd only accepts this dedicated account, which the
+    # provisioning helper creates (default ``ubuntu``).  An unset value resolves
+    # to ``ubuntu`` at dial time, matching ``COMPUTEMCP_SSH_USER``.
+    container_user: str | None = None
     client_key: str | None = None
     known_hosts: str | None = None
     host_key_sha256: str | None = None
@@ -144,6 +676,18 @@ class TargetConfig:
     auto_connect: bool = False
     connect_backoff_initial: float = 1.0
     connect_backoff_max: float = 60.0
+    # Optional Slurm resource description and allocation policy (see the
+    # design doc).  ``node`` is the allocatable capacity per node;
+    # ``allocation`` are the defaults and the single/multi-node policies;
+    # ``slurm`` holds the manual sbatch/srun options and their optional
+    # calculated-value mappings; ``container`` describes the development
+    # container runtime (apptainer/docker).  Each is optional: a target without
+    # a Slurm allocation simply has no such block, as before.
+    node: NodeConfig | None = None
+    allocation: AllocationConfig | None = None
+    slurm: SlurmConfig | None = None
+    container: ContainerConfig | None = None
+    bundle: BundleConfig | None = None
 
     def __post_init__(self) -> None:
         if self.provision_command and self.transport.kind != "tunnel":
@@ -158,14 +702,55 @@ class TargetConfig:
             raise ConfigError(
                 f"target {self.name!r} connect_command requires tunnel transport"
             )
+        if self.bundle is not None and self.bundle.provision_env and (
+            self.transport.kind != "tunnel"
+        ):
+            raise ConfigError(
+                f"target {self.name!r} bundle.provision-env requires tunnel "
+                "transport"
+            )
+        if self.bundle is not None and self.transport.kind != "tunnel":
+            raise ConfigError(
+                f"target {self.name!r} bundle requires tunnel transport"
+            )
+        if self.bundle is not None:
+            if not self.bundle.deploy_dir:
+                if self.container is None or not self.container.storage_root:
+                    raise ConfigError(
+                        f"target {self.name!r} bundle needs 'deploy-dir' or a "
+                        "container 'storage-root' to derive it from"
+                    )
+            if not self.client_key:
+                # The gateway derives the container's authorized key from
+                # client_key; without it the container would accept no key and
+                # the failure would only surface after provisioning starts.
+                raise ConfigError(
+                    f"target {self.name!r} bundle requires 'client_key'"
+                )
         if self.connect_command_mode not in ("on_failure", "always"):
             raise ConfigError(
                 f"target {self.name!r} connect_command_mode must be "
                 "'on_failure' or 'always'"
             )
         validate_target_name(self.name)
-        if not self.user:
-            raise ConfigError(f"target {self.name!r} has no user")
+        # ``user`` may be empty: the SSH config alias or the local account then
+        # supplies the login user.  Only a non-string is rejected.
+        if not isinstance(self.user, str):
+            raise ConfigError(f"target {self.name!r} user must be a string")
+        # ``container_user`` is the account dialed INSIDE the container.  Unset
+        # (None) is allowed and resolves to ``ubuntu`` at dial time.  When set it
+        # must match the helper's own validation: a lowercase shell identifier
+        # that is not ``root`` (the bundle refuses to create a root login).
+        if self.container_user is not None:
+            if (
+                not isinstance(self.container_user, str)
+                or not CONTAINER_USER_RE.match(self.container_user)
+                or self.container_user == "root"
+            ):
+                raise ConfigError(
+                    f"target {self.name!r} container_user must match "
+                    "'^[a-z_][a-z0-9_-]*$' and must not be 'root'"
+                )
         if self.connect_mode not in ("shared", "dedicated"):
             raise ConfigError(
                 f"target {self.name!r} connect_mode must be 'shared' or 'dedicated'"
@@ -249,7 +834,7 @@ class ServerConfig:
     max_body_bytes: int = 256 * 1024 * 1024
     # Out-of-band client enrollment (see enrollment.py).  Approval is always an
     # explicit operator action; these only bound the unauthenticated surface.
-    allow_enrollment: bool = True
+    allow_enrollment: bool = False
     enroll_ttl: float = 600.0
     enroll_max_pending: int = 32
 
@@ -292,6 +877,10 @@ class GatewayConfig:
     clients: dict[str, ClientConfig]
     token_file: str | None = None
     config_path: str | None = None
+    # Absolute paths of the TOML files merged to produce this configuration,
+    # in first-seen preorder (includes first, entry last).  Empty when the
+    # entry file has no ``include`` key.  Useful for diagnostics.
+    include_paths: tuple[str, ...] = ()
     raw: dict = field(default_factory=dict, repr=False)
 
 
@@ -327,7 +916,9 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
     if "agent" in value and not isinstance(value.get("agent"), (list, tuple)):
         raise ConfigError(f"target {name!r} agent must be a list of tables")
 
-    user = value.get("user", "agent")
+    # Absent means "let the SSH config alias or local account decide"; an
+    # explicit empty string is treated the same as absent.
+    user = value.get("user", "")
     has_ssh_targets = "ssh_targets" in value
     ssh_targets = tuple(value.get("ssh_targets", ()))
     kind = value.get("transport")
@@ -350,6 +941,7 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         name=name,
         user=user,
         transport=transport,
+        container_user=value.get("container_user"),
         client_key=value.get("client_key"),
         known_hosts=value.get("known_hosts"),
         host_key_sha256=value.get("host_key_sha256"),
@@ -381,6 +973,11 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         connect_backoff_max=_float(
             value.get("connect_backoff_max"), "connect_backoff_max", 60.0
         ),
+        node=_load_node_config(name, value.get("node")),
+        allocation=_load_allocation_config(name, value.get("allocation")),
+        slurm=_load_slurm_config(name, value.get("slurm")),
+        container=_load_container_config(name, value.get("container")),
+        bundle=_load_bundle_config(name, value.get("bundle")),
     )
 
 
@@ -391,6 +988,9 @@ def _load_clients(
 ) -> dict[str, ClientConfig]:
     external_hashes = external_hashes or {}
     clients: dict[str, ClientConfig] = {}
+    # ``sha256:...`` -> first client id that claimed it.  Built incrementally so
+    # insertion order (and therefore the pair named in an error) is deterministic.
+    seen_hashes: dict[str, str] = {}
     table = _require_table(raw, "clients")
     for client_id, value in table.items():
         validate_target_name(client_id)
@@ -420,6 +1020,13 @@ def _load_clients(
                     f"[clients.{client_id}] references unknown target {target!r}"
                 )
         label = value.get("label")
+        previous = seen_hashes.get(token_hash)
+        if previous is not None:
+            raise ConfigError(
+                f"clients {previous!r} and {client_id!r} share the same token; "
+                "each client needs a unique token"
+            )
+        seen_hashes[token_hash] = client_id
         clients[client_id] = ClientConfig(
             client_id=client_id,
             token_sha256=token_hash,
@@ -458,10 +1065,147 @@ def _token_hashes_from_file_table(table: dict) -> dict[str, str]:
     return result
 
 
+def _flatten_table(body: dict, prefix: tuple[str, ...] = ()) -> dict[str, object]:
+    """Flatten a nested table into ``'a.b.c' -> scalar`` leaf paths.
+
+    Empty inner tables are omitted so a file that contributes nothing
+    (e.g. only comments) never collides with another.
+    """
+    out: dict[str, object] = {}
+    for key, value in body.items():
+        path = prefix + (str(key),)
+        if isinstance(value, dict):
+            out.update(_flatten_table(value, path))
+        else:
+            out[".".join(path)] = value
+    return out
+
+
+def _set_leaf(root: dict, dotted: str, value: object) -> None:
+    """Rebuild ``root[dotted.split('.')] = value`` in place, creating tables."""
+    parts = dotted.split(".")
+    cur = root
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    leaf = parts[-1]
+    if leaf in cur and cur[leaf] != value:
+        raise ConfigError(
+            f"duplicate configuration value {dotted!r} (internal merge conflict)"
+        )
+    cur[leaf] = value
+
+
+def _load_toml_files(root_path: Path) -> tuple[dict, list[Path]]:
+    """Parse the TOML at ``root_path`` and every file its ``include`` chain
+    references, and merge them into one raw table.
+
+    Relative include paths resolve against the declaring file's directory
+    (never the process CWD); absolute paths are used as-is.  Each file is
+    visited exactly once; a cycle and a missing file are ``ConfigError``s.
+    Two files that set the same leaf path are rejected with both file names
+    in the message.  ``include`` keys themselves are stripped from the
+    merged result, so the rest of ``parse_config`` sees a single ordinary
+    gateway table.  The returned ordered list contains only the *included*
+    files, in first-seen preorder (the entry file is excluded because it is
+    reported separately via ``GatewayConfig.config_path``); for an
+    include-free configuration it is empty.
+    """
+    merged: dict = {}
+    sources: dict[str, str] = {}
+    order: list[Path] = []
+    visiting: list[Path] = []
+    seen: set[Path] = set()
+
+    def rec(p: Path) -> None:
+        if p in seen:
+            return
+        if p in visiting:
+            chain = " -> ".join([str(x) for x in visiting] + [str(p)])
+            raise ConfigError(f"include cycle detected: {chain}")
+        visiting.append(p)
+        try:
+            with p.open("rb") as handle:
+                raw = tomllib.load(handle)
+        except FileNotFoundError as exc:
+            raise ConfigError(f"configuration file not found: {p}") from exc
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"malformed TOML in {p}: {exc}") from exc
+        includes = raw.get("include", [])
+        if not (
+            isinstance(includes, list) and all(isinstance(e, str) for e in includes)
+        ):
+            raise ConfigError(
+                f"in {p}: 'include' must be a list of file path strings"
+            )
+        for entry in includes:
+            child = Path(entry)
+            if not child.is_absolute():
+                child = p.parent / entry
+            child = child.resolve()
+            rec(child)
+        body = {k: v for k, v in raw.items() if k != "include"}
+        for leaf, val in _flatten_table(body).items():
+            if leaf in sources:
+                prev = sources[leaf]
+                raise ConfigError(
+                    f"duplicate configuration value {leaf!r}: "
+                    f"defined in both {prev} and {p}"
+                )
+            sources[leaf] = str(p)
+            _set_leaf(merged, leaf, val)
+        visiting.pop()
+        seen.add(p)
+        order.append(p)
+
+    rec(root_path)
+    # ``include_paths`` records only *included* files, not the entry (the
+    # entry is already reported via ``GatewayConfig.config_path``).  An
+    # include-free configuration yields an empty tuple, which also hands out
+    # the back-compat guarantee that "nothing was included".
+    if order and order[-1] == root_path:
+        order.pop()
+    return merged, order
+
+
+def load_config(
+    path: str | Path | None = None, token_file: str | Path | None = None
+) -> GatewayConfig:
+    """Read a TOML gateway config (with optional ``include``) and validate it.
+
+    When the entry file carries a top-level ``include = [...]`` list, each
+    list entry is parsed independently (relative paths resolve against the
+    declaring file's directory; absolute paths are used as-is), then the
+    parsed tables are merged.  A naive ``dict.update`` would silently override,
+    so duplicates are rejected instead: two files assigning the same leaf
+    ``dotted.key`` raise a ``ConfigError`` that names both source files.
+    A missing include file or a cycle in the include graph is also an error.
+    Files are visited depth-first; an include listed more than once applies
+    only once (first-seen wins), so a diamond include with no cycle is OK.
+
+    ``GatewayConfig.include_paths`` records every *included* file in
+    first-seen preorder; it is empty when the entry file has no ``include``
+    key (back-compat with single-file configs).  ``GatewayConfig.config_path``
+    is always the entry the operator named, not a base path for the graph.
+    """
+    path = Path(path) if path is not None else default_config_path()
+    merged, ordered = _load_toml_files(path)
+    return parse_config(
+        merged,
+        config_path=str(path),
+        token_file=str(token_file) if token_file else None,
+        include_paths=tuple(str(p) for p in ordered),
+    )
+
+
 def parse_config(
     raw: dict,
     config_path: str | None = None,
     token_file: str | None = None,
+    include_paths: tuple[str, ...] = (),
 ) -> GatewayConfig:
     if not isinstance(raw, dict):
         raise ConfigError("configuration root must be a table")
@@ -473,7 +1217,7 @@ def parse_config(
         request_timeout=_float(server_raw.get("request_timeout"), "request_timeout", 30.0),
         exec_timeout=_float(server_raw.get("exec_timeout"), "exec_timeout", 900.0),
         max_body_bytes=_int(server_raw.get("max_body_bytes"), "max_body_bytes", 256 * 1024 * 1024),
-        allow_enrollment=bool(server_raw.get("allow_enrollment", True)),
+        allow_enrollment=bool(server_raw.get("allow_enrollment", False)),
         enroll_ttl=_float(server_raw.get("enroll_ttl"), "server.enroll_ttl", 600.0),
         enroll_max_pending=_int(
             server_raw.get("enroll_max_pending"), "server.enroll_max_pending", 32
@@ -543,26 +1287,8 @@ def parse_config(
         clients=clients,
         token_file=token_path,
         config_path=config_path,
+        include_paths=include_paths,
         raw=raw,
-    )
-
-
-def load_config(
-    path: str | Path | None = None, token_file: str | Path | None = None
-) -> GatewayConfig:
-    # An omitted --config falls back to the conventional location.
-    path = Path(path) if path is not None else default_config_path()
-    try:
-        with path.open("rb") as handle:
-            raw = tomllib.load(handle)
-    except FileNotFoundError as exc:
-        raise ConfigError(f"configuration file not found: {path}") from exc
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"malformed TOML in {path}: {exc}") from exc
-    return parse_config(
-        raw,
-        config_path=str(path),
-        token_file=str(token_file) if token_file else None,
     )
 
 
@@ -605,6 +1331,86 @@ def _atomic_write(path: Path, text: str, mode: int | None = None) -> None:
     os.replace(tmp, path)
 
 
+def append_include(config_path: str | Path, include_entry: str) -> None:
+    """Add one path to the top-level ``include`` list, preserving the file.
+
+    TOML has no incremental array append, and this must not disturb the
+    operator's comments or formatting.  The function operates line-wise:
+
+    - an ``include`` array spanning several lines gets the entry inserted on its
+      own line before the closing ``]``;
+    - a single-line ``include = [...]`` is rewritten into the multi-line form;
+    - a file without ``include`` gets one inserted after the leading comment
+      block and before the first table (where TOML allows a root key).
+
+    An entry already present is a no-op, so callers can retry safely.  The file
+    is re-validated after the edit and reverted on failure.
+    """
+    path = Path(config_path)
+    original = path.read_text()
+    with path.open("rb") as handle:
+        raw = tomllib.load(handle)
+    current = raw.get("include", [])
+    if not isinstance(current, list) or not all(isinstance(e, str) for e in current):
+        raise ConfigError(f"{path}: 'include' must be a list of file path strings")
+    if include_entry in current:
+        return
+
+    lines = original.splitlines()
+    quote = _toml_quote(include_entry)
+    # Match only a root-level key (column 0), never a nested table's key that
+    # happens to start with "include".
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if line.startswith("include") and line[len("include") :].lstrip().startswith("=")
+        ),
+        None,
+    )
+    if start is None:
+        insert_at = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                insert_at = i + 1
+                continue
+            insert_at = i
+            break
+        lines[insert_at:insert_at] = ["", f"include = [{quote}]"]
+    else:
+        # Find the closing bracket, ignoring comment-only lines that contain ']'.
+        end = start
+        while True:
+            stripped = lines[end].strip()
+            if "]" in lines[end] and not stripped.startswith("#"):
+                break
+            end += 1
+            if end >= len(lines):
+                raise ConfigError(f"{path}: unterminated include array")
+        indent = "    "
+        if start == end:
+            # Single-line form: rebuild from the parsed values, so a bracket in
+            # a trailing comment cannot confuse the rewrite.
+            rebuilt = ["include = ["]
+            rebuilt += [indent + _toml_quote(entry) + "," for entry in current]
+            rebuilt.append(indent + quote + ",")
+            rebuilt.append("]")
+            lines[start : start + 1] = rebuilt
+        else:
+            closing = lines[end]
+            indent = closing[: len(closing) - len(closing.lstrip())] or indent
+            lines.insert(end, indent + quote + ",")
+
+    updated = "\n".join(lines).rstrip("\n") + "\n"
+    _atomic_write(path, updated)
+    try:
+        load_config(path, token_file=None)
+    except (ConfigError, tomllib.TOMLDecodeError):
+        _atomic_write(path, original)
+        raise
+
+
 def append_client(
     config_path: str | Path,
     client_id: str,
@@ -614,18 +1420,22 @@ def append_client(
     """Append a ``[clients.<id>]`` block to the config, then re-validate it.
 
     The block is only ever *appended*; existing content (including operator
-    comments) is preserved.  The whole file is re-parsed afterwards, and the
-    caller should only rely on it once that validation passes.  A duplicate
-    client id is refused.
+    comments) is preserved.  The whole file (merged across its include chain)
+    is re-parsed afterwards, and the caller should only rely on it once that
+    validation passes.  A duplicate client id is refused.
+
+    Duplicate and target checks consult the merged include graph, not only the
+    entry file: after targets moved into included files, an entry file with
+    ``include = [...]`` can reference a target while defining no
+    ``[targets.*]`` table of its own.  Only the entry file is ever written.
     """
     validate_target_name(client_id)
     path = Path(config_path)
-    with path.open("rb") as handle:
-        raw = tomllib.load(handle)
-    if client_id in raw.get("clients", {}):
+    merged, _ordered = _load_toml_files(path)
+    if client_id in merged.get("clients", {}):
         raise ConfigError(f"client {client_id!r} already exists in {path}")
 
-    known = set(raw.get("targets", {}))
+    known = set(merged.get("targets", {}))
     for target in targets:
         if target != "*" and target not in known:
             raise ConfigError(

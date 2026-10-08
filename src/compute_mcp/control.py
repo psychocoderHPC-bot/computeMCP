@@ -23,17 +23,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
+from pathlib import Path
 
 import aiohttp
 
 from .config import (
+    OPERATOR_TOKEN_NAME,
     ConfigError,
     GatewayConfig,
     default_config_path,
     load_config,
 )
+
+log = logging.getLogger("compute_mcp.control")
 
 # Fallback HTTP client timeout for commands that do not know a provisioning
 # deadline (status, clients, reload, ...) and when no flag overrides it.
@@ -57,10 +62,23 @@ def _resolve_gateway(config: GatewayConfig, override: str | None) -> str:
 
 def _resolve_token(config_path: str, token_file: str | None,
                    client: str, token: str | None) -> str:
+    # Explicit flag wins; then a plaintext operator token written by --bootstrap
+    # next to the config; then COMPUTEMCP_TOKEN; then a plaintext token in the
+    # tokens file.  The config-local token outranks the environment so a stray
+    # ambient token (e.g. one exported for a MCP client) cannot shadow the
+    # gateway this command was pointed at.
     if token:
+        log.debug("token source: flag")
         return token
+    operator_token = Path(config_path).parent / OPERATOR_TOKEN_NAME
+    if operator_token.is_file():
+        text = operator_token.read_text().strip()
+        if text:
+            log.debug("token source: operator-token (%s)", operator_token)
+            return text
     env = os.environ.get("COMPUTEMCP_TOKEN")
     if env:
+        log.debug("token source: environment (COMPUTEMCP_TOKEN)")
         return env
     # Fall back to reading the plaintext token from a tokens file, if present.
     path = token_file
@@ -79,10 +97,12 @@ def _resolve_token(config_path: str, token_file: str | None,
             if not str(key).startswith("sha256:") and str(value).startswith("sha256:"):
                 continue  # hashed entries can't be reversed to a plaintext token
             if key == client:
+                log.debug("token source: tokens-file (%s)", path)
                 return str(value)
     raise SystemExit(
-        "no token available: set COMPUTEMCP_TOKEN, pass --token, or keep a "
-        "plaintext token in the tokens file (hashes cannot be used by the CLI)"
+        "no token available: run --bootstrap (writes an operator token next to "
+        f"the config), set COMPUTEMCP_TOKEN, pass --token, or keep a plaintext "
+        "token in the tokens file (hashes cannot be used by the CLI)"
     )
 
 
@@ -112,6 +132,33 @@ def _resolve_timeout(
     return DEFAULT_TIMEOUT
 
 
+def _parse_overrides(entries: list[str] | None) -> dict | None:
+    """Parse repeated ``--set key=value`` entries into an override dict.
+
+    Malformed entries (no ``=``, empty key) are rejected here; unknown keys and
+    invalid values are rejected by the allocation layer on the gateway, so the
+    CLI does not duplicate that vocabulary.  Returns ``None`` when no entry was
+    given, keeping the request body byte-for-byte as before.
+    """
+    if not entries:
+        return None
+    overrides: dict = {}
+    for entry in entries:
+        key, sep, value = entry.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise SystemExit(
+                f"malformed --set {entry!r}: expected KEY=VALUE "
+                "(e.g. --set gpus-per-node=2)"
+            )
+        # A shell/argparse value is always a string; numeric-looking values are
+        # handed to the gateway as integers so the allocation layer's type
+        # checks accept them.  Memory quantities (e.g. 100G) and mode names stay
+        # strings.  Unknown keys still fail in the allocation layer.
+        overrides[key] = int(value) if value.isdigit() else value
+    return overrides
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="computeMCP-gatewayctl")
     parser.add_argument(
@@ -127,7 +174,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="client id whose token to use (default: admin)")
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     parser.add_argument("--timeout", type=float, default=None)
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--add-target",
+        action="store_true",
+        help="interactively append a [targets.X] block to the config and exit "
+        "(no running gateway required)",
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
 
     sub.add_parser("status", help="show targets and their state")
     sub.add_parser("targets", help="list target names")
@@ -144,22 +197,28 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("client", help="show one client")
     p.add_argument("name")
 
-    p = sub.add_parser("target-connect", help="connect a target")
-    p.add_argument("target")
-    p.add_argument("--2fa", dest="factor", metavar="SECRET",
-                   help="second factor (password/OTP) for interactive_auth targets")
-    p.add_argument("--timeout", dest="action_timeout", type=float,
-                   default=argparse.SUPPRESS, metavar="SECONDS",
-                   help="override the request timeout; default is the target's "
-                   "provision_timeout plus a margin")
-    p = sub.add_parser("target-refresh", help="refresh a target")
-    p.add_argument("target")
-    p.add_argument("--2fa", dest="factor", metavar="SECRET",
-                   help="second factor (password/OTP) for interactive_auth targets")
-    p.add_argument("--timeout", dest="action_timeout", type=float,
-                   default=argparse.SUPPRESS, metavar="SECONDS",
-                   help="override the request timeout; default is the target's "
-                   "provision_timeout plus a margin")
+    for name, help_ in (
+        ("target-connect", "connect a target"),
+        ("target-refresh", "refresh a target"),
+    ):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("target")
+        p.add_argument("--2fa", dest="factor", metavar="SECRET",
+                       help="second factor (password/OTP) for interactive_auth "
+                       "targets")
+        p.add_argument(
+            "--set", dest="overrides", action="append", default=None,
+            metavar="KEY=VALUE",
+            help="allocation override (repeatable), e.g. --set gpus-per-node=2",
+        )
+        p.add_argument("--timeout", dest="action_timeout", type=float,
+                       default=argparse.SUPPRESS, metavar="SECONDS",
+                       help="override the request timeout; default is the "
+                       "target's provision_timeout plus a margin")
+        p.add_argument(
+            "--dry-run", action="store_true",
+            help="preview the allocation without connecting (no allocation)",
+        )
     p = sub.add_parser("target-stop", help="stop a target")
     p.add_argument("target")
 
@@ -259,19 +318,39 @@ async def _run(args: argparse.Namespace) -> int:
             )
             _emit(args, body, lambda b: f"denied {b['request_id']}")
         elif cmd == "target-connect":
-            body = await control.request(
-                "POST", f"/v1/targets/{args.target}/connect",
-                json_body={"factor": args.factor} if args.factor is not None else None,
-                timeout=_resolve_timeout(args, config, [args.target]),
-            )
-            _emit_target(args, body)
+            overrides = _parse_overrides(args.overrides)
+            if args.dry_run:
+                payload = _target_body(args.factor, overrides)
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/preview",
+                    json_body=payload,
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_preview(args, body)
+            else:
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/connect",
+                    json_body=_target_body(args.factor, overrides),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_target(args, body)
         elif cmd == "target-refresh":
-            body = await control.request(
-                "POST", f"/v1/targets/{args.target}/refresh",
-                json_body={"factor": args.factor} if args.factor is not None else None,
-                timeout=_resolve_timeout(args, config, [args.target]),
-            )
-            _emit_target(args, body)
+            overrides = _parse_overrides(args.overrides)
+            if getattr(args, "dry_run", False):
+                payload = _target_body(args.factor, overrides)
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/preview",
+                    json_body=payload,
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_preview(args, body)
+            else:
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/refresh",
+                    json_body=_target_body(args.factor, overrides),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_target(args, body)
         elif cmd == "target-stop":
             body = await control.request("POST", f"/v1/targets/{args.target}/stop")
             _emit(args, body, lambda b: f"{b['name']} -> {b['state']}")
@@ -319,6 +398,20 @@ def _emit(args, body: dict, render) -> None:
         print(render(body))
 
 
+def _target_body(factor: str | None, overrides: dict | None) -> dict | None:
+    """Build the optional connect/refresh/preview request body.
+
+    Returns ``None`` when neither a factor nor overrides are present, preserving
+    the exact pre-existing request shape (no body).  The factor is never echoed.
+    """
+    body: dict = {}
+    if factor is not None:
+        body["factor"] = factor
+    if overrides is not None:
+        body["set"] = overrides
+    return body or None
+
+
 def _emit_target(args, body: dict) -> None:
     """Print a target state line plus any gateway warning (to stderr)."""
     if args.json:
@@ -328,6 +421,52 @@ def _emit_target(args, body: dict) -> None:
     warning = body.get("warning")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
+
+
+def _emit_preview(args, body: dict) -> None:
+    """Print a stable, labeled dry-run block.
+
+    Labels sit on their own lines so the output is easy to scan (and easy to
+    parse with ``grep``/``cut``).  Map-like sections are indented consistently.
+    """
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return
+    planned = body.get("planned") or {}
+    plan = planned.get("plan") or {}
+    provision_env = body.get("provision_env") or {}
+
+    print(f"target: {body.get('target')}")
+    print(f"connected: {body.get('connected')}")
+    if body.get("needs_refresh"):
+        print("needs_refresh: true")
+
+    print("planned:")
+    print(f"  mode: {plan.get('mode')}")
+    print(f"  nodes: {plan.get('nodes')}")
+    print(f"  cpus_per_node: {plan.get('cpus_per_node')}")
+    print(f"  gpus_per_node: {plan.get('gpus_per_node')}")
+    print(f"  memory_per_node_mib: {plan.get('memory_per_node_mib')}")
+    print(f"  exclusive: {plan.get('exclusive')}")
+    print(f"  defaults_used: {planned.get('defaults_used')}")
+
+    print("manual:")
+    for stage in ("sbatch", "srun"):
+        stage_options = (planned.get("manual") or {}).get(stage) or {}
+        print(f"  {stage}: {json.dumps(stage_options, sort_keys=True)}")
+
+    print("args:")
+    print(f"  sbatch: {json.dumps(body.get('sbatch_args') or [])}")
+    print(f"  srun: {json.dumps(body.get('srun_args') or [])}")
+
+    print("not_emitted:")
+    for field in (body.get("would_emit") or {}).get("not_emitted") or []:
+        print(f"  {field}")
+
+    print("COMPUTEMCP_SBATCH_ARGS:")
+    print(provision_env.get("COMPUTEMCP_SBATCH_ARGS", ""))
+    print("COMPUTEMCP_SRUN_ARGS:")
+    print(provision_env.get("COMPUTEMCP_SRUN_ARGS", ""))
 
 
 def _emit_status(args, body: dict) -> None:
@@ -408,6 +547,19 @@ def _emit_sessions(args, body: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.add_target:
+        # Setup wizard: no gateway connection, no token needed.
+        from .setup import Wizard, WizardAbort, run_add_target
+
+        try:
+            return run_add_target(
+                args.config, wizard=Wizard(terminal=None)
+            )
+        except WizardAbort as exc:
+            print(f"add-target: {exc}", file=sys.stderr)
+            return 2
+    if not getattr(args, "command", None):
+        build_parser().error("a command is required (or use --add-target)")
     import asyncio
 
     return asyncio.run(_run(args))

@@ -22,7 +22,7 @@ from typing import Awaitable, Protocol
 
 import asyncssh
 
-from .config import TargetConfig
+from .config import TargetConfig, container_login_user
 
 log = logging.getLogger("compute_mcp.ssh")
 
@@ -168,7 +168,7 @@ async def dial_route(
     name: str,
     host: str,
     port: int,
-    username: str,
+    username: str | tuple,
     client_keys: list[str] | tuple[str, ...] | None,
     passphrase: str | None,
     prompter: _Prompter | None,
@@ -235,18 +235,32 @@ async def dial_route(
 
 
 class SSHBackend:
-    """Caches one live SSH connection per (client independent) target."""
+    """Caches one live container SSH connection per target, keyed by endpoint.
+
+    A cached connection is only valid for the exact container endpoint
+    (host:port) it was dialed to.  The container's published port can change
+    after a container restart, and a refresh/recovery re-provisions to a new
+    endpoint; a cached connection dialed to a stale port must never be reused.
+    ``connection`` therefore records the endpoint each cached connection was
+    dialed to and redials when the requested endpoint differs.
+    """
 
     def __init__(self) -> None:
-        self._connections: dict[str, asyncssh.SSHClientConnection] = {}
+        # Maps target name -> (connection, "host:port" it was dialed to).
+        self._connections: dict[str, tuple[asyncssh.SSHClientConnection, str]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _endpoint_key(host: str, port: int) -> str:
+        return f"{host}:{port}"
 
     def _lock(self, target: str) -> asyncio.Lock:
         return self._locks.setdefault(target, asyncio.Lock())
 
     async def disconnect(self, target: str) -> None:
-        conn = self._connections.pop(target, None)
-        if conn is not None:
+        entry = self._connections.pop(target, None)
+        if entry is not None:
+            conn = entry[0]
             conn.close()
             with contextlib.suppress(Exception):
                 await conn.wait_closed()
@@ -267,10 +281,27 @@ class SSHBackend:
     ) -> asyncssh.SSHClientConnection:
         async with self._lock(target.name):
             existing = self._connections.get(target.name)
-            if existing is not None and not existing.is_closed():
-                return existing
+            key = self._endpoint_key(host, port)
+            if (
+                existing is not None
+                and existing[1] == key  # same endpoint a refresh did not change
+                and not existing[0].is_closed()
+            ):
+                return existing[0]
+            # No cached connection, it is dead, or it was dialed to a different
+            # (stale) endpoint: drop the stale entry and dial the current one.
+            if existing is not None:
+                conn, stale_key = existing
+                if not conn.is_closed():
+                    log.info(
+                        "target %s: dropping container connection to stale "
+                        "endpoint %s; redialing %s",
+                        target.name, stale_key, key,
+                    )
+                self._connections.pop(target.name, None)
+                await self.close_connection(conn)
             conn = await self._dial(target, host, port, prompter)
-            self._connections[target.name] = conn
+            self._connections[target.name] = (conn, key)
             return conn
 
     async def open_connection(
@@ -304,7 +335,17 @@ class SSHBackend:
         port: int,
         prompter: _Prompter | None = None,
         passphrase: str | None = None,
+        username: str | tuple | None = None,
     ) -> asyncssh.SSHClientConnection:
+        # This dials the CONTAINER hop.  The container sshd accepts only its own
+        # login account (``container_user``, default ``ubuntu``), which is a
+        # different account from ``target.user`` (the gateway -> login/route
+        # account).  When no explicit username is threaded through, resolve the
+        # container user here.  The direct-transport case reaches the container
+        # directly, so it too must use the container user rather than the route
+        # user.
+        if username is None:
+            username = container_login_user(target) or ()
         # Only pass the interactive prompter when the target opts in; otherwise
         # authentication stays key/agent-only and no secret can be injected.
         active_prompter = prompter if target.interactive_auth else None
@@ -341,7 +382,7 @@ class SSHBackend:
             return await asyncssh.connect(
                 host,
                 port=port,
-                username=target.user,
+                username=username,
                 client_keys=client_keys,
                 passphrase=passphrase,
                 known_hosts=known_hosts,

@@ -1,0 +1,800 @@
+#!/usr/bin/env bash
+# computeMCP Slurm provisioning entry point, run on the Slurm login node.
+#
+# Actions: provision (default) | stop | close | shell | status
+#
+# The gateway invokes this with a fully populated COMPUTEMCP_* environment (see
+# the design doc, "Gateway-to-provisioner interface").  Every value has a
+# documented fallback so the helper also works for manual/legacy invocations.
+#
+# Stages are strictly separate: SBATCH_ARGS request the allocation; the batch
+# script sources the settings file for the container configuration and starts
+# the container directly on the batch node; SRUN_ARGS are consumed by the
+# relay's per-connection srun steps.  They are never copied between each other
+# or merged.
+#
+# Settings-file transport: the helper writes a per-job settings file (the
+# container configuration plus COMPUTEMCP_SRUN_ARGS) and passes its path to the
+# batch script as a positional argument (``sbatch ... job.sh SETTINGS``).
+# Slurm passes positional arguments to the batch script verbatim, so this
+# survives ``--export=NONE`` and any custom export policy without the helper
+# touching the user's ``--export``.  An ``--export`` based mechanism was
+# rejected because it can silently clobber or be clobbered by the user's export
+# policy, which the design forbids.
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONTAINER_SCRIPT="$SCRIPT_DIR/computemcp-container.sh"
+JOB_SCRIPT="$SCRIPT_DIR/computemcp-job.sh"
+RELAY="$SCRIPT_DIR/computemcp-relay.py"
+# The scheduler may copy computemcp-job.sh into its spool directory and run it
+# there, so the batch script cannot rely on BASH_SOURCE to find its siblings.
+# Export the real bundle directory and transport it through the per-job
+# settings file (see write_settings) so the job finds computemcp-container.sh.
+export COMPUTEMCP_BUNDLE_DIR="$SCRIPT_DIR"
+
+ACTION="${1:-provision}"
+case "$ACTION" in
+    provision|stop|close|shell|status) ;;
+    *) echo "Usage: bash $0 [provision|stop|close|shell|status]" >&2; exit 2 ;;
+esac
+
+# --- Gateway environment and fallbacks -------------------------------------
+SYSTEM="${COMPUTEMCP_SYSTEM:-}"
+# When the gateway invokes stop/close/status with only COMPUTEMCP_STATE_DIR
+# (the earlier bug that exited 2), derive the system name from the state
+# directory's parent: "<storage>/<system>/state".  provision always requires an
+# explicit name below.
+if [ -n "${COMPUTEMCP_STATE_DIR:-}" ] && [ -z "$SYSTEM" ]; then
+    STATE_PARENT="$(dirname -- "$COMPUTEMCP_STATE_DIR")"
+    DERIVED_SYSTEM="$(basename -- "$STATE_PARENT")"
+    if [ -n "$DERIVED_SYSTEM" ] && [ "$DERIVED_SYSTEM" != / ] &&
+        [ "$DERIVED_SYSTEM" != . ] && [ "$DERIVED_SYSTEM" != .. ] &&
+        [[ "$DERIVED_SYSTEM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        SYSTEM="$DERIVED_SYSTEM"
+    fi
+fi
+SYSTEM="${SYSTEM:-computemcp}"
+if ! { [[ "$SYSTEM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [ "$SYSTEM" != . ] && [ "$SYSTEM" != .. ]; }; then
+    echo "Invalid system name: $SYSTEM" >&2
+    exit 2
+fi
+# Resolve the storage root without ever touching an unset $HOME under ``set -u``.
+# A literal $HOME/~ prefix from the gateway is expanded here, so the operator can
+# configure ``$HOME/computemcp`` without knowing the remote home path; that
+# expansion needs HOME.  The provision path on the login node always carries a
+# COMPUTEMCP_STORAGE_ROOT that resolves to an absolute path (the gateway or the
+# fallback below).  The provision action additionally requires an absolute value
+# once settings are known.
+STORAGE_ROOT="${COMPUTEMCP_STORAGE_ROOT:-}"
+if [[ "$STORAGE_ROOT" =~ ^\$HOME(/|$) ]]; then
+    [ -n "${HOME:-}" ] || {
+        echo 'COMPUTEMCP_STORAGE_ROOT starts with $HOME but HOME is unset; provide an absolute COMPUTEMCP_STORAGE_ROOT.' >&2
+        exit 2
+    }
+    STORAGE_ROOT="$HOME${STORAGE_ROOT#\$HOME}"
+elif [[ "$STORAGE_ROOT" =~ ^~(/|$) ]]; then
+    [ -n "${HOME:-}" ] || {
+        echo 'COMPUTEMCP_STORAGE_ROOT starts with ~ but HOME is unset; provide an absolute COMPUTEMCP_STORAGE_ROOT.' >&2
+        exit 2
+    }
+    STORAGE_ROOT="$HOME${STORAGE_ROOT#\~}"
+fi
+if [ -z "$STORAGE_ROOT" ]; then
+    if [ -n "${HOME:-}" ]; then
+        STORAGE_ROOT="$HOME/.local/share/computemcp"
+    elif [ -n "${COMPUTEMCP_STATE_DIR:-}" ]; then
+        # stop/close/status may arrive with only COMPUTEMCP_STATE_DIR (and no
+        # HOME): derive the storage root from "<storage>/<system>/state" so the
+        # earlier env-less stop path keeps working.
+        STORAGE_ROOT="$(dirname -- "$(dirname -- "$COMPUTEMCP_STATE_DIR")")"
+    else
+        echo 'Neither COMPUTEMCP_STORAGE_ROOT nor HOME is set; provide an absolute COMPUTEMCP_STORAGE_ROOT.' >&2
+        exit 2
+    fi
+fi
+SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
+
+# Runtime name.  Docker is daemon-global and Apptainer instances are per-host,
+# so the target name alone collides for two users on the same node.  The remote
+# numeric uid is the only discriminator available on the remote host and is
+# stable across login and compute nodes; include it.  COMPUTEMCP_CONTAINER_NAME
+# is an optional operator/test override and is validated exactly like the
+# derived value.  Keep this derivation identical to computemcp-container.sh so
+# both scripts agree byte-for-byte.
+REMOTE_UID="$(id -u 2>/dev/null || true)"
+if [ -n "$REMOTE_UID" ]; then
+    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$REMOTE_UID-$SYSTEM}"
+else
+    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$SYSTEM}"
+fi
+if ! { [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && [ "$NAME" != . ] && [ "$NAME" != .. ]; }; then
+    echo "Invalid container name: $NAME" >&2
+    exit 2
+fi
+STATE="${COMPUTEMCP_STATE_DIR:-$SYSTEM_DIR/state}"
+SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"
+HOST_HOME="${COMPUTEMCP_HOST_HOME:-$SYSTEM_DIR/home}"
+RUNTIME="${COMPUTEMCP_CONTAINER_RUNTIME:-}"
+IMAGE="${COMPUTEMCP_IMAGE:-}"
+GPU_VENDORS="${COMPUTEMCP_GPU_VENDORS:-}"
+# Where to build the sandbox: on the login/head node (default) or on the first
+# allocated compute node.  "compute" is required on an architecture-mismatched
+# partition (e.g. an ARM partition whose login nodes are x86-64): a sandbox built
+# on the login node would fail with an opaque "exec format error".  An optional
+# ``compute-node`` alias is normalized to the canonical ``compute``.
+BUILD_LOCATION="${COMPUTEMCP_BUILD_LOCATION:-login}"
+case "$BUILD_LOCATION" in
+    login|compute) ;;
+    compute-node) BUILD_LOCATION=compute ;;
+    *)
+        echo "Invalid COMPUTEMCP_BUILD_LOCATION: $BUILD_LOCATION (expected login or compute)." >&2
+        exit 2
+        ;;
+esac
+CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
+SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
+# Login-node relay port.  A fixed default collides when two bundle targets share
+# one login node, so by default the helper asks the relay for an ephemeral port
+# (0) and learns the concrete port from the ready file.  An explicit
+# COMPUTEMCP_FORWARD_PORT overrides the dynamic choice verbatim (legacy/hand
+# use); it is validated here so an invalid value fails with exit 2.
+FORWARD_PORT_OVERRIDE="${COMPUTEMCP_FORWARD_PORT:-}"
+PORT=0
+if [ -n "$FORWARD_PORT_OVERRIDE" ]; then
+    if ! { [[ "$FORWARD_PORT_OVERRIDE" =~ ^[0-9]+$ ]] &&
+           (( FORWARD_PORT_OVERRIDE >= 1 && FORWARD_PORT_OVERRIDE <= 65535 )); }; then
+        echo "Invalid COMPUTEMCP_FORWARD_PORT: $FORWARD_PORT_OVERRIDE (expected an integer 1..65535)." >&2
+        exit 2
+    fi
+    PORT="$FORWARD_PORT_OVERRIDE"
+fi
+WAIT_SECONDS="${COMPUTEMCP_WAIT_SECONDS:-900}"
+NODES="${COMPUTEMCP_NODES:-1}"
+
+# --- Slurm detection --------------------------------------------------------
+# SLURM mode keeps the allocation/srun/relay path; DIRECT mode (no Slurm on the
+# box) runs the container on this login/remote node and exposes its loopback
+# port.  A configured provision_command is chosen by the gateway before this
+# bundle helper runs, so it still takes precedence.  Detection uses sbatch and
+# srun and never hard-fails a box that lacks them.
+HAVE_SLURM=0
+if command -v sbatch >/dev/null 2>&1 && command -v srun >/dev/null 2>&1; then
+    HAVE_SLURM=1
+fi
+
+# --- Pre-provision environment hook -----------------------------------------
+# The gateway exports COMPUTEMCP_PROVISION_ENV as the configured ``module load``
+# / ``source`` lines joined by newlines (no trailing newline).  Each line runs in
+# THIS shell so the hook takes effect here; set -euo pipefail aborts on failure.
+# The same helper is applied inside computemcp-job.sh, because a login-node
+# module load does not propagate to the compute node.
+apply_provision_env() {
+    [ -n "${COMPUTEMCP_PROVISION_ENV:-}" ] || return 0
+    local LINE
+    while IFS= read -r LINE; do
+        [ -n "$LINE" ] || continue
+        eval "$LINE"
+    done <<< "$COMPUTEMCP_PROVISION_ENV"
+}
+# Invoked below on the provision path, before any runtime/container use.
+
+# Re-export the resolved layout so computemcp-container.sh uses the same paths
+# on the login node and the compute node.
+export COMPUTEMCP_SYSTEM="$SYSTEM"
+export COMPUTEMCP_STATE_DIR="$STATE"
+export COMPUTEMCP_SANDBOX_DIR="$SANDBOX"
+export COMPUTEMCP_HOST_HOME="$HOST_HOME"
+export COMPUTEMCP_CONTAINER_RUNTIME="$RUNTIME"
+export COMPUTEMCP_IMAGE="$IMAGE"
+export COMPUTEMCP_GPU_VENDORS="$GPU_VENDORS"
+export COMPUTEMCP_BUILD_LOCATION="$BUILD_LOCATION"
+export COMPUTEMCP_CONTAINER_PORT="$CONTAINER_PORT"
+export COMPUTEMCP_SSH_WAIT_SECONDS="$SSH_WAIT_SECONDS"
+export COMPUTEMCP_SSH_USER="${COMPUTEMCP_SSH_USER:-ubuntu}"
+# Transport an explicit name override (if any) so computemcp-container.sh uses
+# the same runtime name as this helper in every mode.
+export COMPUTEMCP_CONTAINER_NAME="${COMPUTEMCP_CONTAINER_NAME:-}"
+
+# Resolve the SSH public key to install in the container.  The gateway is
+# expected to inject COMPUTEMCP_SSH_PUBLIC_KEY (or a file path); when it does
+# not, an already configured authorized_keys is reused.
+resolve_ssh_key() {
+    if [ -n "${COMPUTEMCP_SSH_PUBLIC_KEY:-}" ]; then
+        return 0
+    fi
+    if [ -n "${COMPUTEMCP_SSH_PUBLIC_KEY_FILE:-}" ]; then
+        [ -r "$COMPUTEMCP_SSH_PUBLIC_KEY_FILE" ] || {
+            echo "Unreadable SSH public key file: $COMPUTEMCP_SSH_PUBLIC_KEY_FILE" >&2
+            exit 1
+        }
+        COMPUTEMCP_SSH_PUBLIC_KEY="$(head -n 1 "$COMPUTEMCP_SSH_PUBLIC_KEY_FILE")"
+        export COMPUTEMCP_SSH_PUBLIC_KEY
+        return 0
+    fi
+    if [ -s "$HOST_HOME/.ssh/authorized_keys" ]; then
+        COMPUTEMCP_SSH_PUBLIC_KEY="$(head -n 1 "$HOST_HOME/.ssh/authorized_keys")"
+        export COMPUTEMCP_SSH_PUBLIC_KEY
+        return 0
+    fi
+    echo 'No SSH public key available: set COMPUTEMCP_SSH_PUBLIC_KEY.' >&2
+    exit 1
+}
+
+# --- Parse the two argv-style stages ---------------------------------------
+SBATCH_ARGS=()
+if [ -n "${COMPUTEMCP_SBATCH_ARGS:-}" ]; then
+    mapfile -t SBATCH_ARGS <<< "$COMPUTEMCP_SBATCH_ARGS"
+fi
+SRUN_ARGS=()
+if [ -n "${COMPUTEMCP_SRUN_ARGS:-}" ]; then
+    mapfile -t SRUN_ARGS <<< "$COMPUTEMCP_SRUN_ARGS"
+fi
+
+# The relay's data step binding.  Extract a cpu-bind from the rendered SRUN_ARGS
+# when present; otherwise fall back to "none", matching the reference.
+CPU_BIND="none"
+for (( IDX = 0; IDX < ${#SRUN_ARGS[@]}; IDX++ )); do
+    ARG="${SRUN_ARGS[IDX]}"
+    case "$ARG" in
+        --cpu-bind=*) CPU_BIND="${ARG#--cpu-bind=}" ;;
+        --cpu-bind) if (( IDX + 1 < ${#SRUN_ARGS[@]} )); then CPU_BIND="${SRUN_ARGS[IDX + 1]}"; fi ;;
+    esac
+done
+export COMPUTEMCP_CPU_BIND="$CPU_BIND"
+
+# Manual/legacy resource fallback.  It fills SBATCH_ARGS ONLY when the gateway
+# provided no COMPUTEMCP_SBATCH_ARGS, so it cannot double-request resources
+# alongside the gateway-rendered deck.  The variable names match the manual
+# overrides of the reference scripts (COMPUTEMCP_ACCOUNT, COMPUTEMCP_PARTITION,
+# ...).  It deliberately does not read the plan variables (CPUS_PER_NODE,
+# GPUS_PER_NODE, MEMORY_PER_NODE_MIB): those describe the calculated plan,
+# which the design says must NOT be silently turned into a scheduler request.
+if [ "${#SBATCH_ARGS[@]}" -eq 0 ]; then
+    LEGACY_CPUS="${COMPUTEMCP_CPUS:-}"
+    LEGACY_MEMORY="${COMPUTEMCP_MEMORY:-}"
+    LEGACY_GPUS="${COMPUTEMCP_GPUS:-}"
+    LEGACY_TIME="${COMPUTEMCP_TIME_LIMIT:-}"
+    [ -z "${COMPUTEMCP_PARTITION:-}" ] || SBATCH_ARGS+=(--partition="$COMPUTEMCP_PARTITION")
+    [ -z "${COMPUTEMCP_ACCOUNT:-}" ] || SBATCH_ARGS+=(--account="$COMPUTEMCP_ACCOUNT")
+    [ -z "$LEGACY_CPUS" ] || SBATCH_ARGS+=(--cpus-per-task="$LEGACY_CPUS")
+    [ -z "$LEGACY_GPUS" ] || SBATCH_ARGS+=(--gres="gpu:$LEGACY_GPUS")
+    [ -z "$LEGACY_MEMORY" ] || SBATCH_ARGS+=(--mem="$LEGACY_MEMORY")
+    [ -z "$LEGACY_TIME" ] || SBATCH_ARGS+=(--time="$LEGACY_TIME")
+fi
+
+# --- Validation -------------------------------------------------------------
+[[ "$NODES" =~ ^[0-9]+$ ]] || { echo "Invalid node count: $NODES" >&2; exit 2; }
+if (( NODES > 1 )); then
+    echo 'multi-node not yet supported: requested COMPUTEMCP_NODES='"$NODES" >&2
+    exit 2
+fi
+for VALUE in "$CONTAINER_PORT" "$SSH_WAIT_SECONDS" "$PORT" "$WAIT_SECONDS"; do
+    [[ "$VALUE" =~ ^[0-9]+$ ]] || { echo "Expected integer: $VALUE" >&2; exit 2; }
+done
+# PORT == 0 means "ephemeral, choose it on the login node"; the concrete port is
+# learned from the relay ready file before it is ever reported.  An explicit
+# override was already validated to 1..65535 above.
+(( CONTAINER_PORT >= 1024 && CONTAINER_PORT <= 65535 && PORT >= 0 && PORT <= 65535 &&
+   SSH_WAIT_SECONDS > 0 && WAIT_SECONDS > 0 )) || {
+    echo 'Invalid timeout or port configuration.' >&2
+    exit 2
+}
+[ "$PORT" != "$CONTAINER_PORT" ] || { echo 'Forward and container ports must differ.' >&2; exit 2; }
+
+# The relay and batch script are only needed in Slurm mode; direct mode neither
+# submits an allocation nor starts a relay.
+if [ "$HAVE_SLURM" = 1 ]; then
+    for CMD in sbatch squeue scancel python3 flock; do command -v "$CMD" >/dev/null; done
+    for FILE in "$RELAY" "$JOB_SCRIPT"; do
+        [ -r "$FILE" ] || { echo "Missing/unreadable helper: $FILE" >&2; exit 1; }
+    done
+else
+    for CMD in python3 flock; do command -v "$CMD" >/dev/null; done
+fi
+[ -r "$CONTAINER_SCRIPT" ] || { echo "Missing/unreadable helper: $CONTAINER_SCRIPT" >&2; exit 1; }
+
+mkdir -p "$STATE"
+
+# --- Locking and job helpers ------------------------------------------------
+exec 9>"$STATE/provision.lock"
+flock -w "$WAIT_SECONDS" 9
+
+JOBID="$(cat "$STATE/jobid" 2>/dev/null || true)"
+CLUSTER="$(cat "$STATE/cluster" 2>/dev/null || true)"
+MODE="$(cat "$STATE/mode" 2>/dev/null || true)"
+[[ -z "$JOBID" || "$JOBID" =~ ^[0-9]+$ ]] || { echo 'Invalid tracked job ID.' >&2; exit 1; }
+[[ -z "$CLUSTER" || "$CLUSTER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'Invalid tracked cluster.' >&2; exit 1; }
+[[ -z "$MODE" || "$MODE" = slurm || "$MODE" = direct ]] || { echo 'Invalid tracked mode.' >&2; exit 1; }
+# A previously tracked direct target stays direct for stop/status even if Slurm
+# appears on PATH later; freshly provisioned targets use current detection.
+[ -n "$MODE" ] || { [ "$HAVE_SLURM" = 1 ] && MODE=slurm || MODE=direct; }
+
+# --- Runtime derivation for stop/close/status -------------------------------
+# The gateway may invoke stop/close without the COMPUTEMCP_* environment (the
+# earlier "must be apptainer or docker" failure).  For these actions only,
+# derive the runtime from the value recorded at provision time, or from
+# whichever runtime is installed, so the container is still stopped.  The
+# provision action keeps its strict checks: an empty runtime there is an error.
+if [ "$ACTION" = stop ] || [ "$ACTION" = close ] || [ "$ACTION" = status ]; then
+    if [ -z "$RUNTIME" ] && [ -s "$STATE/container.runtime" ]; then
+        RECORDED_RUNTIME="$(head -n 1 "$STATE/container.runtime" || true)"
+        case "$RECORDED_RUNTIME" in
+            apptainer|docker) RUNTIME="$RECORDED_RUNTIME" ;;
+        esac
+    fi
+    if [ -z "$RUNTIME" ]; then
+        if command -v docker >/dev/null 2>&1; then
+            RUNTIME=docker
+        elif command -v apptainer >/dev/null 2>&1; then
+            RUNTIME=apptainer
+        fi
+    fi
+    export COMPUTEMCP_CONTAINER_RUNTIME="$RUNTIME"
+    # computemcp-container.sh derives its own STATE from
+    # STORAGE_ROOT/SYSTEM, not from COMPUTEMCP_STATE_DIR; re-export the values
+    # implied by the state dir so the container script targets the same paths.
+    if [ -n "${COMPUTEMCP_STATE_DIR:-}" ]; then
+        DERIVED_SYSTEM_DIR="$(dirname -- "$COMPUTEMCP_STATE_DIR")"
+        DERIVED_ROOT="$(dirname -- "$DERIVED_SYSTEM_DIR")"
+        export COMPUTEMCP_SYSTEM="$SYSTEM"
+        export COMPUTEMCP_STORAGE_ROOT="$DERIVED_ROOT"
+        export COMPUTEMCP_STATE_DIR="$STATE"
+        export COMPUTEMCP_SANDBOX_DIR="$SANDBOX"
+        export COMPUTEMCP_HOST_HOME="$HOST_HOME"
+        export COMPUTEMCP_CONTAINER_PORT="$CONTAINER_PORT"
+    fi
+fi
+
+# --- Resolve the container's real loopback endpoint -------------------------
+# Direct mode publishes the container on a real host port.  Docker assigns an
+# ephemeral host port for ``--publish 127.0.0.1::<port>``, so the container
+# port is NOT the endpoint; the container script records the mapping in
+# ``$STATE/container.endpoint`` on start.  The live runtime query is
+# authoritative: if the Docker daemon restarts, the container is re-published
+# on a NEW ephemeral host port, so the cached file goes stale and the gateway
+# would forward to a dead port (exec/files 502) until it is refreshed.  The
+# file is therefore only a fallback for when the daemon is unavailable; any
+# live mapping that differs is written back so ``status`` and later calls stay
+# consistent.  Apptainer binds the fixed loopback port, so it never needs a
+# live query or the file.
+is_valid_endpoint() {
+    local VALUE="$1" ENDPOINT_PORT="${1##*:}"
+    [[ "$VALUE" =~ ^127\.0\.0\.1:[0-9]{1,5}$ ]] || return 1
+    [[ "$ENDPOINT_PORT" =~ ^[0-9]+$ ]] || return 1
+    (( ENDPOINT_PORT >= 1 && ENDPOINT_PORT <= 65535 ))
+}
+
+resolve_container_endpoint() {
+    local CACHED="" LINE=""
+    # The cached mapping is read once and used only as a fallback now.
+    if [ -s "$STATE/container.endpoint" ]; then
+        CACHED="$(head -n 1 "$STATE/container.endpoint" || true)"
+        is_valid_endpoint "$CACHED" || CACHED=""
+    fi
+    case "$RUNTIME" in
+        docker)
+            # Query the daemon first; it knows the current published port even
+            # after a daemon restart changed it.
+            if command -v docker >/dev/null 2>&1; then
+                while IFS= read -r LINE; do
+                    if is_valid_endpoint "$LINE"; then
+                        if [ "$LINE" != "$CACHED" ]; then
+                            printf '%s\n' "$LINE" > "$STATE/container.endpoint"
+                        fi
+                        printf '%s\n' "$LINE"
+                        return 0
+                    fi
+                done < <(docker container port "$NAME" "$CONTAINER_PORT/tcp" 2>/dev/null || true)
+            fi
+            # Daemon unavailable: fall back to the cached mapping, then to the
+            # container port.
+            if [ -n "$CACHED" ]; then
+                printf '%s\n' "$CACHED"
+                return 0
+            fi
+            printf '127.0.0.1:%s\n' "$CONTAINER_PORT"
+            return 0
+            ;;
+        apptainer)
+            # Apptainer binds the fixed ``127.0.0.1:$CONTAINER_PORT``; a live
+            # query is unnecessary and the file is not consulted.
+            printf '127.0.0.1:%s\n' "$CONTAINER_PORT"
+            return 0
+            ;;
+    esac
+    if [ -n "$CACHED" ]; then
+        printf '%s\n' "$CACHED"
+        return 0
+    fi
+    return 1
+}
+
+SQUEUE_ARGS=(--noheader --user "$(id -un)" --format '%i|%T')
+[ -z "$CLUSTER" ] || SQUEUE_ARGS+=(--clusters="$CLUSTER")
+job_state() {
+    squeue "${SQUEUE_ARGS[@]}" 2>/dev/null |
+        awk -F '|' -v job="$JOBID" '$1 == job {print $2}'
+}
+relay_running() {
+    local PID
+    PID="$(cat "$STATE/relay.pid" 2>/dev/null || true)"
+    [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" 2>/dev/null &&
+        [ -r "/proc/$PID/cmdline" ] &&
+        tr '\0' '\n' < "/proc/$PID/cmdline" |
+        grep -Fxq -e "$RELAY" -e "$STATE/relay.py"
+}
+# Read the relay's ready file ("<pid> <port>\n") and echo the concrete bound
+# port.  Returns non-zero when the file is missing or malformed, so callers can
+# fall back rather than trusting a stale or empty value.
+relay_ready_port() {
+    local LINE READY_PID READY_PORT
+    [ -s "$STATE/relay.ready" ] || return 1
+    read -r READY_PID READY_PORT < "$STATE/relay.ready" || true
+    [[ "$READY_PORT" =~ ^[0-9]+$ ]] || return 1
+    (( READY_PORT >= 1 && READY_PORT <= 65535 )) || return 1
+    printf '%s\n' "$READY_PORT"
+}
+stop_relay() {
+    if relay_running; then
+        kill "$(cat "$STATE/relay.pid")"
+        for (( I = 0; I < 50; I++ )); do relay_running || break; sleep 0.1; done
+    fi
+    rm -f "$STATE/relay.pid" "$STATE/tunnel-job" "$STATE/relay.ready" "$STATE/relay.port"
+}
+
+# --- Non-provision actions --------------------------------------------------
+if [ "$ACTION" = stop ] || [ "$ACTION" = close ]; then
+    if [ "$MODE" = direct ]; then
+        # Direct mode: stop the container that runs on this remote node.
+        bash "$CONTAINER_SCRIPT" stop
+        echo "Stopped direct container ${SYSTEM}; files remain." >&2
+        exit 0
+    fi
+    SCANCEL_ARGS=("$JOBID")
+    [ -z "$CLUSTER" ] || SCANCEL_ARGS=(--clusters="$CLUSTER" "$JOBID")
+    if [ -n "$JOBID" ] && [ -n "$(job_state)" ]; then
+        scancel "${SCANCEL_ARGS[@]}"
+    fi
+    stop_relay
+    echo "Stopped tracked job ${JOBID:-none} and relay; container files remain." >&2
+    exit 0
+fi
+
+if [ "$ACTION" = status ]; then
+    if [ "$MODE" = direct ]; then
+        ENDPOINT="$(resolve_container_endpoint || true)"
+        [ -n "$ENDPOINT" ] || ENDPOINT="127.0.0.1:$CONTAINER_PORT"
+        printf 'mode: direct\nstate: %s\nendpoint: %s\n' \
+            "$([ -s "$STATE/container.endpoint" ] && echo running || echo stopped)" \
+            "$ENDPOINT"
+        exit 0
+    fi
+    printf 'jobid: %s\ncluster: %s\nstate: %s\n' \
+        "${JOBID:-none}" "${CLUSTER:-none}" "$(job_state || true)"
+    if [ -s "$STATE/ready-$JOBID" ]; then
+        printf 'node: %s\n' "$(cat "$STATE/ready-$JOBID")"
+    fi
+    # Slurm mode reports the persisted concrete relay port, not the request
+    # value (which may be the ephemeral sentinel 0 before a relay runs).
+    STATUS_PORT="$(relay_ready_port 2>/dev/null || true)"
+    if [ -z "$STATUS_PORT" ] && [ -s "$STATE/relay.port" ]; then
+        STATUS_PORT="$(head -n 1 "$STATE/relay.port" 2>/dev/null || true)"
+    fi
+    if [ -z "$STATUS_PORT" ] && [ -n "$FORWARD_PORT_OVERRIDE" ]; then
+        STATUS_PORT="$FORWARD_PORT_OVERRIDE"
+    fi
+    [ -n "$STATUS_PORT" ] || STATUS_PORT=none
+    printf 'endpoint: 127.0.0.1:%s\n' "$STATUS_PORT"
+    exit 0
+fi
+
+# --- Auto-build the container on the login node, then configure the SSH key -
+runtime_tool() {
+    case "$RUNTIME" in
+        apptainer) command -v apptainer >/dev/null || { echo 'apptainer not found.' >&2; exit 1; } ;;
+        docker)    command -v docker >/dev/null    || { echo 'docker not found.' >&2; exit 1; } ;;
+        *)
+            if command -v apptainer >/dev/null; then RUNTIME=apptainer
+            elif command -v docker >/dev/null; then RUNTIME=docker
+            else echo 'Set COMPUTEMCP_CONTAINER_RUNTIME to apptainer or docker.' >&2; exit 1
+            fi
+            export COMPUTEMCP_CONTAINER_RUNTIME="$RUNTIME"
+            ;;
+    esac
+}
+container_missing() {
+    case "$RUNTIME" in
+        apptainer) [ ! -d "$SANDBOX" ] ;;
+        docker)    ! docker image inspect "${NAME,,}:latest" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A compute-node build needs an allocation.  Slurm mode sets COMPUTE_BUILD=1 and
+# the login node then skips the build when the sandbox is missing; the batch job
+# builds and configures it on the first allocated node.  Direct mode has no
+# allocation, so ``build-location = compute`` is contradictory there: warn and
+# fall back to the default login-node build so direct mode keeps working.
+COMPUTE_BUILD=0
+if [ "$BUILD_LOCATION" = compute ]; then
+    if [ "$HAVE_SLURM" = 1 ]; then
+        COMPUTE_BUILD=1
+    else
+        echo "WARNING: build-location = compute requires Slurm; falling back to building on the login/remote node." >&2
+    fi
+fi
+
+ensure_container() {
+    runtime_tool
+    [ -n "$IMAGE" ] || { echo 'COMPUTEMCP_IMAGE is required.' >&2; exit 1; }
+    resolve_ssh_key
+    # Compute-node build.  If the sandbox is missing, do NOT build it here: the
+    # architecture may differ from the compute node, and the batch job builds and
+    # configures it inside the allocation (so skip configure too -- there is
+    # nothing to edit yet).  If it already exists, configure still runs on the
+    # login node: configure only rewrites architecture-independent files with
+    # the host python3 (sandbox passwd/shadow and the container
+    # authorized_keys), so it is safe and refreshes the key before the job.
+    if [ "$COMPUTE_BUILD" = 1 ]; then
+        if container_missing; then
+            echo "Sandbox missing; it will be built on the compute node (build-location = compute)." >&2
+            return 0
+        fi
+        echo "Container present; configuring it on the login node." >&2
+        bash "$CONTAINER_SCRIPT" configure
+        return 0
+    fi
+    if container_missing; then
+        echo "Container missing; building it on the login node." >&2
+        bash "$CONTAINER_SCRIPT" build
+    else
+        echo "Container present; configuring it on the login node." >&2
+        bash "$CONTAINER_SCRIPT" configure
+    fi
+}
+
+# --- Direct (non-Slurm) mode helpers ---------------------------------------
+# return 0 when the container runs on THIS node, 1 when it is present but
+# stopped, 2 when it does not exist.
+container_state() {
+    case "$RUNTIME" in
+        apptainer)
+            if apptainer instance list 2>/dev/null | awk -v NAME="$NAME" '$1 == NAME {FOUND=1} END {exit !FOUND}'; then
+                return 0
+            fi
+            [ -d "$SANDBOX" ] && return 1
+            return 2
+            ;;
+        docker)
+            if docker container inspect "$NAME" >/dev/null 2>&1; then
+                [ "$(docker container inspect --format '{{.State.Running}}' "$NAME")" = true ] && return 0
+                return 1
+            fi
+            return 2
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+# Idempotent direct-mode provision: build when missing, start when stopped,
+# reuse when running; then re-emit the container's own loopback endpoint so the
+# gateway can forward to it.  A login-node module load does not propagate to a
+# compute node, but direct mode runs the container right here.
+direct_provision() {
+    # ensure_container already built/configured the container above, so here a
+    # stopped container is started and a running one reused (no rebuild).
+    if container_state; then
+        echo "Reusing running container $NAME." >&2
+    else
+        echo "Starting container $NAME on the remote node." >&2
+        bash "$CONTAINER_SCRIPT" start
+    fi
+    # Record the runtime so a later stop/status invoked without the gateway
+    # environment still knows which runtime to use.
+    printf '%s\n' "$RUNTIME" > "$STATE/container.runtime"
+    local ENDPOINT
+    ENDPOINT="$(resolve_container_endpoint)" || {
+        echo "Could not determine the container endpoint for $NAME." >&2
+        exit 1
+    }
+    printf 'ENDPOINT %s\n' "$ENDPOINT"
+}
+
+# --- Per-job SRUN settings file --------------------------------------------
+write_settings() {
+    local FILE="$1" ARG
+    {
+        printf '# computeMCP per-job settings for job %s\n' "$JOBID"
+        printf '# Sourced by computemcp-job.sh; generated by computemcp-provision.sh.\n'
+        printf 'export COMPUTEMCP_SYSTEM=%q\n' "$SYSTEM"
+        # Carry the already-resolved absolute login-node storage root so the
+        # compute-node container script never needs HOME (Slurm may strip it
+        # with --export=NONE / a custom export policy).
+        printf 'export COMPUTEMCP_STORAGE_ROOT=%q\n' "$STORAGE_ROOT"
+        printf 'export COMPUTEMCP_STATE_DIR=%q\n' "$STATE"
+        printf 'export COMPUTEMCP_BUNDLE_DIR=%q\n' "$COMPUTEMCP_BUNDLE_DIR"
+        printf 'export COMPUTEMCP_SANDBOX_DIR=%q\n' "$SANDBOX"
+        printf 'export COMPUTEMCP_HOST_HOME=%q\n' "$HOST_HOME"
+        printf 'export COMPUTEMCP_CONTAINER_RUNTIME=%q\n' "$RUNTIME"
+        printf 'export COMPUTEMCP_IMAGE=%q\n' "$IMAGE"
+        printf 'export COMPUTEMCP_GPU_VENDORS=%q\n' "$GPU_VENDORS"
+        printf 'export COMPUTEMCP_BUILD_LOCATION=%q\n' "$BUILD_LOCATION"
+        printf 'export COMPUTEMCP_CPUS_PER_NODE=%q\n' "${COMPUTEMCP_CPUS_PER_NODE:-}"
+        printf 'export COMPUTEMCP_GPUS_PER_NODE=%q\n' "${COMPUTEMCP_GPUS_PER_NODE:-}"
+        printf 'export COMPUTEMCP_MEMORY_PER_NODE_MIB=%q\n' "${COMPUTEMCP_MEMORY_PER_NODE_MIB:-}"
+        printf 'export COMPUTEMCP_CONTAINER_PORT=%q\n' "$CONTAINER_PORT"
+        printf 'export COMPUTEMCP_SSH_WAIT_SECONDS=%q\n' "$SSH_WAIT_SECONDS"
+        printf 'export COMPUTEMCP_SSH_USER=%q\n' "${COMPUTEMCP_SSH_USER:-ubuntu}"
+        printf 'export COMPUTEMCP_SSH_PUBLIC_KEY=%q\n' "${COMPUTEMCP_SSH_PUBLIC_KEY:-}"
+        printf 'export COMPUTEMCP_CPU_BIND=%q\n' "$CPU_BIND"
+        printf 'export COMPUTEMCP_SRUN_ARGS=%q\n' "${COMPUTEMCP_SRUN_ARGS:-}"
+        # The login-node hook must run again on the compute node; %q transports
+        # the newline-joined lines verbatim through this settings file.
+        printf 'export COMPUTEMCP_PROVISION_ENV=%q\n' "${COMPUTEMCP_PROVISION_ENV:-}"
+    } > "$FILE.tmp"
+    mv -- "$FILE.tmp" "$FILE"
+    chmod 600 "$FILE"
+}
+
+# --- Provision: direct mode or Slurm allocation ----------------------------
+if [ "$ACTION" = provision ]; then
+    # Run the pre-provision hook in this shell before any runtime/container use,
+    # so ``module load`` and ``source`` are in effect for ensure_container and
+    # the runtime checks that follow.
+    apply_provision_env
+
+    # Build/configure the container on this login/remote node in both modes:
+    # Slurm starts it later inside the allocation, direct mode starts it here.
+    ensure_container
+
+    if [ "$HAVE_SLURM" != 1 ]; then
+        # DIRECT mode: no sbatch/srun/relay; run the container on this node and
+        # expose its own loopback port, so the gateway forwards to it.
+        printf '%s\n' direct > "$STATE/mode"
+        direct_provision "$@"
+        exit 0
+    fi
+    printf '%s\n' slurm > "$STATE/mode"
+
+    case "$(job_state)" in
+        PENDING|RUNNING|CONFIGURING) echo "Reusing tracked job $JOBID ($(job_state))." >&2 ;;
+        COMPLETING|SUSPENDED|STOPPED) echo "Job $JOBID cannot be reused; stop it first." >&2; exit 1 ;;
+        *) JOBID=""; CLUSTER="" ;;
+    esac
+
+    # Report, never silently drop, a half-started allocation.  Installed before
+    # submission so a failure after sbatch (or jobid write) still reports it.
+    report_job() {
+        echo "Allocation state: job ${JOBID:-none} cluster ${CLUSTER:-none}; settings ${STATE}/srun-$SYSTEM.settings" >&2
+    }
+    trap 'STATUS=$?; if (( STATUS != 0 )); then report_job; fi' EXIT
+
+    if [ -z "$JOBID" ]; then
+        stop_relay
+        SETTINGS="$STATE/srun-$SYSTEM.settings"        HELPER_ARGS=(--parsable --job-name="$NAME")
+        sbatch_has() {
+            local WANTED="$1" ARG
+            for ARG in "${SBATCH_ARGS[@]}"; do
+                case "$ARG" in "$WANTED"|"$WANTED"=*) return 0 ;; esac
+            done
+            return 1
+        }
+        sbatch_has --output || sbatch_has -o || HELPER_ARGS+=(--output="$STATE/slurm-%j.log")
+        sbatch_has --error  || sbatch_has -e || HELPER_ARGS+=(--error="$STATE/slurm-%j.log")
+        # Write the settings file BEFORE sbatch: a fast scheduler can start the
+        # job step before a post-submission write lands, and job.sh sources it.
+        write_settings "$SETTINGS"
+        RESULT="$(sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
+        JOBID="${RESULT%%;*}"
+        [[ "$JOBID" =~ ^[0-9]+$ ]] || { echo "Invalid sbatch result: $RESULT" >&2; exit 1; }
+        if [[ "$RESULT" == *';'* ]]; then CLUSTER="${RESULT#*;}"; fi
+        printf '%s\n' "$JOBID" > "$STATE/jobid"
+        printf '%s\n' "$CLUSTER" > "$STATE/cluster"
+        echo "Submitted job $JOBID (cluster ${CLUSTER:-default}). Settings: $SETTINGS" >&2
+    fi
+
+    END=$((SECONDS + WAIT_SECONDS))
+    NODE=""
+    while (( SECONDS < END )); do
+        case "$(job_state)" in
+            RUNNING)
+                if [ -s "$STATE/ready-$JOBID" ]; then read -r NODE < "$STATE/ready-$JOBID"; break; fi
+                ;;
+            PENDING|CONFIGURING) ;;
+            *)
+                tail -n 60 "$STATE/slurm-$JOBID.log" >&2 2>/dev/null || true
+                report_job
+                exit 1
+                ;;
+        esac
+        sleep 5
+    done
+    [ -n "$NODE" ] || { echo "Timed out waiting for job $JOBID; it stays tracked for the next call." >&2; exit 1; }
+    [[ "$NODE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "Invalid node name: $NODE" >&2; exit 1; }
+
+    # Resolve the login-node relay port.  Explicit override wins (already
+    # validated).  Otherwise reuse the recorded port when the tracked relay is
+    # still running, so a reconnect does not churn the relay or move the
+    # endpoint; every other case asks the relay for a fresh ephemeral port.
+    if [ -z "$FORWARD_PORT_OVERRIDE" ]; then
+        if relay_running && [ -s "$STATE/relay.port" ]; then
+            RECORDED_PORT="$(head -n 1 "$STATE/relay.port" 2>/dev/null || true)"
+            if [[ "$RECORDED_PORT" =~ ^[0-9]+$ ]] &&
+               (( RECORDED_PORT >= 1 && RECORDED_PORT <= 65535 )); then
+                PORT="$RECORDED_PORT"
+            else
+                PORT=0
+            fi
+        else
+            PORT=0
+        fi
+    fi
+
+    WANTED="$JOBID $NODE $PORT $CONTAINER_PORT"
+    if ! relay_running || [ "$(cat "$STATE/tunnel-job" 2>/dev/null || true)" != "$WANTED" ]; then
+        stop_relay
+        nohup python3 "$RELAY" "$PORT" "$JOBID" "$NODE" "$STATE/relay.ready" \
+            </dev/null >>"$STATE/relay.log" 2>&1 9>&- &
+        printf '%s\n' "$!" > "$STATE/relay.pid"
+        for (( I = 0; I < 50; I++ )); do
+            [ -s "$STATE/relay.ready" ] && break
+            kill -0 "$(cat "$STATE/relay.pid")" 2>/dev/null || break
+            sleep 0.1
+        done
+        if ! { relay_running && [ -s "$STATE/relay.ready" ]; }; then
+            echo "Relay failed; see $STATE/relay.log" >&2
+            stop_relay
+            exit 1
+        fi
+    fi
+
+    # The relay owns the concrete port (it may have chosen an ephemeral one).
+    # Read it back from the ready file and persist it, then use it everywhere
+    # below so ENDPOINT and --check never carry the request value 0.
+    PARSED_PORT="$(relay_ready_port || true)"
+    if [ -z "$PARSED_PORT" ]; then
+        echo "Relay ready file $STATE/relay.ready is missing or malformed." >&2
+        if [ -n "$FORWARD_PORT_OVERRIDE" ]; then
+            PORT="$FORWARD_PORT_OVERRIDE"
+        else
+            echo "Cannot determine the relay port; see $STATE/relay.log" >&2
+            stop_relay
+            exit 1
+        fi
+    else
+        PORT="$PARSED_PORT"
+    fi
+    # Persist the concrete port only after the relay is confirmed started; a
+    # fresh provision after stop removes it and picks a new ephemeral port.
+    PORT_TMP="$STATE/relay.port.tmp.$$"
+    printf '%s\n' "$PORT" > "$PORT_TMP"
+    mv -f "$PORT_TMP" "$STATE/relay.port"
+    WANTED="$JOBID $NODE $PORT $CONTAINER_PORT"
+    printf '%s\n' "$WANTED" > "$STATE/tunnel-job"
+
+    READY=0
+    for (( I = 0; I < 3; I++ )); do
+        if python3 "$RELAY" --check "$PORT"; then READY=1; break; fi
+        relay_running || { echo "Relay failed; see $STATE/relay.log" >&2; exit 1; }
+        sleep 1
+    done
+    [ "$READY" = 1 ] || { echo 'Container SSH endpoint is unavailable.' >&2; exit 1; }
+
+    trap - EXIT
+    echo "Ready: job $JOBID on $NODE, local port $PORT." >&2
+    printf 'ENDPOINT 127.0.0.1:%s\n' "$PORT"
+    exit 0
+fi
+
+# --- Interactive shell into the tracked allocation -------------------------
+if [ "$ACTION" = shell ]; then
+    [ -n "$JOBID" ] || { echo 'No tracked job; run provision first.' >&2; exit 1; }
+    NODE=""
+    [ -s "$STATE/ready-$JOBID" ] && read -r NODE < "$STATE/ready-$JOBID"
+    [ -n "$NODE" ] || { echo 'Tracked job has no ready node.' >&2; exit 1; }
+    exec srun --jobid="$JOBID" --overlap --nodes=1 --ntasks=1 --cpus-per-task=1 \
+        --cpu-bind="$CPU_BIND" --nodelist="$NODE" --pty \
+        bash "$CONTAINER_SCRIPT" shell
+fi

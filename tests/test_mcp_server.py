@@ -134,3 +134,22 @@ async def test_download_tree_recursive(tmp_path):
     assert report["downloaded"] == 2
     assert (out / "a.txt").read_bytes() == b"A"
     assert (out / "sub" / "b.bin").read_bytes() == b"\x00\x01\x02"
+
+
+async def test_target_status_tool_docs_cover_container_login_user_and_endpoint():
+    """The target/status descriptions document the container fields.
+
+    Agents learn the tool surface from the docstrings, so they must explain the
+    in-container login account (`container_user`) and the resolved
+    `provisioned_endpoint`; this locks the added documentation in.
+    """
+    from compute_mcp.mcp_server import build_server
+
+    server = build_server(None)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+
+    for name in ("computeMCP_targets", "computeMCP_status"):
+        description = tools[name].description or ""
+        assert "container_user" in description, name
+        assert "provisioned_endpoint" in description, name
+        assert "container" in description, name

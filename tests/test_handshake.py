@@ -65,6 +65,9 @@ async def test_handshake_end_to_end(tmp_path):
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         """
+        [server]
+        allow_enrollment = true
+
         [clients.admin]
         token = "admin-token"
         targets = ["*"]

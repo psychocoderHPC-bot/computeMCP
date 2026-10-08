@@ -17,17 +17,26 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
 from . import __version__
 from .auth import AuthError, Authenticator, Client, ForbiddenTarget
+from .allocation import (
+    compute_plan,
+    plan_summary,
+    render_args,
+    validate_conflicts,
+)
+from .bundle import BundleError, public_key_for
 from .config import (
     ConfigError,
     GatewayConfig,
     TargetConfig,
     append_client,
     append_token_hash,
+    container_login_user,
     default_config_path,
     default_token_path,
     load_config,
@@ -66,15 +75,141 @@ log = logging.getLogger("compute_mcp.gateway")
 RECOVERY_POLL_SECONDS = 5.0
 
 
+def _container_env_fields(target: TargetConfig) -> dict[str, str]:
+    """The container-description fields of the gateway->provisioner contract.
+
+    Shared by :func:`build_provision_env` (plan/argv path) and
+    ``Gateway._target_provision_env`` (best-effort path) so the two cannot
+    drift.  ``COMPUTEMCP_SSH_USER`` is emitted only when a container or bundle
+    block is present, matching the dialable-account rule.
+    """
+    container = target.container
+    fields = {
+        "COMPUTEMCP_CONTAINER_RUNTIME": container.runtime if container else "",
+        "COMPUTEMCP_STORAGE_ROOT": (container.storage_root or "") if container else "",
+        "COMPUTEMCP_IMAGE": (container.image or "") if container else "",
+        "COMPUTEMCP_GPU_VENDORS": ",".join(container.gpus) if container else "",
+        "COMPUTEMCP_HOST_HOME": (container.host_home or "") if container else "",
+        "COMPUTEMCP_SANDBOX": (
+            "true" if container is not None and container.sandbox else "false"
+        ),
+        # Where the provisioning helper builds the sandbox: "login" (default)
+        # builds on the login/head node; "compute" lets the batch job build it
+        # on the compute node (required on an architecture-mismatched partition).
+        # Kept in this shared helper so the dial and provision paths cannot drift.
+        "COMPUTEMCP_BUILD_LOCATION": (
+            container.build_location if container is not None else "login"
+        ),
+    }
+    if target.container is not None or target.bundle is not None:
+        # The container sshd allows only its own login account (default
+        # ``ubuntu``); the helper creates it and AllowUsers it.  The gateway
+        # dials the container as the same account, resolved through the single
+        # ``container_login_user`` source of truth so the two cannot drift.
+        fields["COMPUTEMCP_SSH_USER"] = container_login_user(target)
+    return fields
+
+
+def build_provision_env(target: TargetConfig, plan, sbatch_args, srun_args) -> dict[str, str]:
+    """Build the gateway -> provisioner environment contract.
+
+    The gateway converts the resolved plan, the rendered per-stage arguments
+    and the container description into ``COMPUTEMCP_*`` variables that the
+    trusted provisioning command consumes (see the design doc,
+    "Gateway-to-provisioner interface").  Only the two ARGS variables and the
+    plan/container variables are emitted: nothing here can collide with a user
+    environment variable.
+
+    ``COMPUTEMCP_SBATCH_ARGS`` / ``COMPUTEMCP_SRUN_ARGS`` carry one complete
+    argument per newline with no trailing newline; an empty string means an
+    empty argument list.  The two stages are rendered independently and never
+    copied between each other.  Numeric per-node fields become an empty string
+    when the plan has no value; ``COMPUTEMCP_NODES``, ``COMPUTEMCP_EXCLUSIVE``
+    and ``COMPUTEMCP_MODE`` are always concrete.
+    """
+    def _num(value) -> str:
+        return "" if value is None else str(value)
+
+    env = {
+        "COMPUTEMCP_SBATCH_ARGS": "\n".join(sbatch_args),
+        "COMPUTEMCP_SRUN_ARGS": "\n".join(srun_args),
+        "COMPUTEMCP_NODES": str(plan.nodes),
+        "COMPUTEMCP_CPUS_PER_NODE": _num(plan.cpus_per_node),
+        "COMPUTEMCP_GPUS_PER_NODE": _num(plan.gpus_per_node),
+        "COMPUTEMCP_MEMORY_PER_NODE_MIB": _num(plan.memory_per_node_mib),
+        "COMPUTEMCP_EXCLUSIVE": "true" if plan.exclusive else "false",
+        "COMPUTEMCP_MODE": plan.mode,
+        "COMPUTEMCP_SYSTEM": target.name,
+    }
+    env.update(_container_env_fields(target))
+    # A deployed bundle target gets the container's authorized public key derived
+    # from the target's SSH client key, so no per-site key placement is needed.
+    # An explicit provision_command target keeps the previous environment.
+    if target.bundle is not None:
+        try:
+            public_key = public_key_for(target)
+        except BundleError as exc:
+            raise ConfigError(str(exc)) from exc
+        if public_key:
+            env["COMPUTEMCP_SSH_PUBLIC_KEY"] = public_key
+        # Pre-provision hooks run on the remote before the container runtime is
+        # used.  The joined lines carry no trailing newline; an empty tuple
+        # yields an empty string, which the helper treats as a no-op.
+        env["COMPUTEMCP_PROVISION_ENV"] = "\n".join(target.bundle.provision_env)
+    # A shell string cannot carry NUL or carriage return; refuse both here
+    # (HTTP 400 at the edge) rather than let them reach the trusted provision
+    # command (a CR in a value could smuggle an extra shell line).  LF stays
+    # allowed: it is the intentional delimiter of the two ARGS variables, whose
+    # individual arguments are already validated (allocation.py).
+    for name, value in env.items():
+        if "\x00" in value or "\r" in value:
+            raise ConfigError(
+                f"provisioning environment {name!r} contains a NUL byte or "
+                f"carriage return"
+            )
+        if "\x00" in name or "\r" in name:
+            raise ConfigError(
+                f"provisioning environment name {name!r} contains a NUL byte "
+                f"or carriage return"
+            )
+    return env
+
+
+def plan_signature(summary: dict | None) -> tuple | None:
+    """Effective per-node request of a stored plan summary, for mismatch checks.
+
+    Two override sets that resolve to the same concrete request are a no-op;
+    only a value difference requires a refresh.
+    """
+    if not summary:
+        return None
+    plan = summary.get("plan") or {}
+    return (
+        plan.get("nodes"),
+        plan.get("cpus_per_node"),
+        plan.get("gpus_per_node"),
+        plan.get("memory_per_node_mib"),
+        plan.get("exclusive"),
+        plan.get("mode"),
+    )
+
+
 class InteractiveAuthRequired(RuntimeError):
     """A target needs a second factor and no factor was supplied for the request."""
 
-    def __init__(self, target: str) -> None:
-        super().__init__(
+    def __init__(self, target: str, detail: str | None = None) -> None:
+        message = (
             f"target {target!r} requires interactive authentication (second "
             f"factor); run target-connect --2fa <secret> {target}"
         )
+        # The actionable sentence stays the prefix so existing substring
+        # assertions keep matching; the dial detail follows when known so the
+        # operator can see why the container hop failed in the awaiting case.
+        if detail:
+            message = f"{message} (container hop failed: {detail})"
+        super().__init__(message)
         self.target = target
+        self.detail = detail
 
 
 @dataclass
@@ -93,6 +228,11 @@ class TargetRuntime:
     # be used.  Never carries a secret; only tells operators why a connect was
     # refused/failed so a real tunnel error is not masked as "needs 2FA".
     awaiting_factor: bool = False
+    # Resolved allocation retained across a connect/refresh so recovery and a
+    # later refresh reuse it instead of silently reverting to defaults.  Empty
+    # for a target with no allocation block.
+    resolved_plan: dict | None = None
+    resolved_overrides: dict[str, Any] = field(default_factory=dict)
     recovery_task: asyncio.Task | None = field(default=None, repr=False)
 
     def public(self, clients: int = 0) -> dict:
@@ -109,11 +249,29 @@ class TargetRuntime:
             "needs_refresh": self.needs_refresh,
             "provisioned_endpoint": self.provisioned_endpoint,
             "awaiting_factor": self.awaiting_factor,
+            # Additive: a target without a Slurm allocation reports None so the
+            # existing keys/format stay unchanged for existing callers.
+            "resolved_plan": self.resolved_plan,
+            "resolved_overrides": dict(self.resolved_overrides),
         }
+
+
+def validate_config_allocations(config: GatewayConfig) -> None:
+    """Cross-check every target's enabled mappings against its manual options.
+
+    This runs at gateway startup and before a reload is applied, so
+    ``computeMCP-gatewayctl reload`` refuses a bad configuration (and keeps the
+    previous one) instead of discovering the conflict at connect time.
+    ``validate_conflicts`` is imported lazily to avoid a circular import
+    (allocation imports config); it is pure and side-effect free.
+    """
+    for target in config.targets.values():
+        validate_conflicts(target)
 
 
 class Gateway:
     def __init__(self, config: GatewayConfig, transport_override: str | None = None):
+        validate_config_allocations(config)
         self.config = config
         self.transport_override = transport_override
         self._apply_transport_override()
@@ -166,6 +324,14 @@ class Gateway:
     def _endpoint(self, runtime: TargetRuntime) -> tuple[str, int]:
         target = self.config.targets[runtime.name]
         if target.transport.kind == "direct":
+            # The gateway dials ``remote_host:remote_port`` itself.  A loopback
+            # remote_host here therefore points at the gateway's OWN loopback,
+            # which can only work when the container really runs next to the
+            # gateway.  For a tunnel target the same loopback value is valid and
+            # is intentionally NOT rejected: the forward target host:port is
+            # resolved REMOTELY at the route host, so ``127.0.0.1`` means the
+            # container on that remote host.  Runtime behavior is unchanged; the
+            # distinction is documented here so the two cases are not confused.
             return target.transport.remote_host, target.transport.remote_port
         if runtime.local_port is None:
             raise TunnelError(f"target {runtime.name!r} has no active tunnel")
@@ -202,29 +368,120 @@ class Gateway:
         with contextlib.suppress(TunnelError, SSHError, HostKeyError):
             await self.ensure_connected(name)
 
+    # -- allocation resolution --------------------------------------------
+    @staticmethod
+    def _allocation_configured(target: TargetConfig) -> bool:
+        return (
+            target.node is not None
+            or target.allocation is not None
+            or target.slurm is not None
+        )
+
+    @staticmethod
+    def _env_configured(target: TargetConfig) -> bool:
+        return (
+            target.node is not None
+            or target.allocation is not None
+            or target.slurm is not None
+            or target.container is not None
+            or target.bundle is not None
+        )
+
+    def _resolve_allocation(
+        self, target: TargetConfig, overrides: dict[str, Any] | None
+    ) -> tuple[Any, dict[str, str]]:
+        """Resolve plan, per-stage args and the provision environment.
+
+        Overrides resolve before mapping: they are validated by
+        :func:`compute_plan`, which also re-checks mapping/manual conflicts.
+        An override on a target with no ``node``/``allocation``/``slurm`` block
+        is refused, so a missing mapping can never be mistaken for successful
+        enforcement.  Raises :class:`ConfigError` (HTTP 400 at the edge).
+        """
+        if overrides and not self._allocation_configured(target):
+            raise ConfigError(
+                f"target {target.name!r} has no Slurm allocation configuration; "
+                "--set overrides cannot be applied (configure [node], "
+                "[allocation] or [slurm] first)"
+            )
+        validate_conflicts(target)
+        plan = compute_plan(target, overrides)
+        sbatch, srun = render_args(target, plan)
+        provision_env = build_provision_env(target, plan, sbatch, srun)
+        return plan, provision_env
+
+    def _target_provision_env(self, target: TargetConfig) -> dict[str, str]:
+        """The ``COMPUTEMCP_*`` contract for a target, best-effort.
+
+        Shared by the connect and close paths so a bundle target gets the same
+        environment in both and cannot drift.  For a target whose allocation
+        cannot be resolved (for example a bundle with no node/allocation block,
+        or a plan error) a minimal dict with the system and container fields is
+        returned rather than raising: close/connect are advisory and must not
+        crash teardown.
+        """
+        try:
+            _, provision_env = self._resolve_allocation(target, None)
+            return provision_env
+        except (ConfigError, ValueError):
+            pass
+        env: dict[str, str] = {"COMPUTEMCP_SYSTEM": target.name}
+        env.update(_container_env_fields(target))
+        return env
+
     # -- state machine -----------------------------------------------------
     async def ensure_connected(self, name: str) -> TargetRuntime:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
             if runtime.state == "connected":
+                # A live target is by definition no longer awaiting a factor, so
+                # clear a flag left over from a factor-less refresh or a previous
+                # loss.  Otherwise the stale flag could mask a real dial failure.
                 if target.transport.kind == "direct":
+                    runtime.awaiting_factor = False
                     return runtime
                 if runtime.tunnel and runtime.tunnel.is_alive():
+                    runtime.awaiting_factor = False
                     return runtime
                 self._mark_lost(runtime, "tunnel connection closed")
-            return await self._connect_locked(target, runtime)
+            # Recovery/automatic reconnect must retain the resolved settings
+            # instead of silently reverting to the configured defaults.
+            return await self._connect_locked(
+                target, runtime, overrides=(runtime.resolved_overrides or None)
+            )
 
     async def _connect_locked(
-        self, target: TargetConfig, runtime: TargetRuntime, factor: str | None = None
+        self,
+        target: TargetConfig,
+        runtime: TargetRuntime,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
     ) -> TargetRuntime:
         runtime.state = "connecting"
         runtime.last_error = None
+        provision_env: dict[str, str] | None = None
+        plan = None
+        if self._env_configured(target) or overrides:
+            try:
+                plan, provision_env = self._resolve_allocation(target, overrides)
+            except (ConfigError, ValueError) as exc:
+                # A bad override must not wedge the runtime in "connecting":
+                # record the failure and re-raise (the HTTP layer maps it to 400).
+                runtime.state = "failed"
+                runtime.last_error = str(exc)
+                raise
+        connect_kwargs: dict[str, Any] = {"factor": factor}
+        if provision_env is not None:
+            # Only allocation/container targets carry the environment contract;
+            # every other target keeps the exact previous call shape.
+            connect_kwargs["provision_env"] = provision_env
         try:
             tunnel = await self.tunnels.connect(
                 target,
                 on_route=lambda route, exc: log.debug("route %s failed: %s", route, exc),
-                factor=factor,
+                **connect_kwargs,
             )
         except TunnelError as exc:
             runtime.state = "failed"
@@ -235,15 +492,31 @@ class Gateway:
         runtime.tunnel = tunnel
         runtime.active_route = tunnel.route
         runtime.local_port = tunnel.local_port
+        # Endpoint lifecycle: after a successful provision (or a static direct
+        # transport) the freshly resolved endpoint is authoritative for this
+        # connect.  A re-provision on refresh/recovery re-resolves it here, so
+        # ``runtime.provisioned_endpoint`` always mirrors the latest successful
+        # provision rather than a stale port from a previous allocation.  The
+        # cached container connection is keyed to the endpoint and dropped by
+        # the backend when the port changes (see SSHBackend.connection).
         if tunnel.provisioned_endpoint is not None:
             host, port = tunnel.provisioned_endpoint
             runtime.provisioned_endpoint = f"{host}:{port}"
         else:
             runtime.provisioned_endpoint = None
+        if plan is not None:
+            runtime.resolved_plan = plan_summary(target, plan)
+            runtime.resolved_overrides = dict(plan.overrides)
+        else:
+            runtime.resolved_plan = None
+            runtime.resolved_overrides = {}
         runtime.connected_since = datetime.now(timezone.utc)
         runtime.needs_refresh = False
         runtime.backoff = 0.0
         runtime.state = "connected"
+        # A successful connect resolves any outstanding factor: the invariant
+        # after this point is ``state == "connected"`` and
+        # ``awaiting_factor is False`` together.
         runtime.awaiting_factor = False
         return runtime
 
@@ -254,27 +527,64 @@ class Gateway:
         runtime.state = "disconnected"
         runtime.active_route = None
         runtime.local_port = None
+        # Drop the endpoint so a recovery that skips re-provision (static
+        # transport) does not dial a no-longer-published port; a re-provision
+        # re-resolves it in ``_connect_locked``.
+        runtime.provisioned_endpoint = None
         runtime.last_error = reason
         runtime.connected_since = None
 
-    async def connect_target(self, name: str, factor: str | None = None) -> dict:
+    async def connect_target(
+        self,
+        name: str,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
             if runtime.state == "connected":
+                if overrides:
+                    # A connect with overrides on a live target must not
+                    # silently tear down or silently accept a different
+                    # allocation: compare the effective settings and require an
+                    # explicit refresh when they differ.
+                    plan, _ = self._resolve_allocation(target, overrides)
+                    new_sig = plan_signature(plan_summary(target, plan))
+                    if new_sig != plan_signature(runtime.resolved_plan):
+                        result = runtime.public(
+                            self.sessions.count_for_target(name)
+                        )
+                        result["needs_refresh"] = True
+                        result["warning"] = (
+                            "requested allocation settings differ from the "
+                            f"active allocation for target {name!r}; run "
+                            f"'target-refresh {name} --set ...' to apply them"
+                        )
+                        return result
+                    # Effective settings are equal: no-op, allocation preserved.
                 return runtime.public(self.sessions.count_for_target(name))
             warning = self._factor_warning(target, factor)
             if target.interactive_auth and factor is None:
                 return self._interactive_skip(runtime)
             if warning is not None:
                 factor = None  # key-only downstream
-            await self._connect_locked(target, runtime, factor=factor)
+            await self._connect_locked(
+                target, runtime, factor=factor, overrides=overrides
+            )
             result = runtime.public(self.sessions.count_for_target(name))
         if warning:
             result["warning"] = warning
         return result
 
-    async def refresh_target(self, name: str, factor: str | None = None) -> dict:
+    async def refresh_target(
+        self,
+        name: str,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
@@ -285,16 +595,77 @@ class Gateway:
             warning = self._factor_warning(target, factor)
             if warning is not None:
                 factor = None  # key-only downstream
+            # A refresh without explicit overrides re-applies the settings the
+            # target already retained, so recovery never silently reverts to
+            # defaults.  Resolve/validate before any teardown: a bad override
+            # must not destroy a still-active allocation.
+            effective = (
+                overrides
+                if overrides is not None
+                else (runtime.resolved_overrides or None)
+            )
+            if effective or self._env_configured(target):
+                self._resolve_allocation(target, effective)
             # Release the old allocation before provisioning a new one.  The
             # route connection is still alive here, so the command can run.
             await self._run_close_command(name)
             await self._stop_locked(name)
+            # The old allocation is released.  Drop the gateway-side cached
+            # container connection so the next exec/session dials the freshly
+            # provisioned endpoint; the provider is not even called until the
+            # new tunnel is up.  ``_connect_locked`` re-resolves the endpoint
+            # from ``tunnel.provisioned_endpoint`` and makes the new value
+            # authoritative.  A plain connect while connected would have kept
+            # the stale endpoint (idempotent early return); the explicit
+            # refresh is the guaranteed re-provision point.
             await self.backend.disconnect(name)
             await self.sessions.close_for_target(name, reason="refresh")
-            await self._connect_locked(target, runtime, factor=factor)
+            await self._connect_locked(
+                target, runtime, factor=factor, overrides=effective
+            )
             result = runtime.public(self.sessions.count_for_target(name))
         if warning:
             result["warning"] = warning
+        return result
+
+    def preview_target(
+        self, name: str, overrides: dict[str, Any] | None = None
+    ) -> dict:
+        """Pure allocation preview: no connection, no allocation, no state change.
+
+        Returns the resolved plan summary, the per-stage rendered args and the
+        provision environment contract.  For a connected target, a preview whose
+        effective settings differ from the retained ones reports
+        ``needs_refresh``; a plain connect and a preview never disturb the live
+        allocation.
+        """
+        target = self._target(name)
+        runtime = self.runtimes[name]
+        plan, provision_env = self._resolve_allocation(target, overrides)
+        sbatch, srun = render_args(target, plan)
+        summary = plan_summary(target, plan)
+        result = {
+            "target": name,
+            "connected": runtime.state == "connected",
+            "planned": summary,
+            "sbatch_args": list(sbatch),
+            "srun_args": list(srun),
+            "provision_env": provision_env,
+            "would_emit": {
+                "sbatch": list(sbatch),
+                "srun": list(srun),
+                "not_emitted": list(summary.get("not_emitted", [])),
+            },
+        }
+        if runtime.state == "connected":
+            new_sig = plan_signature(summary)
+            if new_sig != plan_signature(runtime.resolved_plan):
+                result["needs_refresh"] = True
+                result["warning"] = (
+                    "previewed allocation settings differ from the active "
+                    f"allocation for target {name!r}; run 'target-refresh "
+                    f"{name} --set ...' to apply them"
+                )
         return result
 
     def _factor_warning(self, target: TargetConfig, factor: str | None) -> str | None:
@@ -340,7 +711,12 @@ class Gateway:
         and must not release the allocation.
         """
         target = self.config.targets.get(name)
-        if target is None or not target.close_command:
+        if target is None:
+            return
+        # A bundle target without an explicit close_command releases the
+        # allocation through the deployed helper's `stop` action, so do not
+        # skip it merely because close_command is empty.
+        if not target.close_command and target.bundle is None:
             return
         runtime = self.runtimes[name]
         connection = runtime.tunnel.connection if runtime.tunnel else None
@@ -353,8 +729,19 @@ class Gateway:
         route = runtime.active_route or (
             target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
         )
+        # The derived bundle `stop` needs the same COMPUTEMCP_* contract as the
+        # provision path; build it from the target (best-effort) so teardown
+        # never crashes on a missing allocation.
+        provision_env = (
+            self._target_provision_env(target) if target.bundle is not None else None
+        )
+        close_kwargs: dict[str, Any] = {}
+        if provision_env is not None:
+            close_kwargs["provision_env"] = provision_env
         try:
-            await self.tunnels.run_close_command(target, route, connection=connection)
+            await self.tunnels.run_close_command(
+                target, route, connection=connection, **close_kwargs
+            )
         except Exception as exc:  # noqa: BLE001 - advisory, never fatal
             log.warning("target %s: close_command failed: %s", name, exc)
 
@@ -372,6 +759,12 @@ class Gateway:
         runtime.state = "disconnected"
         runtime.active_route = None
         runtime.local_port = None
+        # The allocation is gone, so the endpoint provisioned for it is stale.
+        # Clear it here (the one place every teardown/refresh/removal passes
+        # through); a reconnect re-resolves it from a fresh provision in
+        # ``_connect_locked``.  This is what keeps a refresh from dialing the
+        # previous container port.
+        runtime.provisioned_endpoint = None
         runtime.connected_since = None
         runtime.awaiting_factor = False
 
@@ -521,6 +914,37 @@ class Gateway:
         return prompter
 
     # -- connection providers for exec/sessions --------------------------
+    def _target_connected_live(
+        self, target: TargetConfig, runtime: TargetRuntime
+    ) -> bool:
+        """Whether the target is successfully connected with a usable route.
+
+        Mirrors the early-return liveness test in ``ensure_connected``: a direct
+        transport is live as soon as it is connected; a tunnel target also needs
+        an alive tunnel.
+        """
+        if runtime.state != "connected":
+            return False
+        if target.transport.kind == "direct":
+            return True
+        return runtime.tunnel is not None and runtime.tunnel.is_alive()
+
+    def _factor_outstanding(
+        self, target: TargetConfig, runtime: TargetRuntime
+    ) -> bool:
+        """Whether a second factor is genuinely still outstanding.
+
+        ``awaiting_factor`` is authoritative only while the target is not
+        successfully connected with a usable route.  A live target is treated as
+        resolved even if a stale flag remains, so a real container-dial failure
+        surfaces as-is instead of being masked as a 2FA-required 503.
+        """
+        return (
+            target.interactive_auth
+            and runtime.awaiting_factor
+            and not self._target_connected_live(target, runtime)
+        )
+
     async def _open_container_conn(self, name: str, force_dedicated: bool = False):
         """Open the container SSH connection for a target.
 
@@ -535,10 +959,14 @@ class Gateway:
             # A real tunnel/host-key/dial failure on an interactive target must
             # surface as-is (502).  Map to 503 only when this target is known to
             # still be awaiting a factor.
-            if target.interactive_auth and self.runtimes[name].awaiting_factor:
+            if self._factor_outstanding(target, self.runtimes[name]):
                 raise InteractiveAuthRequired(name) from None
             raise
         runtime = self.runtimes[name]
+        # Pre-dial gate: while the target is not connected at all a factor is
+        # genuinely outstanding, so refuse before dialing.  A target that claims
+        # to be connected is dialed, and any failure is classified by the final
+        # gate below (which also carries the dial detail).
         if (
             target.interactive_auth
             and runtime.awaiting_factor
@@ -547,6 +975,13 @@ class Gateway:
             raise InteractiveAuthRequired(name)
         host, port = self._endpoint(runtime)
         dedicated = force_dedicated or target.connect_mode == "dedicated"
+
+        # A bundle-backed recovery command needs the COMPUTEMCP_* contract too,
+        # so a stopped container can be brought back up.  Best-effort: never
+        # fail the connect path building the advisory environment.
+        connect_kwargs: dict[str, Any] = {}
+        if target.bundle is not None:
+            connect_kwargs["provision_env"] = self._target_provision_env(target)
 
         async def attempt():
             if dedicated:
@@ -560,7 +995,9 @@ class Gateway:
                 target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
             )
             connection = runtime.tunnel.connection if runtime.tunnel else None
-            await self.tunnels.run_connect_command(target, route, connection=connection)
+            await self.tunnels.run_connect_command(
+                target, route, connection=connection, **connect_kwargs
+            )
 
         try:
             conn = await attempt()
@@ -578,7 +1015,9 @@ class Gateway:
                     name, first,
                 )
                 connection = runtime.tunnel.connection if runtime.tunnel else None
-                await self.tunnels.run_connect_command(target, route, connection=connection)
+                await self.tunnels.run_connect_command(
+                    target, route, connection=connection, **connect_kwargs
+                )
                 # Drop any cached (dead) connection before retrying.
                 await self.backend.disconnect(name)
                 try:
@@ -586,8 +1025,11 @@ class Gateway:
                     return target, conn
                 except SSHError:
                     pass
-            if target.interactive_auth:
-                raise InteractiveAuthRequired(name) from None
+            # Only map to 503 while a factor is genuinely outstanding.  A real
+            # container-dial failure (stopped container, refused port, ...) on
+            # an interactive target must surface as-is (502) with its message.
+            if self._factor_outstanding(target, runtime):
+                raise InteractiveAuthRequired(name, detail=str(first)) from None
             raise first
 
     async def _connection_provider(self, name: str):
@@ -633,7 +1075,12 @@ class Gateway:
         before this runs, so a malformed file never reaches here.  Unchanged
         connected targets keep their tunnels; removed targets are stopped;
         changed targets are marked for refresh (and refreshed if connected).
+
+        Allocation conflicts are re-checked here, before any state changes, so
+        a reload that would introduce an inconsistent mapping is rejected and
+        the active configuration is retained.
         """
+        validate_config_allocations(new_config)
         if self.transport_override:
             # Re-apply the test/debug transport override to the new config.
             saved = self.transport_override
@@ -721,22 +1168,28 @@ class Gateway:
             raise web.HTTPNotFound(text="unknown target")
         return web.json_response(self.public_status(name))
 
-    async def _request_factor(self, request: web.Request) -> str | None:
-        """Read the optional ``{"factor": "..."}`` JSON body.
+    async def _request_json(self, request: web.Request) -> dict:
+        """Read and validate the optional JSON object body once.
 
-        An absent or empty body is allowed (returns ``None``).  Malformed JSON or
-        a non-string factor is a 400.  The value is never logged or echoed.
+        The request body can only be read once; callers must derive both the
+        2FA factor and the allocation overrides from this single result.  An
+        absent or empty body is an empty object; malformed JSON or a non-object
+        body is a 400.
         """
         if not request.can_read_body:
-            return None
+            return {}
         try:
             body = await request.json()
         except Exception as exc:  # noqa: BLE001 - bad client body
             raise web.HTTPBadRequest(text="body must be JSON") from exc
         if body in (None, {}):
-            return None
+            return {}
         if not isinstance(body, dict):
             raise web.HTTPBadRequest(text="body must be a JSON object")
+        return body
+
+    @staticmethod
+    def _body_factor(body: dict) -> str | None:
         factor = body.get("factor")
         if factor is None:
             return None
@@ -744,19 +1197,44 @@ class Gateway:
             raise web.HTTPBadRequest(text="'factor' must be a string")
         return factor or None
 
+    @staticmethod
+    def _body_overrides(body: dict) -> dict[str, Any] | None:
+        overrides = body.get("set")
+        if overrides is None:
+            return None
+        if not isinstance(overrides, dict):
+            raise web.HTTPBadRequest(text="'set' must be an object of override values")
+        return {str(k): v for k, v in overrides.items()}
+
     async def h_connect(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
-        factor = await self._request_factor(request)
-        return web.json_response(await self.connect_target(name, factor=factor))
+        body = await self._request_json(request)
+        factor = self._body_factor(body)
+        overrides = self._body_overrides(body)
+        return web.json_response(
+            await self.connect_target(name, factor=factor, overrides=overrides)
+        )
 
     async def h_refresh(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
-        factor = await self._request_factor(request)
-        return web.json_response(await self.refresh_target(name, factor=factor))
+        body = await self._request_json(request)
+        factor = self._body_factor(body)
+        overrides = self._body_overrides(body)
+        return web.json_response(
+            await self.refresh_target(name, factor=factor, overrides=overrides)
+        )
+
+    async def h_preview(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        name = request.match_info["target"]
+        client.require_target(name)
+        body = await self._request_json(request)
+        overrides = self._body_overrides(body)
+        return web.json_response(self.preview_target(name, overrides=overrides))
 
     async def h_stop(self, request: web.Request) -> web.Response:
         client = self._auth(request)
@@ -1123,7 +1601,13 @@ class Gateway:
     async def h_enroll_approve(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         client.require_admin()
-        pending = await self.approve_enrollment(request.match_info["request"])
+        try:
+            pending = await self.approve_enrollment(request.match_info["request"])
+        except EnrollmentError as exc:
+            # An unknown or expired id, and a request already consumed, all
+            # share one message after _expire(), so 404 is the honest status
+            # here, mirroring h_enroll_deny.
+            raise web.HTTPNotFound(text=str(exc)) from exc
         return web.json_response(
             {
                 "request_id": pending.request_id,
@@ -1315,6 +1799,7 @@ class Gateway:
         router.add_get("/v1/targets/{target}", self.h_get_target)
         router.add_post("/v1/targets/{target}/connect", self.h_connect)
         router.add_post("/v1/targets/{target}/refresh", self.h_refresh)
+        router.add_post("/v1/targets/{target}/preview", self.h_preview)
         router.add_post("/v1/targets/{target}/stop", self.h_stop)
         router.add_post("/v1/exec", self.h_exec)
         router.add_post("/v1/sessions", self.h_session_create)
@@ -1696,6 +2181,28 @@ def build_parser() -> argparse.ArgumentParser:
         "~/.config/computeMCP-gateway/tokens.toml), print the plaintext "
         "tokens once, and exit",
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="interactively create the initial gateway configuration (server, "
+        "auth, a hashed client token and optionally a target) and exit",
+    )
+    parser.add_argument(
+        "--config-dir",
+        metavar="DIR",
+        help="directory for --bootstrap (default: the directory of --config)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="with --bootstrap, overwrite an existing configuration file",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="refuse interactive prompts (for scripts); --bootstrap then fails "
+        "instead of waiting for input",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1834,6 +2341,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.generate_tokens:
             return generate_tokens(args.config, args.generate_tokens, args.token_file)
+        if args.bootstrap:
+            from .setup import Wizard, WizardAbort, run_bootstrap
+
+            config_arg = args.config or default_config_path()
+            if args.config_dir:
+                target_path = Path(args.config_dir) / Path(default_config_path()).name
+            else:
+                target_path = Path(config_arg)
+            wizard = Wizard(terminal=False if args.non_interactive else None)
+            try:
+                return run_bootstrap(target_path, force=args.force, wizard=wizard)
+            except WizardAbort as exc:
+                print(f"bootstrap: {exc}", file=sys.stderr)
+                return 2
         return asyncio.run(_amain(args))
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)

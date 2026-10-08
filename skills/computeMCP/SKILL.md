@@ -144,8 +144,9 @@ with the `computeMCP-handshake` tool **inside this container**:
 computeMCP-handshake <project-id> --port <gateway-port> [--system hal,fwk394]
 ```
 
-It queues a request; a human must approve it on the gateway console
-(`approve <request-id>`). Tell the human the request id and that it is waiting.
+It queues a request; a human must approve it **on the gateway host, not inside
+this container** (`computeMCP-gatewayctl approve <request-id>`, or the console
+`approve <request-id>`). Tell the human the request id and that it is waiting.
 On approval the token is written to `~/.bashrc`, but the running agent will not
 see it until restarted (tmux keeps its old environment) — the command prints an
 `environment` block to paste into the MCP config. Never attempt to bypass the
