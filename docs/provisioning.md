@@ -210,15 +210,26 @@ from the key the **container** sshd accepts:
   `.pub` half if present) to derive the **public** key. The bundle receives
   it as `COMPUTEMCP_SSH_PUBLIC_KEY` and the helper installs it into the
   container's `authorized_keys`. Manual placement is **not** needed.
-- **Manual target.** The public key for the account the gateway dials inside
-  the container must already be in `authorized_keys` on the host.
-  Typically:
+- **Manual target.** The public key must go into the `container_user`
+  account **inside the container**, not the route login account. Derive the
+  public half on the gateway host (only the public half leaves the gateway);
+  the gateway's `client_key` is this same path:
 
   ```bash
-  ssh-keygen -y -f /home/USER/.ssh/computemcp_container | \
-    ssh <login-alias> 'cat >> ~/.ssh/authorized_keys'
+  cat ~/.ssh/computemcp_container.pub
+  # or: ssh-keygen -y -f ~/.ssh/computemcp_container
   ```
 
+  Then install that single line into the container account, using the
+  container runtime on the route host, e.g.:
+
+  ```bash
+  docker exec <container> install -d -m700 -o <container_user> -g <container_user> /home/<container_user>/.ssh
+  printf '%s\n' '<public-key-line>' | docker exec -i <container> tee -a /home/<container_user>/.ssh/authorized_keys
+  ```
+
+  Do **not** use `ssh <login-alias> 'cat >> ~/.ssh/authorized_keys'`: that
+  writes the route login account and does not authorize the container.
   The private key stays on the gateway host; only the public key is placed.
 
 ### 2.3 Route `user` vs in-container `container_user`

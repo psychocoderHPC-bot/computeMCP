@@ -381,7 +381,7 @@ it.
 Terok Shield is default-deny: a task container cannot open a TCP connection to
 the gateway until the project explicitly allows the destination. If the MCP
 fails with a connection error even though the gateway is healthy, this is the
-cause. Add the gateway to the project's `project.toml`:
+cause. Add the gateway to the project's `project.yml` (at `~/.config/terok/projects/<project>/project.yml`):
 
 ```yaml
 shield:

@@ -110,7 +110,7 @@ Terok Shield is default-deny. The gateway is reached at
 not enough: Terok's reserved `localhost:PORT` host-service grant is what opens
 the gateway's port on the host (the client still dials
 `host.containers.internal`). Check the connection, add the grant to the
-project's `project.toml`, and recreate the task:
+project's `project.yml`, and recreate the task:
 
 ```bash
 getent hosts host.containers.internal        # should resolve, e.g. 10.0.2.2
@@ -118,13 +118,13 @@ curl -fsS http://host.containers.internal:2222/v1/health
 ```
 
 ```yaml
-# <project>/project.toml
+# ~/.config/terok/projects/<project>/project.yml
 shield:
   allow:
     - "localhost:2222"   # host-service grant opens the gateway port on the host
 ```
 
-After changing `project.toml`, rebuild the project's container; the change only
+After changing `project.yml`, rebuild the project's container; the change only
 takes effect in new Terok tasks. An already-running task keeps the old Shield
 settings.
 
@@ -266,7 +266,7 @@ after recreating. Full reference in [docs/provisioning.md](docs/provisioning.md)
   the pin is a placeholder. Read the new fingerprint and re-pin, then refresh;
   see [Host-key verification](#host-key-verification).
 - **Handshake or MCP cannot reach the gateway**: Terok Shield is default-deny.
-  Add `localhost:2222` to `project.toml` `shield.allow` (the reserved
+   Add `localhost:2222` to `project.yml` `shield.allow` (the reserved
   host-service grant) and create a new task;
   see [docs/operations.md](docs/operations.md).
 - **`pipx install .` permission error in the agent container**: `~/.local` is

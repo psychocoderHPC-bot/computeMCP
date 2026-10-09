@@ -32,6 +32,13 @@ prepare_entrypoint_vars() {
     AGENT_UID="$(stat -c %u "$HOST_HOME")"
     AGENT_GID="$(stat -c %g "$HOST_HOME")"
 
+    if [ "$AGENT_UID" = "0" ] || [ "$AGENT_GID" = "0" ]; then
+        echo "STOP: $HOST_HOME is owned by uid/gid 0 (root)." >&2
+        echo "The container must not use a root login account. Create or chown it as your normal user first, e.g.:" >&2
+        echo "  sudo chown -R \"\$USER\":\"\$USER\" $HOST_HOME" >&2
+        exit 1
+    fi
+
     # A persistent home is allowed to be non-empty on recreate: the toolchain
     # is what makes the container persistent across recreation.
     if [ -n "$(find "$HOST_HOME" -mindepth 1 -maxdepth 1 -print -quit)" ]; then

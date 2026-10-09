@@ -133,7 +133,7 @@ If `computeMCP_targets` does not return a system you expect, or a target shows
 cannot reach the gateway at all (connection refused/timeout while
 `COMPUTEMCP_GATEWAY` is set), the Terok Shield is likely blocking the
 destination — the project `shield.allow`/`override` must permit the gateway host
-(see the project's `project.toml`). **Do not try to bypass the gateway** (no
+(see the project's `project.yml`). **Do not try to bypass the gateway** (no
 direct `ssh`, no host access).
 
 If the `compute` MCP is not configured at all (no tools available, or

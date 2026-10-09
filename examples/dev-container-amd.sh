@@ -72,6 +72,7 @@ case "$SSH_PUBLIC_KEY" in
         exit 1 ;;
 esac
 
+# HOST_HOME must be owned by the invoking (non-root) user; do not create it with `sudo`.
 mkdir -p "$HOST_HOME"
 
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then

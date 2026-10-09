@@ -55,11 +55,14 @@ duplicate-sections).
 Run from the `examples/` directory (or pass the full path to `dev-container-nvidia.sh`):
 
 ```bash
-# on the remote host, BEFORE the first gateway connect:
+# ON THE GATEWAY HOST: print the public half; the private key never leaves it.
+cat ~/.ssh/computemcp_container.pub      # or: ssh-keygen -y -f ~/.ssh/computemcp_container
+
+# ON THE REMOTE HOST: pass the printed public line as --public-key.
 bash dev-container-nvidia.sh \
   --name computeMCP-container \
   --home-dir /home/USER/workspace/computemcp-container \
-  --public-key "$(ssh-keygen -y -f /path/to/gateway/computemcp_container)"
+  --public-key 'ssh-ed25519 AAAA... gateway'
 
 # read the new fingerprint and set it as host_key_sha256 in your config:
 docker exec computeMCP-container ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
@@ -68,10 +71,14 @@ docker exec computeMCP-container ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pu
 **AMD dev-container:**
 
 ```bash
+# ON THE GATEWAY HOST: print the public half; the private key never leaves it.
+cat ~/.ssh/computemcp_container.pub      # or: ssh-keygen -y -f ~/.ssh/computemcp_container
+
+# ON THE REMOTE HOST: pass the printed public line as --public-key.
 bash dev-container-amd.sh \
   --name computeMCP-container \
   --home-dir /home/USER/workspace/computemcp-container \
-  --public-key "$(ssh-keygen -y -f /path/to/gateway/computemcp_container)"
+  --public-key 'ssh-ed25519 AAAA... gateway'
 ```
 
 **`connect_command` recovery:**

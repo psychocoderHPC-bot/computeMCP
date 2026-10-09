@@ -23,7 +23,7 @@
 #   bash dev-container-nvidia.sh \
 #     --name computeMCP-container \
 #     --home-dir /home/USER/workspace/computemcp-container \
-#     --public-key "$(ssh-keygen -y -f /path/to/gateway/computemcp_container)"
+#     --public-key 'ssh-ed25519 AAAA... gateway'   # the .pub text, derived on the gateway
 #
 # Options:
 #   --name         container name (default computeMCP-container)
@@ -72,6 +72,7 @@ case "$SSH_PUBLIC_KEY" in
         exit 1 ;;
 esac
 
+# HOST_HOME must be owned by the invoking (non-root) user; do not create it with `sudo`.
 mkdir -p "$HOST_HOME"
 
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
