@@ -1,0 +1,47 @@
+# non-slurm-docker-host.toml
+#
+# Workflow A: non-Slurm Docker-host bundle target. The shipped bundle is
+# not Slurm-specific: on a host without a scheduler (like `myTargetHost`)
+# the helper skips sbatch/srun, builds or reuses the container on the route
+# (login) node, and starts it directly there. The [targets.X.bundle]
+# block is the provisioner in this case: the gateway deploys the bundle
+# over the route connection and runs it, so provision_command is not
+# required. provision-env runs the site setup before the container
+# runtime is used.
+#
+# Note the three accounts: `user` is the SSH account for the route
+# gateway -- login connection (here = "agent"); `container_user` is the
+# account inside the container (here default = "ubuntu"), which is the
+# one the gateway dials over the forwarded tunnel. The two scripts in
+# this examples/ directory (dev-container-nvidia.sh, dev-container-amd.sh)
+# use "agent" as the in-container account, which is only compatible with
+# this TOML if you ALSO set `container_user = "agent"` on the [targets.X]
+# line below (commented). Without that, every exec/file call after connect
+# is 502.
+#
+# Precondition: candidate for a workflow B pre-existing container IF the
+# operator has already run dev-container-nvidia.sh on the host. For a fresh
+# host where the gateway is told to build the container, this target does
+# NOT need a pre-existing container.
+
+[targets.myTargetHost]
+ssh_targets = ["myTargetHost"]
+user = "agent"
+client_key = "/home/USER/.ssh/computemcp_container"
+host_key_sha256 = "SHA256:REPLACE_WITH_64_HEX_CHARS_OF_B32_ENCODED_RANDOM"
+host_key_algorithms = ["ssh-ed25519"]
+auto_connect = true
+# If the dev container was created by dev-container-{nvidia,amd}.sh (which
+# create the "agent" account), uncomment to match:
+# container_user = "agent"
+
+[targets.myTargetHost.bundle]
+source = "computemcp-container"
+deploy-dir = "$HOME/computemcp/bundle"
+provision-env = ["source /etc/profile.d/docker.sh"]
+
+[targets.myTargetHost.container]
+runtime = "docker"
+storage-root = "/scratch/USER/computemcp"
+image = "ubuntu:24.04"
+gpus = ["nvidia"]

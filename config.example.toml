@@ -22,8 +22,8 @@
 # only carries `include` plus the tables below still loads as a normal config.
 # ---------------------------------------------------------------------------
 # include = [
-#     "systems/rosi.toml",
-#     "systems/hal.toml",
+#     "systems/myTargetHost-slurm.toml",
+#     "systems/myTargetHost.toml",
 #     "/opt/computeMCP-gateway/systems/other.toml",
 # ]
 
@@ -81,7 +81,7 @@ output_buffer_bytes = 4194304
 # ---------------------------------------------------------------------------
 [clients.alpaka]
 token = "REPLACE_WITH_PROJECT_TOKEN"
-targets = ["hal", "fwk394"]
+targets = ["myTargetHost", "secondTarget"]
 
 [clients.admin]
 token = "REPLACE_WITH_ADMIN_TOKEN"
@@ -95,8 +95,8 @@ targets = ["*"]
 # Transport defaults to "tunnel" when ssh_targets is present, and "direct"
 # otherwise.
 # ---------------------------------------------------------------------------
-[targets.hal]
-ssh_targets = ["hal", "ex_hal"]
+[targets.myTargetHost]
+ssh_targets = ["myTargetHost", "ex_myTargetHost"]
 remote_host = "127.0.0.1"
 remote_port = 2222
 user = "agent"
@@ -168,11 +168,11 @@ connect_backoff_initial = 1.0
 connect_backoff_max = 60.0
 
 # --- HPC target: Slurm compute node behind a fixed login node --------------
-# The login node (e.g. rosi5) is fixed; the compute node and the container's
+# The login node (e.g. myTargetHost-slurm) is fixed; the compute node and the container's
 # forwarded port are produced by Slurm, so they are discovered at connect time
 # by a trusted provisioning command.  Both hops use the gateway user's keys.
 #
-# [targets.rosi5]
+# [targets.myTargetHost-hpc]
 # user = "agent"
 # client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
@@ -180,15 +180,15 @@ connect_backoff_max = 60.0
 # # Optional: pin the login node host key; unset uses ~/.ssh/known_hosts.
 # # route_host_key_sha256 = "SHA256:REPLACE_WITH_LOGIN_NODE_HOST_KEY_FINGERPRINT"
 # # Gateway reaches the login node via this SSH config alias.
-# ssh_targets = ["rosi5"]
+# ssh_targets = ["myTargetHost-hpc"]
 # # Optional: jump through another alias (dialed first, then the route alias).
-# proxy_jump = "rosi5"
+# proxy_jump = "myTargetHost-hpc"
 # # Trusted argv (no shell).  It runs ON the login node over the authenticated
 # # route connection (not as a local subprocess), starts/attaches the Slurm
 # # job, sets up a forward from the login node to the compute container, and
 # # prints `host:port` (optionally prefixed with ENDPOINT) on stdout.  The
 # # gateway forwards that endpoint over the same connection.
-# provision_command = ["/home/USER/.config/computeMCP-gateway/rosi5-provision.sh"]
+# provision_command = ["/home/USER/.config/computeMCP-gateway/myTargetHost-hpc-provision.sh"]
 # provision_timeout = 900.0
 # # `target-connect`/`target-refresh` wait for provision_timeout plus a short
 # # handshake margin, so this value also bounds the operator CLI wait.  Pass
@@ -202,8 +202,8 @@ connect_backoff_max = 60.0
 # close_command_timeout = 120.0
 
 # A target reachable without a tunnel (e.g. gateway co-located with the
-# container, or the dev-hal test setup in this repository).
-[targets.hal-direct]
+# container, or the local test setup in this repository).
+[targets.myTargetHost-direct]
 transport = "direct"
 remote_host = "host.containers.internal"
 remote_port = 2222
@@ -211,8 +211,8 @@ user = "agent"
 known_hosts = "/home/USER/.ssh/known_hosts"
 client_key = "/home/USER/.ssh/terok_hal_task"
 
-[targets.fwk394]
-ssh_targets = ["fwk394", "ex_fwk394"]
+[targets.secondTarget]
+ssh_targets = ["secondTarget", "ex_secondTarget"]
 remote_host = "127.0.0.1"
 remote_port = 2222
 user = "agent"
@@ -241,8 +241,8 @@ client_key = "/home/USER/.ssh/computemcp_container"
 
 # A target with many simultaneous long-running sessions can opt out of the
 # remote sshd's per-connection MaxSessions limit.
-# [targets.gpu03]
-# ssh_targets = ["gpu03"]
+# [targets.secondTarget-dedicated]
+# ssh_targets = ["secondTarget-dedicated"]
 # remote_host = "127.0.0.1"
 # remote_port = 2222
 # user = "agent"
@@ -281,8 +281,8 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # sbatch when the request has more than one node.  Use nodes = 1 until the
 # container-startup path lands in a later change.
 # ---------------------------------------------------------------------------
-# [targets.rosi]
-# ssh_targets = ["rosi"]                # login-node alias
+# [targets.myTargetHost-slurm]
+# ssh_targets = ["myTargetHost-slurm"]                # login-node alias
 # user = "agent"
 # client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
@@ -300,7 +300,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # the container runtime is used (once on the login/route node before build and
 # # again inside the container-start path on the job node); an empty array is a
 # # no-op.  With a bundle block, provision_command is not required.
-# [targets.rosi.bundle]
+# [targets.myTargetHost-slurm.bundle]
 # source = "computemcp-container"
 # # deploy-dir = "/scratch/USER/computemcp/bundle"
 # # auto-deploy = true
@@ -310,7 +310,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # all fields are optional).  cpus are Slurm CPUs under the site/SMT policy,
 # # gpus are the scheduler-visible GPU units, memory is allocatable host memory
 # # with a Slurm unit (a bare integer is MiB).  Not installed RAM, not GPU memory.
-# [targets.rosi.node]
+# [targets.myTargetHost-slurm.node]
 # cpus = 24
 # gpus = 4
 # memory = "378000M"
@@ -320,7 +320,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # `single-node` takes
 # # any of gpu-proportional | cpu-proportional | full | exclusive; `multi-node`
 # # is limited to full | exclusive.  max-nodes is the hard bound on the request.
-# [targets.rosi.allocation]
+# [targets.myTargetHost-slurm.allocation]
 # default-gpus = 1
 # single-node = "gpu-proportional"
 # multi-node = "exclusive"
@@ -333,7 +333,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # The dedicated `account` key is the scheduler account passed as
 # # `sbatch -A`/`--account`; an empty string or an omitted key emits no
 # # --account argument at all.
-# [targets.rosi.slurm.sbatch]
+# [targets.myTargetHost-slurm.slurm.sbatch]
 # partition = "REPLACE_WITH_PARTITION_NAME"   # nested table under [slurm]
 # time = "02:00:00"
 # account = "REPLACE_WITH_ACCOUNT"            # omitted -> no -A/--account
@@ -349,7 +349,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # (emitted only when the plan is exclusive).  Omit a mapping to leave the
 # # scheduler default.  The `sbatch`/`srun` stages are rendered independently;
 # # nothing is copied between them.
-# [targets.rosi.slurm.sbatch-map]
+# [targets.myTargetHost-slurm.slurm.sbatch-map]
 # nodes = "nodes"
 # gpus-per-node = "gres"
 # cpus-per-node = "cpus-per-task"
@@ -357,11 +357,11 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # No memory mapping: the manual mem option above is authoritative.
 #
 # # Manual job-step options and their mappings (independent from sbatch).
-# [targets.rosi.slurm.srun]
+# [targets.myTargetHost-slurm.slurm.srun]
 # ntasks-per-node = 1
 # cpu-bind = "none"
 #
-# [targets.rosi.slurm.srun-map]
+# [targets.myTargetHost-slurm.slurm.srun-map]
 # nodes = "nodes"
 # cpus-per-node = "cpus-per-task"
 #
@@ -379,7 +379,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # inside the allocation.  "compute" is meaningful for the Apptainer runtime (an
 # # architecture-mismatched partition); with the Docker runtime it is orthogonal
 # # because the image is pulled and started where it runs.
-# [targets.rosi.container]
+# [targets.myTargetHost-slurm.container]
 # runtime = "apptainer"
 # storage-root = "/scratch/USER/computemcp"
 # image = "docker://ubuntu:24.04"
@@ -389,7 +389,7 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # build-location = "compute"
 #
 # # Operator preview of the allocation without connecting:
-# #   computeMCP-gatewayctl target-connect rosi --set gpus-per-node=2 --dry-run
+# #   computeMCP-gatewayctl target-connect myTargetHost-slurm --set gpus-per-node=2 --dry-run
 # # The preview prints the plan, per-stage manual options, the rendered
 # # per-stage arguments, the fields not emitted, and the final
 # # COMPUTEMCP_SBATCH_ARGS / COMPUTEMCP_SRUN_ARGS.
@@ -403,8 +403,8 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # and memory requests.  The container runtime is Docker and `gpus` is empty,
 # so the helper adds no GPU device flags.
 # ---------------------------------------------------------------------------
-# [targets.cpuhost]
-# ssh_targets = ["cpuhost"]
+# [targets.myTargetHost-cpu]
+# ssh_targets = ["myTargetHost-cpu"]
 # user = "agent"
 # client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
@@ -412,37 +412,37 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # auto_connect = false
 # provision_timeout = 600.0
 #
-# [targets.cpuhost.bundle]
+# [targets.myTargetHost-cpu.bundle]
 # source = "computemcp-container"
 # # deploy-dir = "/scratch/USER/computemcp/bundle"
 #
-# [targets.cpuhost.node]
+# [targets.myTargetHost-cpu.node]
 # cpus = 16
 # memory = "128G"
 # # No `gpus` key: the node is CPU-only.
 #
-# [targets.cpuhost.allocation]
+# [targets.myTargetHost-cpu.allocation]
 # default-cpus = 4
 # single-node = "cpu-proportional"
 #
-# [targets.cpuhost.slurm.sbatch]
+# [targets.myTargetHost-cpu.slurm.sbatch]
 # partition = "REPLACE_WITH_PARTITION_NAME"
 # time = "01:00:00"
 # account = "REPLACE_WITH_ACCOUNT"      # empty/omitted -> no --account
 # ntasks-per-node = 1
 #
-# [targets.cpuhost.slurm.sbatch-map]
+# [targets.myTargetHost-cpu.slurm.sbatch-map]
 # cpus-per-node = "cpus-per-task"      # one task per node (ntasks-per-node = 1)
 # memory-per-node = "mem"              # emit --mem=<MiB>M from the plan
 #
-# [targets.cpuhost.slurm.srun]
+# [targets.myTargetHost-cpu.slurm.srun]
 # ntasks-per-node = 1
 # cpu-bind = "none"
 #
-# [targets.cpuhost.slurm.srun-map]
+# [targets.myTargetHost-cpu.slurm.srun-map]
 # cpus-per-node = "cpus-per-task"
 #
-# [targets.cpuhost.container]
+# [targets.myTargetHost-cpu.container]
 # runtime = "docker"
 # storage-root = "/scratch/USER/computemcp"
 # image = "ubuntu:24.04"               # plain reference for the Docker path
@@ -458,20 +458,20 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # provisioning path.  provision-env runs the site setup before the runtime is
 # used.
 # ---------------------------------------------------------------------------
-# [targets.hal-docker]
-# ssh_targets = ["hal"]                 # a plain SSH route, no scheduler
+# [targets.myTargetHost-docker]
+# ssh_targets = ["myTargetHost-docker"]  # a plain SSH route, no scheduler
 # user = "agent"
 # client_key = "/home/USER/.ssh/computemcp_container"
 # host_key_sha256 = "SHA256:REPLACE_WITH_CONTAINER_HOST_KEY_FINGERPRINT"
 # host_key_algorithms = ["ssh-ed25519"]
 # auto_connect = true
 #
-# [targets.hal-docker.bundle]
+# [targets.myTargetHost-docker.bundle]
 # source = "computemcp-container"
 # deploy-dir = "$HOME/computemcp/bundle"
 # # provision-env = ["source /etc/profile.d/docker.sh"]
 #
-# [targets.hal-docker.container]
+# [targets.myTargetHost-docker.container]
 # runtime = "docker"
 # storage-root = "/scratch/USER/computemcp"
 # image = "ubuntu:24.04"
