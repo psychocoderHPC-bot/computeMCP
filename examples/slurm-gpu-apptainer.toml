@@ -1,0 +1,91 @@
+# slurm-gpu-apptainer.toml
+#
+# Workflow A: Slurm + GPU + Apptainer bundle target.
+# Illustrative Slurm + Apptainer shape from the documentation worked example.
+#
+# Ownership: this file is a FRAGMENT for the operator's own
+# ~/.config/computeMCP-gateway/config.toml. The [clients.X] and [server]
+# tables are omitted by design so the fragment can be pasted next to the
+# operator's existing tables without producing duplicate-sections errors.
+#
+# Precondition: this target requires tunnel transport, i.e. at least one
+# ssh_targets entry, so the gateway deploys the bundle over the route
+# connection. On a direct target there is no route to deploy through and
+# you would fall back to a manual provision_command (workflow B).
+#
+# Parse test: python3 -c "import tomllib; tomllib.load(open('slurm-gpu-
+# apptainer.toml','rb'))"
+
+[targets.myTargetHost]
+ssh_targets = ["myTargetHost"]
+user = "agent"
+client_key = "/home/USER/.ssh/computemcp_container"
+host_key_sha256 = "SHA256:REPLACE_WITH_64_HEX_CHARS_OF_B32_ENCODED_RANDOM"
+host_key_algorithms = ["ssh-ed25519"]
+sharing = "exclusive"
+auto_connect = true
+provision_timeout = 960.0
+
+# Let the gateway deploy and run the shipped bundle over the route
+# connection. Upload is skipped when the remote content marker matches;
+# after a gateway upgrade the changed bundle re-deploys on the next
+# connect. deploy-dir defaults to <container.storage-root>/bundle and
+# must live on storage visible to login and compute nodes.
+[targets.myTargetHost.bundle]
+source = "computemcp-container"
+# deploy-dir = "/scratch/USER/computemcp/bundle"
+# auto-deploy = true
+# provision-env = ["module load apptainer"]
+
+# Node capacities. Illustrative numbers for a mid-sized GPU cluster, not
+# current verified hardware of any specific installation.
+[targets.myTargetHost.node]
+cpus = 24
+gpus = 4
+memory = "378000M"
+
+# Allocation defaults and policies.
+[targets.myTargetHost.allocation]
+# default-gpus is accepted but currently inert: the mode fixes the per-node
+# GPU count (1 in gpu-proportional, full-capacity in full/exclusive).
+default-gpus = 1
+single-node = "gpu-proportional"
+multi-node = "exclusive"
+max-nodes = 4
+
+# Manual submission options for the sbatch stage. The map fills the
+# resource numbers on top.
+[targets.myTargetHost.slurm.sbatch]
+partition = "REPLACE_WITH_PARTITION_NAME"
+time = "02:00:00"
+mem = "100G"   # fixed memory; the calculated per-node memory share is not emitted
+ntasks-per-node = 1
+# account = "REPLACE_WITH_SCHDULER_ACCOUNT"
+
+# Mappings from the gateway-computed plan to scheduler options for the
+# sbatch stage.
+[targets.myTargetHost.slurm.sbatch-map]
+nodes = "nodes"
+gpus-per-node = "gres"
+cpus-per-node = "cpus-per-task"   # legal because both stages set ntasks-per-node = 1
+exclusive = "exclusive"
+# No memory mapping: the manual mem option is authoritative.
+
+# Job-step launch options for the container's internal workload/relay.
+[targets.myTargetHost.slurm.srun]
+ntasks-per-node = 1
+cpu-bind = "none"
+
+[targets.myTargetHost.slurm.srun-map]
+nodes = "nodes"
+cpus-per-node = "cpus-per-task"
+
+# Container runtime for the provisioning bundle.
+[targets.myTargetHost.container]
+runtime = "apptainer"
+storage-root = "/scratch/USER/computemcp"
+image = "docker://ubuntu:24.04"
+gpus = ["nvidia"]
+host-home = "/scratch/USER/computemcp/home"
+sandbox = true
+# build-location = "compute"   # enable on an architecture-mismatched partition; requires Slurm

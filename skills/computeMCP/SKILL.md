@@ -23,7 +23,7 @@ mandatory for every compute MCP action: discovery, exec, sessions, file
 transfer, and remote-agent delegation. Do not call `computeMCP_targets()`,
 open a session, transfer a file, or delegate to a remote agent before you
 have read this document. Skipping the load has already caused missed rules,
-such as the non-TTY stdin warning in section 2.
+such as the non-TTY stdin warning in the "Run a command" section.
 
 ## 0. Tool names and client namespacing
 
@@ -141,7 +141,7 @@ If the `compute` MCP is not configured at all (no tools available, or
 with the `computeMCP-handshake` tool **inside this container**:
 
 ```
-computeMCP-handshake <project-id> --port <gateway-port> [--system hal,fwk394]
+computeMCP-handshake <project-id> --port <gateway-port> [--system myTargetHost]
 ```
 
 It queues a request; a human must approve it **on the gateway host, not inside
@@ -158,8 +158,8 @@ For short, non-interactive commands use `computeMCP_exec`. It returns
 `exit_status`, `stdout`, `stderr`.
 
 ```
-computeMCP_exec(target="hal", command="nvidia-smi")
-computeMCP_exec(target="hal", command="cmake --build build -j", cwd="/work/picongpu")
+computeMCP_exec(target="myTargetHost", command="nvidia-smi")
+computeMCP_exec(target="myTargetHost", command="cmake --build build -j", cwd="/work/picongpu")
 ```
 
 - `cwd` is a directory **inside the remote container** (the shell runs there).
@@ -172,9 +172,9 @@ computeMCP_exec(target="hal", command="cmake --build build -j", cwd="/work/picon
   debuggers, servers), use a persistent session instead — see below.
 
 ```
-computeMCP_exec(target="hal", command="make -j", cwd="/work/proj",
+computeMCP_exec(target="myTargetHost", command="make -j", cwd="/work/proj",
              env={"OMP_NUM_THREADS": "32", "CUDA_VISIBLE_DEVICES": "0"})
-computeMCP_exec(target="hal", command="wc -l", stdin="a\nb\nc\n")
+computeMCP_exec(target="myTargetHost", command="wc -l", stdin="a\nb\nc\n")
 ```
 
 ### Non-TTY stdin can block stdin-reading CLIs
@@ -207,11 +207,11 @@ build in one does not block another call or another session. Use a second
 session to inspect a running build (`ps`, `tail`, `nvidia-smi`).
 
 ```
-sid = computeMCP_session_create(target="hal", cwd="/work/picongpu")["session_id"]
+sid = computeMCP_session_create(target="myTargetHost", cwd="/work/picongpu")["session_id"]
 
 computeMCP_session_write(sid, "cmake --build build -j32\n")   # include the newline
 # ... start a second session while the build runs ...
-sid2 = computeMCP_session_create(target="hal")["session_id"]
+sid2 = computeMCP_session_create(target="myTargetHost")["session_id"]
 computeMCP_session_write(sid2, "nvidia-smi\n")
 
 computeMCP_session_read(sid2)              # drain buffered output (max_bytes=0 = all)
@@ -242,24 +242,24 @@ Two styles:
 **Small text / inline** — content goes in the tool call/response:
 
 ```
-computeMCP_file_write(target="hal", path="/work/notes.txt", content="hello\n")
-computeMCP_file_read(target="hal", path="/work/notes.txt")
-computeMCP_file_read_base64(target="hal", path="/work/blob.bin")   # binary read
-computeMCP_file_write(target="hal", path="/work/x.bin", content="<base64>", encoding="base64")
+computeMCP_file_write(target="myTargetHost", path="/work/notes.txt", content="hello\n")
+computeMCP_file_read(target="myTargetHost", path="/work/notes.txt")
+computeMCP_file_read_base64(target="myTargetHost", path="/work/blob.bin")   # binary read
+computeMCP_file_write(target="myTargetHost", path="/work/x.bin", content="<base64>", encoding="base64")
 ```
 
 **Large / binary / artifacts — streamed, nothing in context:**
 
 ```
-computeMCP_file_upload(target="hal", local_path="/tmp/build.tar.gz", remote_path="/work/build.tar.gz")
-computeMCP_file_download(target="hal", remote_path="/work/results.dat", local_path="/tmp/results.dat")
+computeMCP_file_upload(target="myTargetHost", local_path="/tmp/build.tar.gz", remote_path="/work/build.tar.gz")
+computeMCP_file_download(target="myTargetHost", remote_path="/work/results.dat", local_path="/tmp/results.dat")
 ```
 
 **Whole directory trees — also streamed per file:**
 
 ```
-computeMCP_file_upload_tree(target="hal", local_path="/work/src", remote_path="/work/src")
-computeMCP_file_download(target="hal", remote_path="/work/build", local_path="/tmp/build", recursive=True)
+computeMCP_file_upload_tree(target="myTargetHost", local_path="/work/src", remote_path="/work/src")
+computeMCP_file_download(target="myTargetHost", remote_path="/work/build", local_path="/tmp/build", recursive=True)
 ```
 
 `computeMCP_file_upload_tree` mirrors a directory tree. It is incremental: re-run
@@ -307,14 +307,14 @@ with `skip_existing=True` to send only files still missing remotely, and use
 
 ```
 systems = computeMCP_targets()                       # 1. discover
-computeMCP_status("hal")                             #    check it is connected
+computeMCP_status("myTargetHost")                             #    check it is connected
 
-sid = computeMCP_session_create(target="hal", cwd="/work/alpaka")["session_id"]
+sid = computeMCP_session_create(target="myTargetHost", cwd="/work/alpaka")["session_id"]
 computeMCP_session_write(sid, "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release\n")
 computeMCP_session_write(sid, "cmake --build build -j\n")
 
 # while it builds, use a second session to watch
-sid2 = computeMCP_session_create(target="hal")["session_id"]
+sid2 = computeMCP_session_create(target="myTargetHost")["session_id"]
 computeMCP_session_write(sid2, "nvidia-smi; ps -eo pid,pcpu,comm --sort=-pcpu | head\n")
 computeMCP_session_read(sid2)
 computeMCP_session_close(sid2)
@@ -322,7 +322,7 @@ computeMCP_session_close(sid2)
 computeMCP_session_read(sid)                         # poll until exit_status is set
 computeMCP_session_write(sid, "ctest --test-dir build --output-on-failure\n")
 computeMCP_session_read(sid)
-computeMCP_file_download(target="hal", remote_path="/work/alpaka/build/results.xml",
+computeMCP_file_download(target="myTargetHost", remote_path="/work/alpaka/build/results.xml",
                       local_path="/tmp/results.xml")
 computeMCP_session_close(sid)
 ```

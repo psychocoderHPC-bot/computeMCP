@@ -1,0 +1,66 @@
+# manual-connect-recovery.toml
+#
+# Workflow B: existing / custom environment using provision_command,
+# close_command, and connect_command. No [targets.X.bundle] block:
+# the operator keeps an existing Slurm-aware provision script on the
+# remote host and the gateway just runs it.
+#
+# This example demonstrates:
+#   provision_command   -- argv run ON THE REMOTE HOST over the route
+#                         connection; prints the endpoint to dial.
+#   close_command       -- argv run ON THE REMOTE HOST when the target is
+#                         stopped, when the gateway shuts down, or before
+#                         a refresh re-provisions. NOT run when a reload
+#                         removes the target.
+#   connect_command     -- argv run ON THE REMOTE HOST (the machine
+#                         hosting the container) when the container cannot
+#                         be reached. The shipped reference script
+#                         examples/ensure-container.sh is the canonical
+#                         implementation: start the container if it is not
+#                         running, no-op if it is.
+#
+# The two scripts referenced below are the ones in this examples/
+# directory, copied to the remote host by the operator before first
+# use:
+#
+#   scp examples/ensure-container.sh <remote-host>:~/.config/computeMCP-gateway/
+#   ssh  <remote-host> chmod +x ~/.config/computeMCP-gateway/ensure-container.sh
+#
+# The provision script is NOT shipped by this repo; it is site-specific.
+# See docs/provisioning.md ("provision_command argv constraints") for the contract
+# (argv constraints, idempotency, and the `host:port` polling protocol).
+# The operator maintains their own provision script; point provision_command
+# at it.
+
+[targets.mcm-host]
+ssh_targets = ["mcm-host"]
+user = "agent"
+client_key = "/home/USER/.ssh/computemcp_container"
+host_key_sha256 = "SHA256:REPLACE_WITH_64_HEX_CHARS_OF_B32_ENCODED_RANDOM"
+host_key_algorithms = ["ssh-ed25519"]
+auto_connect = false
+sharing = "unknown"
+provision_timeout = 900.0
+
+# The operator-maintained provision script. It must:
+#   (a) ensure a Slurm job is running for this target (reuse or submit),
+#   (b) ensure a 127.0.0.1:<port> listener on the login node forwards
+#       to the container sshd on the compute node,
+#   (c) print "ENDPOINT host:port" (a bare "host:port" is accepted too).
+# Idempotency is MANDATORY: route loss auto-reconnects and re-runs this.
+provision_command = ["/home/USER/.config/computeMCP-gateway/mcm-host-provision.sh"]
+
+# Release the allocation when the target is stopped, on gateway shutdown,
+# or before a refresh re-provisions. NOT run when a reload removes the
+# target from the config.
+close_command = ["scancel", "--name", "mcm-host-job"]
+close_command_timeout = 120.0
+
+# Recovery: when the tunnel is healthy but the container is stopped,
+# connect_command runs on the machine hosting the container. The shipped
+# reference script (examples/ensure-container.sh) is a no-op when the
+# container is already running, so it is safe under BOTH on_failure and
+# always modes.
+connect_command = ["/home/USER/.config/computeMCP-gateway/ensure-container.sh"]
+connect_command_timeout = 120.0
+connect_command_mode = "on_failure"   # default; "always" runs pre-connect
