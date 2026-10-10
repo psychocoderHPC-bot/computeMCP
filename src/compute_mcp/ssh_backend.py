@@ -35,6 +35,26 @@ class HostKeyError(SSHError):
     pass
 
 
+def _is_channel_open_error(exc: BaseException) -> bool:
+    """Return True when *exc* is asyncssh's channel-open failure.
+
+    ``asyncssh.ChannelOpenError`` is exported at the top level in asyncssh
+    2.24.1 (and also as ``asyncssh.misc.ChannelOpenError``).  Resolve it at call
+    time so the check stays correct if a future version relocates the name,
+    without hard-coding a version-specific import path.
+    """
+    channel_open_error = getattr(asyncssh, "ChannelOpenError", None)
+    return channel_open_error is not None and isinstance(exc, channel_open_error)
+
+
+def _channel_open_message(prefix: str, exc: BaseException) -> str:
+    return (
+        f"{prefix} (remote sshd MaxSessions limit may be reached); consider "
+        "connect_mode='dedicated' or retrying: "
+        f"{exc}"
+    )
+
+
 @dataclass
 class ManagedSession:
     id: str
@@ -265,6 +285,35 @@ class SSHBackend:
             with contextlib.suppress(Exception):
                 await conn.wait_closed()
 
+    async def discard_connection(
+        self, name_or_conn: str | asyncssh.SSHClientConnection
+    ) -> None:
+        """Drop a cached connection so the next request redials.
+
+        Accepts either a target name or a live connection object.  Used when a
+        cached SHARED connection can no longer open session channels (the
+        remote sshd's per-connection ``MaxSessions`` cap was reached): keeping
+        it cached would make every later request fail the same way.
+        """
+        if isinstance(name_or_conn, str):
+            name = name_or_conn
+        else:
+            name = self._target_for_conn(name_or_conn)
+            if name is None:
+                # Not a cached connection (e.g. a dedicated one owned by the
+                # caller): nothing to invalidate here.
+                return
+        await self.disconnect(name)
+
+    def _target_for_conn(
+        self, conn: asyncssh.SSHClientConnection
+    ) -> str | None:
+        """Return the cached target name for *conn*, or None if not cached."""
+        for cached_name, (cached_conn, _key) in self._connections.items():
+            if cached_conn is conn:
+                return cached_name
+        return None
+
     async def close_all(self) -> None:
         for name in list(self._connections):
             await self.disconnect(name)
@@ -434,6 +483,20 @@ class SSHBackend:
             )
         except asyncio.TimeoutError as exc:
             raise SSHError("remote command timed out") from exc
+        except asyncssh.Error as exc:
+            # ChannelOpenError (a subclass of asyncssh.Error) means the remote
+            # sshd refused a new session channel on this connection, typically
+            # because its per-connection MaxSessions cap was reached.  Drop the
+            # cached connection so the next request can redial.
+            if _is_channel_open_error(exc):
+                await self.discard_connection(conn)
+                raise SSHError(
+                    _channel_open_message(
+                        f"{self._conn_slot(conn)}failed to open SSH session channel",
+                        exc,
+                    )
+                ) from exc
+            raise SSHError(f"{self._conn_slot(conn)}remote command failed: {exc}") from exc
 
     async def create_session(
         self,
@@ -455,7 +518,22 @@ class SSHBackend:
                 request_pty=True,
             )
         except asyncssh.Error as exc:
-            raise SSHError(f"failed to create PTY session: {exc}") from exc
+            if _is_channel_open_error(exc):
+                await self.discard_connection(conn)
+                raise SSHError(
+                    _channel_open_message(
+                        f"{self._conn_slot(conn)}failed to open SSH session channel",
+                        exc,
+                    )
+                ) from exc
+            raise SSHError(
+                f"{self._conn_slot(conn)}failed to create PTY session: {exc}"
+            ) from exc
+
+    def _conn_slot(self, conn: asyncssh.SSHClientConnection) -> str:
+        """Return a ``target-name: `` prefix for *conn* when it is cached."""
+        name = self._target_for_conn(conn)
+        return f"target {name!r}: " if name is not None else ""
 
     async def sftp(self, conn: asyncssh.SSHClientConnection) -> asyncssh.SFTPClient:
         try:

@@ -483,8 +483,7 @@ async def test_disconnect_drops_endpoint_keyed_cache(monkeypatch):
 @pytest.mark.skipif(
     not _container_server_support, reason="asyncssh server support unavailable"
 )
-async def test_container_dial_wrong_account_fails_but_container_account_ok(
-    tmp_path_factory,
+async def test_container_dial_wrong_account_fails_but_container_account_ok(    tmp_path_factory,
 ):
     import asyncio
     import os
@@ -542,3 +541,94 @@ async def test_container_dial_wrong_account_fails_but_container_account_ok(
 
         with contextlib.suppress(Exception):
             await server.wait_closed()
+
+
+# -- ChannelOpenError: sshd refused a new session channel (HTTP 500 fix) -----
+
+
+class _ChannelOpenConn:
+    """Connection whose channel-open always fails like a MaxSessions-exhausted sshd."""
+
+    def __init__(self, exc) -> None:
+        self._exc = exc
+        self.closed = False
+
+    def is_closed(self):
+        return self.closed
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
+
+    async def run(self, *args, **kwargs):
+        raise self._exc
+
+    async def create_process(self, *args, **kwargs):
+        raise self._exc
+
+
+def _channel_open_error():
+    return asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "open failed")
+
+
+async def test_run_maps_channel_open_error_to_ssherror():
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+
+    conn = _ChannelOpenConn(_channel_open_error())
+    with pytest.raises(SSHError) as excinfo:
+        await SSHBackend().run(conn, "echo hi")
+    msg = str(excinfo.value)
+    assert "session channel" in msg
+    assert "MaxSessions" in msg
+    assert "open failed" in msg
+
+
+async def test_create_session_maps_channel_open_error_to_ssherror():
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+
+    conn = _ChannelOpenConn(_channel_open_error())
+    with pytest.raises(SSHError) as excinfo:
+        await SSHBackend().create_session(conn, None, 80, 24)
+    msg = str(excinfo.value)
+    assert "session channel" in msg
+    assert "MaxSessions" in msg
+    assert "open failed" in msg
+
+
+async def test_channel_open_error_discards_cached_connection(monkeypatch):
+    """A cached SHARED connection that cannot open a channel is dropped so the
+    next request redials instead of failing the same way forever."""
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(kind="direct", remote_host="127.0.0.1", remote_port=2222),
+    )
+    dialed = []
+    conns = []
+
+    async def fake_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        dialed.append((host, port))
+        conn = _ChannelOpenConn(_channel_open_error())
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+
+    backend = SSHBackend()
+    conn = await backend.connection(target, "127.0.0.1", 2222)
+    assert backend.known_targets() == ["hal"]
+
+    with pytest.raises(SSHError) as excinfo:
+        await backend.run(conn, "echo hi")
+
+    assert "session channel" in str(excinfo.value)
+    assert backend.known_targets() == []
+    assert conns[0].closed is True
+
+    await backend.connection(target, "127.0.0.1", 2222)
+    assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 2222)]
