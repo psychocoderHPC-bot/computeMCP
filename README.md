@@ -262,6 +262,11 @@ after recreating. Full reference in [docs/provisioning.md](docs/provisioning.md)
   (default `ubuntu`), never the route `user`. Keep `container_user` in sync with
   the account the container was built for, then `target-refresh <t>`. See
   [docs/troubleshooting.md](docs/troubleshooting.md).
+- **Concurrent file reads intermittently return `502`**: the target's sshd
+  refused an SFTP channel (`SFTP subsystem`, `Session request failed`). Retry
+  the call, or set `connect_mode = "dedicated"` for contended targets so
+  each file operation dials its own connection. See
+  [docs/troubleshooting.md](docs/troubleshooting.md).
 - **`Host key is not trusted`**: the container was recreated (new host key) or
   the pin is a placeholder. Read the new fingerprint and re-pin, then refresh;
   see [Host-key verification](#host-key-verification).

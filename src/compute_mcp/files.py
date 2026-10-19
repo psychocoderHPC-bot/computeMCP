@@ -10,7 +10,6 @@ SFTP subsystem.
 
 from __future__ import annotations
 
-import contextlib
 import posixpath
 import stat as stat_module
 
@@ -149,15 +148,3 @@ def _stat_dict(path: str, info) -> dict:
         "gid": info.gid,
         "mtime": info.mtime,
     }
-
-
-@contextlib.asynccontextmanager
-async def sftp_client(conn: asyncssh.SSHClientConnection):
-    client = None
-    try:
-        client = await conn.start_sftp_client()
-        yield client
-    finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                client.exit()

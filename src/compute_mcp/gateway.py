@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import asyncssh
 from aiohttp import web
 
 from . import __version__
@@ -50,7 +51,6 @@ from .enrollment import (
     EnrollmentQueueFull,
     PendingEnrollment,
 )
-from .files import sftp_client
 from .files import chmod as files_chmod
 from .files import list_dir as files_list
 from .files import mkdir as files_mkdir
@@ -1710,7 +1710,7 @@ class Gateway:
         target, conn = await self._connection_provider(target_name)
         owned = target.connect_mode == "dedicated"
         try:
-            async with sftp_client(conn) as sftp:
+            async with self.backend.sftp_client(conn) as sftp:
                 yield sftp
         finally:
             if owned:
@@ -1739,7 +1739,7 @@ class Gateway:
             target, conn = await self._connection_provider(target_name)
             owned = target.connect_mode == "dedicated"
             try:
-                async with sftp_client(conn) as sftp:
+                async with self.backend.sftp_client(conn) as sftp:
                     info = await files_stat(sftp, path)
                     if info["type"] != "file":
                         raise web.HTTPBadRequest(text="not a regular file")
@@ -2196,6 +2196,10 @@ async def _error_middleware(request: web.Request, handler):
     except InteractiveAuthRequired as exc:
         raise web.HTTPServiceUnavailable(text=str(exc)) from exc
     except (HostKeyError, SSHError, TunnelError) as exc:
+        raise web.HTTPBadGateway(text=str(exc)) from exc
+    except asyncssh.Error as exc:
+        # Defense in depth: an SSH failure that escapes a handler-specific
+        # mapping must be an upstream failure (502), never a raw 500.
         raise web.HTTPBadGateway(text=str(exc)) from exc
     except SessionNotFound:
         raise web.HTTPNotFound(text="unknown session") from None
