@@ -31,6 +31,19 @@ class SSHError(RuntimeError):
     pass
 
 
+# Bounded retry and channel budget for the SFTP subsystem.  The remote sshd
+# caps session channels per connection (``MaxSessions``); a burst of file
+# operations on one shared connection can exhaust that budget, so opens are
+# serialized, retried a few times, and capped in number.
+SFTP_OPEN_MAX_ATTEMPTS = 3
+SFTP_OPEN_BACKOFF_BASE = 0.25
+MAX_SFTP_SESSIONS = 8
+
+# SSH_OPEN_ADMINISTRATIVELY_PROHIBITED (code 1): the server refuses the
+# subsystem outright, so retrying and redialing cannot help.
+_SFTP_OPEN_PROHIBITED = asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED
+
+
 class HostKeyError(SSHError):
     pass
 
@@ -269,6 +282,10 @@ class SSHBackend:
         # Maps target name -> (connection, "host:port" it was dialed to).
         self._connections: dict[str, tuple[asyncssh.SSHClientConnection, str]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # SFTP open serialization and channel budget, keyed by id(conn) because
+        # dedicated connections are not tracked by target name.
+        self._sftp_locks: dict[int, asyncio.Lock] = {}
+        self._sftp_sems: dict[int, asyncio.Semaphore] = {}
 
     @staticmethod
     def _endpoint_key(host: str, port: int) -> str:
@@ -277,10 +294,15 @@ class SSHBackend:
     def _lock(self, target: str) -> asyncio.Lock:
         return self._locks.setdefault(target, asyncio.Lock())
 
+    def _release_sftp_state(self, conn: asyncssh.SSHClientConnection) -> None:
+        self._sftp_locks.pop(id(conn), None)
+        self._sftp_sems.pop(id(conn), None)
+
     async def disconnect(self, target: str) -> None:
         entry = self._connections.pop(target, None)
         if entry is not None:
             conn = entry[0]
+            self._release_sftp_state(conn)
             conn.close()
             with contextlib.suppress(Exception):
                 await conn.wait_closed()
@@ -348,6 +370,7 @@ class SSHBackend:
                         target.name, stale_key, key,
                     )
                 self._connections.pop(target.name, None)
+                self._release_sftp_state(conn)
                 await self.close_connection(conn)
             conn = await self._dial(target, host, port, prompter)
             self._connections[target.name] = (conn, key)
@@ -535,11 +558,79 @@ class SSHBackend:
         name = self._target_for_conn(conn)
         return f"target {name!r}: " if name is not None else ""
 
-    async def sftp(self, conn: asyncssh.SSHClientConnection) -> asyncssh.SFTPClient:
-        try:
-            return await conn.start_sftp_client()
-        except asyncssh.Error as exc:
-            raise SSHError(f"failed to start SFTP subsystem: {exc}") from exc
+    def _sftp_open_lock(self, conn: asyncssh.SSHClientConnection) -> asyncio.Lock:
+        return self._sftp_locks.setdefault(id(conn), asyncio.Lock())
+
+    def _sftp_sem(
+        self, conn: asyncssh.SSHClientConnection, max_sessions: int
+    ) -> asyncio.Semaphore:
+        return self._sftp_sems.setdefault(id(conn), asyncio.Semaphore(max_sessions))
+
+    @contextlib.asynccontextmanager
+    async def sftp_client(
+        self,
+        conn: asyncssh.SSHClientConnection,
+        max_sessions: int = MAX_SFTP_SESSIONS,
+    ):
+        """Open an SFTP subsystem session bounded per connection.
+
+        At most *max_sessions* SFTP channels stay open per connection.  Channel
+        opens are serialized on a per-connection lock that is held only around
+        ``start_sftp_client`` (never across the backoff sleep or ``exit``), so
+        concurrent file operations queue instead of racing the sshd session
+        budget.  Transient channel-open failures are retried before the cached
+        connection is discarded.
+        """
+        async with self._sftp_sem(conn, max_sessions):
+            client = None
+            try:
+                for attempt in range(1, SFTP_OPEN_MAX_ATTEMPTS + 1):
+                    async with self._sftp_open_lock(conn):
+                        try:
+                            client = await conn.start_sftp_client()
+                            break
+                        except (asyncssh.Error, OSError) as exc:
+                            # A bare OSError is not retried: only asyncssh's
+                            # channel-open refusal has evidence of transience.
+                            transient = (
+                                _is_channel_open_error(exc)
+                                and getattr(exc, "code", None) != _SFTP_OPEN_PROHIBITED
+                            )
+                            if attempt >= SFTP_OPEN_MAX_ATTEMPTS or not transient:
+                                if transient:
+                                    await self.discard_connection(conn)
+                                    msg = _channel_open_message(
+                                        f"{self._conn_slot(conn)}failed to open "
+                                        "SFTP subsystem",
+                                        exc,
+                                    )
+                                else:
+                                    msg = (
+                                        f"{self._conn_slot(conn)}failed to start "
+                                        f"SFTP subsystem: {exc}"
+                                    )
+                                raise SSHError(msg) from exc
+                            log.warning(
+                                "sftp channel open attempt %d/%d failed on %s: %s",
+                                attempt,
+                                SFTP_OPEN_MAX_ATTEMPTS,
+                                conn,
+                                exc,
+                            )
+                    # The open lock is released here: backoff must not block
+                    # other open attempts on the same connection.
+                    await asyncio.sleep(
+                        SFTP_OPEN_BACKOFF_BASE * 2 ** (attempt - 1)
+                    )
+                yield client
+            finally:
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        client.exit()
+                if self._target_for_conn(conn) is None:
+                    # Dedicated/one-shot connections are closed by the caller
+                    # after this context exits; drop their bound state now.
+                    self._release_sftp_state(conn)
 
 
 def _shquote(value: str) -> str:

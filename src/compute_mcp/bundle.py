@@ -28,10 +28,27 @@ import subprocess
 
 import asyncssh
 
-from . import files
 from .config import TargetConfig
 
 log = logging.getLogger(__name__)
+
+
+@contextlib.asynccontextmanager
+async def _sftp_client(conn):
+    """Open and close the route connection's SFTP subsystem.
+
+    Bundle deployment runs once per connect on the route connection, so it
+    does not share the gateway's per-container channel budget machinery.
+    """
+    client = None
+    try:
+        client = await conn.start_sftp_client()
+        yield client
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.exit()
+
 
 MARKER_PREFIX = ".computemcp-bundle-"
 PROVISION_SCRIPT = "computemcp-provision.sh"
@@ -243,7 +260,7 @@ async def ensure_deployed(
         )
         return deploy_dir
 
-    factory = sftp_factory or files.sftp_client
+    factory = sftp_factory or _sftp_client
     try:
         await _deploy_sftp(factory, conn, deploy_dir, contents, marker)
     except (asyncssh.Error, OSError, BundleError) as exc:

@@ -632,3 +632,289 @@ async def test_channel_open_error_discards_cached_connection(monkeypatch):
 
     await backend.connection(target, "127.0.0.1", 2222)
     assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 2222)]
+
+
+# -- SFTP subsystem: bounded opens, retries and per-connection state --------
+
+
+class _FakeSftpClient:
+    def __init__(self, conn) -> None:
+        self._conn = conn
+        self.exited = False
+
+    def exit(self) -> None:
+        if not self.exited:
+            self.exited = True
+            self._conn.channels_open -= 1
+
+
+class _SftpConn:
+    """Connection whose `start_sftp_client` follows a failure schedule.
+
+    A schedule entry is either ``None``/absent (succeed), an int error code
+    (raise ``ChannelOpenError``) or an exception instance to raise.
+    """
+
+    def __init__(self, failures=()) -> None:
+        self.failures = list(failures)
+        self.attempts = 0
+        self.inflight = 0
+        self.max_inflight = 0
+        self.channels_open = 0
+        self.max_channels = 0
+        self.closed = False
+        self.gate = None
+        self.clients: list[_FakeSftpClient] = []
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+    async def start_sftp_client(self):
+        self.attempts += 1
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            # Yield so a missing open lock would expose concurrent opens.
+            await asyncio.sleep(0.01)
+            failure = self.failures.pop(0) if self.failures else None
+            if isinstance(failure, BaseException):
+                raise failure
+            if failure is not None:
+                raise asyncssh.ChannelOpenError(failure, "Session request failed")
+            self.channels_open += 1
+            self.max_channels = max(self.max_channels, self.channels_open)
+            client = _FakeSftpClient(self)
+            self.clients.append(client)
+            return client
+        finally:
+            self.inflight -= 1
+
+
+async def _no_sleep(*_args, **_kwargs) -> None:
+    return None
+
+
+async def test_concurrent_sftp_opens_serialize():
+    from compute_mcp.ssh_backend import SSHBackend
+
+    conn = _SftpConn()
+    backend = SSHBackend()
+
+    async def use():
+        async with backend.sftp_client(conn) as client:
+            await asyncio.sleep(0.01)
+            return client
+
+    clients = await asyncio.gather(*[use() for _ in range(5)])
+    assert conn.attempts == 5
+    assert conn.max_inflight == 1
+    assert all(client.exited for client in clients)
+
+
+async def test_sftp_semaphore_bounds_concurrent_sessions():
+    from compute_mcp.ssh_backend import SSHBackend
+
+    conn = _SftpConn()
+    backend = SSHBackend()
+
+    async def use():
+        async with backend.sftp_client(conn, max_sessions=2):
+            await asyncio.sleep(0.05)
+
+    await asyncio.gather(*[use() for _ in range(4)])
+    assert conn.max_channels == 2
+
+
+@pytest.mark.parametrize("code", [0xFFFFFFFF, asyncssh.OPEN_CONNECT_FAILED])
+async def test_sftp_retries_transient_channel_errors(monkeypatch, code):
+    from compute_mcp.ssh_backend import SSHBackend
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    conn = _SftpConn([code])
+    backend = SSHBackend()
+
+    async with backend.sftp_client(conn) as client:
+        assert isinstance(client, _FakeSftpClient)
+    assert conn.attempts == 2
+    assert client.exited is True
+
+
+@pytest.mark.parametrize("code", [0xFFFFFFFF, asyncssh.OPEN_CONNECT_FAILED])
+async def test_sftp_exhausted_retries_discard_connection(monkeypatch, code):
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    conn = _SftpConn([code, code, code])
+    backend = SSHBackend()
+    discarded = []
+
+    async def fake_discard(connection):
+        discarded.append(connection)
+
+    monkeypatch.setattr(backend, "discard_connection", fake_discard)
+
+    with pytest.raises(SSHError) as excinfo:
+        async with backend.sftp_client(conn):
+            raise AssertionError("SFTP client must not be yielded")
+
+    msg = str(excinfo.value)
+    assert conn.attempts == 3
+    assert discarded == [conn]
+    assert "SFTP subsystem" in msg
+    assert "MaxSessions" in msg
+    assert "dedicated" in msg
+
+
+async def test_sftp_prohibited_channel_open_is_not_retried(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    conn = _SftpConn([asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED])
+    backend = SSHBackend()
+    discarded = []
+
+    async def fake_discard(connection):
+        discarded.append(connection)
+
+    monkeypatch.setattr(backend, "discard_connection", fake_discard)
+
+    with pytest.raises(SSHError) as excinfo:
+        async with backend.sftp_client(conn):
+            raise AssertionError("SFTP client must not be yielded")
+
+    assert conn.attempts == 1
+    assert discarded == []
+    assert "SFTP subsystem" in str(excinfo.value)
+
+
+async def test_sftp_non_channel_error_is_not_retried(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    conn = _SftpConn([asyncssh.PermissionDenied("no sftp for you")])
+    backend = SSHBackend()
+    discarded = []
+
+    async def fake_discard(connection):
+        discarded.append(connection)
+
+    monkeypatch.setattr(backend, "discard_connection", fake_discard)
+
+    with pytest.raises(SSHError) as excinfo:
+        async with backend.sftp_client(conn):
+            raise AssertionError("SFTP client must not be yielded")
+
+    assert conn.attempts == 1
+    assert discarded == []
+    assert "no sftp for you" in str(excinfo.value)
+
+
+async def test_sftp_oserror_is_wrapped_not_retried(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend, SSHError
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    conn = _SftpConn([OSError("socket file descriptor lost")])
+    backend = SSHBackend()
+    discarded = []
+
+    async def fake_discard(connection):
+        discarded.append(connection)
+
+    monkeypatch.setattr(backend, "discard_connection", fake_discard)
+
+    with pytest.raises(SSHError) as excinfo:
+        async with backend.sftp_client(conn):
+            raise AssertionError("SFTP client must not be yielded")
+
+    assert conn.attempts == 1
+    assert discarded == []
+    assert "SFTP subsystem" in str(excinfo.value)
+    assert "socket file descriptor lost" in str(excinfo.value)
+
+
+async def test_sftp_cancellation_while_waiting_for_open_lock():
+    from compute_mcp.ssh_backend import SSHBackend
+
+    conn = _SftpConn()
+    conn.gate = asyncio.Event()
+    backend = SSHBackend()
+
+    async def use():
+        async with backend.sftp_client(conn) as client:
+            return client
+
+    holder = asyncio.create_task(use())
+    for _ in range(1000):
+        if conn.attempts:
+            break
+        await asyncio.sleep(0.001)
+    assert conn.attempts == 1
+
+    waiter = asyncio.create_task(use())
+    await asyncio.sleep(0.01)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    conn.gate.set()
+    await asyncio.wait_for(holder, 1.0)
+
+    # The lock must be free again after both the cancellation and the holder.
+    conn.gate = None
+    client = await asyncio.wait_for(use(), 1.0)
+    assert client.exited is True
+
+
+async def test_sftp_state_released_for_one_shot_connection():
+    from compute_mcp.ssh_backend import SSHBackend
+
+    conn = _SftpConn()
+    backend = SSHBackend()
+    async with backend.sftp_client(conn):
+        assert id(conn) in backend._sftp_locks
+        assert id(conn) in backend._sftp_sems
+
+    assert id(conn) not in backend._sftp_locks
+    assert id(conn) not in backend._sftp_sems
+
+
+async def test_sftp_state_released_on_redial(monkeypatch):
+    from compute_mcp.config import TargetConfig, TransportConfig
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = TargetConfig(
+        name="hal",
+        user="agent",
+        transport=TransportConfig(
+            kind="direct", remote_host="127.0.0.1", remote_port=2222
+        ),
+    )
+    old = _SftpConn()
+    new = _SftpConn()
+    dialed = iter([old, new])
+
+    async def fake_dial(
+        self, tgt, host, port, prompter=None, passphrase=None, username=None
+    ):
+        return next(dialed)
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+    backend = SSHBackend()
+    conn = await backend.connection(target, "127.0.0.1", 2222)
+    async with backend.sftp_client(conn):
+        pass
+    assert id(conn) in backend._sftp_locks
+
+    # A closed cached connection triggers the redial cleanup path.
+    conn.closed = True
+    assert await backend.connection(target, "127.0.0.1", 2222) is new
+    assert id(old) not in backend._sftp_locks
+    assert id(old) not in backend._sftp_sems

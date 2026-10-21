@@ -7,6 +7,7 @@ import dataclasses
 import json
 import time
 
+import asyncssh
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -330,7 +331,7 @@ async def test_file_chmod_endpoint(monkeypatch):
         return gw.config.targets[name], object()
 
     monkeypatch.setattr(gw, "_connection_provider", fake_provider)
-    monkeypatch.setattr("compute_mcp.gateway.sftp_client", lambda conn: FakeSftpCtx(conn))
+    monkeypatch.setattr(gw.backend, "sftp_client", lambda conn: FakeSftpCtx(conn))
 
     client = await make_client(gw)
     try:
@@ -604,7 +605,7 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
 
     monkeypatch.setattr(gw, "_connection_provider", fake_provider)
     monkeypatch.setattr(
-        "compute_mcp.gateway.sftp_client", lambda conn: FakeSftpCtx(conn)
+        gw.backend, "sftp_client", lambda conn: FakeSftpCtx(conn)
     )
 
     client = await make_client(gw)
@@ -3875,3 +3876,144 @@ async def test_connect_target_early_return_keeps_endpoint(monkeypatch):
     result = await gw.refresh_target("hal")
     assert result["state"] == "connected"
     assert result["provisioned_endpoint"] == "127.0.0.1:9501"
+
+
+# -- files: SFTP channel-open failures ------------------------------------
+
+
+class _GatewayAttrs:
+    permissions = 0o100644
+    size = 4
+    uid = 1
+    gid = 1
+    mtime = 0
+
+
+class _GatewayHandle:
+    def __init__(self, data=b"data") -> None:
+        self._data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def read(self, *_args):
+        data, self._data = self._data, b""
+        return data
+
+
+class _GatewaySftp:
+    def exit(self) -> None:
+        pass
+
+    async def stat(self, _path):
+        return _GatewayAttrs()
+
+    def open(self, _path, _mode):
+        return _GatewayHandle()
+
+
+class _GatewaySftpConn:
+    """Connection whose SFTP opens follow a failure schedule (int codes)."""
+
+    def __init__(self, failures=()) -> None:
+        self.failures = list(failures)
+        self.attempts = 0
+        self.closed = False
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+    async def start_sftp_client(self):
+        self.attempts += 1
+        if self.failures:
+            raise asyncssh.ChannelOpenError(
+                self.failures.pop(0), "Session request failed"
+            )
+        return _GatewaySftp()
+
+
+async def test_file_read_channel_open_error_maps_to_502(monkeypatch):
+    gw = make_gateway()
+    conn = _GatewaySftpConn([0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF])
+
+    async def fake_provider(name):
+        return gw.config.targets[name], conn
+
+    monkeypatch.setattr(gw, "_connection_provider", fake_provider)
+    # Zero backoff keeps the retry test deterministic without patching
+    # asyncio.sleep, which the gateway's background reaper also uses.
+    monkeypatch.setattr("compute_mcp.ssh_backend.SFTP_OPEN_BACKOFF_BASE", 0.0)
+    # Cache the connection so discard_connection actually drops it.
+    gw.backend._connections["hal"] = (conn, "127.0.0.1:9")
+
+    client = await make_client(gw)
+    try:
+        resp = await client.get(
+            "/v1/files/read",
+            headers=auth("alpaka-token"),
+            params={"target": "hal", "path": "/work/x"},
+        )
+        assert resp.status == 502, (resp.status, await resp.text())
+        body = await resp.text()
+        assert "SFTP subsystem" in body
+        assert "MaxSessions" in body
+        assert conn.attempts == 3
+        assert conn.closed is True
+        assert "hal" not in gw.backend.known_targets()
+    finally:
+        await client.close()
+
+
+async def test_concurrent_file_reads_retry_without_500(monkeypatch):
+    gw = make_gateway()
+    # The first two channel opens fail, the following ones succeed.
+    conn = _GatewaySftpConn([0xFFFFFFFF, 0xFFFFFFFF])
+
+    async def fake_provider(name):
+        return gw.config.targets[name], conn
+
+    monkeypatch.setattr(gw, "_connection_provider", fake_provider)
+    monkeypatch.setattr("compute_mcp.ssh_backend.SFTP_OPEN_BACKOFF_BASE", 0.0)
+
+    client = await make_client(gw)
+    try:
+        responses = await asyncio.gather(
+            *[
+                client.get(
+                    "/v1/files/read",
+                    headers=auth("alpaka-token"),
+                    params={"target": "hal", "path": f"/work/{i}"},
+                )
+                for i in range(3)
+            ]
+        )
+        statuses = [resp.status for resp in responses]
+        bodies = [await resp.text() for resp in responses]
+        assert statuses == [200, 200, 200], bodies
+        assert all('"data"' in body for body in bodies)
+    finally:
+        await client.close()
+
+
+async def test_error_middleware_passes_http_exceptions_through():
+    """Handler-owned HTTP errors (400/404, ...) must not become 502."""
+    from aiohttp import web
+
+    from compute_mcp.gateway import _error_middleware
+
+    async def handler(_request):
+        raise web.HTTPNotFound(text="missing")
+
+    with pytest.raises(web.HTTPNotFound) as excinfo:
+        await _error_middleware(object(), handler)
+    assert excinfo.value.status == 404
+    assert excinfo.value.text == "missing"
