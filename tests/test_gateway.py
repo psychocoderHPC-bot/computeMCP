@@ -625,6 +625,116 @@ async def test_upload_endpoint_streams_body_to_sftp(monkeypatch):
         await client.close()
 
 
+async def test_file_read_client_disconnect_mid_stream_is_not_500(monkeypatch, caplog):
+    """An aborted streamed download is client behaviour, not a server fault.
+
+    aiohttp raises ClientConnectionResetError (a subclass of the stdlib
+    ConnectionResetError) from ``resp.write()`` once the client transport is
+    closing.  The handler must log that at DEBUG and return the already
+    prepared response instead of letting the reset reach the generic 500 path.
+    """
+    import logging
+
+    import aiohttp
+    from aiohttp import web
+
+    gw = make_gateway()
+    payload = b"x" * (256 * 1024)
+
+    class FakeHandle:
+        def __init__(self):
+            self.reads = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def read(self, size):
+            self.reads += 1
+            return payload if self.reads == 1 else b""
+
+    class FakeSFTP:
+        def exit(self):
+            pass
+
+        def open(self, path, mode):
+            return FakeHandle()
+
+        async def stat(self, path):
+            return type(
+                "A",
+                (),
+                {
+                    "permissions": 0o100644,
+                    "size": len(payload),
+                    "uid": 1,
+                    "gid": 1,
+                    "mtime": 0,
+                },
+            )()
+
+    class FakeSftpCtx:
+        def __init__(self, conn):
+            self._sftp = FakeSFTP()
+
+        async def __aenter__(self):
+            return self._sftp
+
+        async def __aexit__(self, *args):
+            return False
+
+    async def fake_provider(name):
+        return gw.config.targets[name], object()
+
+    monkeypatch.setattr(gw, "_connection_provider", fake_provider)
+    monkeypatch.setattr(gw.backend, "sftp_client", lambda conn: FakeSftpCtx(conn))
+
+    streams = []
+
+    class DisconnectStreamResponse(web.StreamResponse):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.write_attempted = False
+            streams.append(self)
+
+        async def write(self, data):
+            self.write_attempted = True
+            raise aiohttp.ClientConnectionResetError(
+                "Cannot write to closing transport"
+            )
+
+    monkeypatch.setattr(
+        "compute_mcp.gateway.web.StreamResponse", DisconnectStreamResponse
+    )
+
+    caplog.set_level(logging.DEBUG)
+    client = await make_client(gw)
+    try:
+        resp = await client.get(
+            "/v1/files/read",
+            headers=auth("alpaka-token"),
+            params={"target": "hal", "path": "/work/x.bin", "encoding": "stream"},
+        )
+        assert resp.status == 200, resp.status
+        assert streams, "streamed handler did not create a StreamResponse"
+        assert streams[0].write_attempted
+        assert streams[0].prepared
+        assert not [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.ERROR
+            and "Error handling request" in record.getMessage()
+        ]
+        assert any(
+            "client disconnected mid-stream" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        await client.close()
+
+
 def test_parse_provision_endpoint():
     from compute_mcp.tunnel import parse_provision_endpoint
 
