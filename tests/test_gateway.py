@@ -735,6 +735,107 @@ async def test_file_read_client_disconnect_mid_stream_is_not_500(monkeypatch, ca
         await client.close()
 
 
+async def test_file_read_sftp_error_mid_stream_is_not_swallowed(monkeypatch, caplog):
+    """A genuine remote SFTP read fault mid-stream must stay a server error.
+
+    The client-disconnect guard in ``h_file_read`` only catches
+    ConnectionResetError/BrokenPipeError.  This test drives a real asyncssh
+    fault out of ``handle.read()`` after headers are already on the wire and
+    pins that the guard does not mistake it for a disconnect: no DEBUG
+    "client disconnected mid-stream" record, and the fault still surfaces as a
+    server-side 502 completion in aiohttp's access log rather than a clean 200.
+    """
+    import logging
+
+    gw = make_gateway()
+    payload = b"x" * (256 * 1024)
+
+    class FakeHandle:
+        def __init__(self):
+            self.reads = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def read(self, size):
+            self.reads += 1
+            if self.reads == 1:
+                return payload
+            # The fault a real remote read raises when the SFTP subsystem
+            # dies: an asyncssh error, not a client transport error.
+            raise asyncssh.SFTPConnectionLost("connection lost")
+
+    class FakeSFTP:
+        def exit(self):
+            pass
+
+        def open(self, path, mode):
+            return FakeHandle()
+
+        async def stat(self, path):
+            return type(
+                "A",
+                (),
+                {
+                    "permissions": 0o100644,
+                    "size": len(payload),
+                    "uid": 1,
+                    "gid": 1,
+                    "mtime": 0,
+                },
+            )()
+
+    class FakeSftpCtx:
+        def __init__(self, conn):
+            self._sftp = FakeSFTP()
+
+        async def __aenter__(self):
+            return self._sftp
+
+        async def __aexit__(self, *args):
+            return False
+
+    async def fake_provider(name):
+        return gw.config.targets[name], object()
+
+    monkeypatch.setattr(gw, "_connection_provider", fake_provider)
+    monkeypatch.setattr(gw.backend, "sftp_client", lambda conn: FakeSftpCtx(conn))
+
+    caplog.set_level(logging.DEBUG)
+    client = await make_client(gw)
+    try:
+        resp = await client.get(
+            "/v1/files/read",
+            headers=auth("alpaka-token"),
+            params={"target": "hal", "path": "/work/x.bin", "encoding": "stream"},
+        )
+        # Headers went out before the fault, so resp.status stays 200 on the
+        # wire and a 502 is not observable there (the pre-prepare 502 mapping
+        # is covered by test_file_read_channel_open_error_maps_to_502).  The
+        # payload chunk was already written, so the client body is complete;
+        # the signal that the fault was not swallowed as success is the
+        # server-side completion: aiohttp maps the escaped asyncssh error to
+        # 502 in its access log instead of closing the request as a clean 200.
+        body = await resp.read()
+        assert resp.status == 200, resp.status
+        assert body == payload
+
+        assert not any(
+            "client disconnected mid-stream" in record.getMessage()
+            for record in caplog.records
+        ), "SFTP fault was misclassified as a client disconnect"
+        assert any(
+            " 502 " in record.getMessage()
+            for record in caplog.records
+            if record.name == "aiohttp.access"
+        ), "SFTP fault was swallowed as a clean 200 completion"
+    finally:
+        await client.close()
+
+
 def test_parse_provision_endpoint():
     from compute_mcp.tunnel import parse_provision_endpoint
 
