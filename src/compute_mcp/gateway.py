@@ -1751,14 +1751,30 @@ class Gateway:
                     )
                     if info.get("size") is not None:
                         resp.content_length = info["size"]
-                    await resp.prepare(request)
-                    async with sftp.open(path, "rb") as handle:
-                        while True:
-                            chunk = await handle.read(262144)
-                            if not chunk:
-                                break
-                            await resp.write(chunk)
-                    await resp.write_eof()
+                    try:
+                        await resp.prepare(request)
+                        async with sftp.open(path, "rb") as handle:
+                            while True:
+                                chunk = await handle.read(262144)
+                                if not chunk:
+                                    break
+                                await resp.write(chunk)
+                        await resp.write_eof()
+                    except (ConnectionResetError, BrokenPipeError) as exc:
+                        # A client that aborts a download closes the transport
+                        # under us (TCP RST or EPIPE). aiohttp's
+                        # ClientConnectionResetError subclasses the stdlib
+                        # ConnectionResetError, so this covers both; the bare
+                        # stdlib errors cover older aiohttp versions. This is
+                        # ordinary client behaviour, not a server fault.
+                        log.debug(
+                            "file read aborted: client disconnected mid-stream "
+                            "target=%s path=%s (%s)",
+                            target_name,
+                            path,
+                            type(exc).__name__,
+                        )
+                        return resp
                     return resp
             finally:
                 if owned:
