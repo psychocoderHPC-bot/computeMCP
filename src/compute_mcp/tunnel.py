@@ -588,16 +588,20 @@ class TunnelManager:
         try:
             for hop in _iter_hops(route_info):
                 is_final = hop is route_info
+                # The per-request factor is the credential for the route
+                # (final) login, never for a ProxyJump hop.  A one-time code
+                # consumed by an intermediate host would leave the real 2FA
+                # prompt unanswered.
                 tunnel_conn = await _dial_hop(
                     hop,
                     tunnel=conn,
                     client_keys=client_keys,
-                    prompter=prompter,
+                    prompter=prompter if is_final else None,
                     pin=pin if is_final else None,
                     ssh=self.ssh,
                     name=route,
                     fallback_user=target.user,
-                    passphrase=factor,
+                    passphrase=factor if is_final else None,
                 )
                 opened.append(tunnel_conn)
                 conn = tunnel_conn

@@ -567,3 +567,79 @@ async def test_proxyjump_nonfinal_hop_dialed_without_route_pin(
     finally:
         await tunnel.stop()
         mgr.release(tunnel)
+
+
+async def test_proxyjump_factor_is_used_only_on_the_final_hop(monkeypatch):
+    """The 2FA factor must not be spent on a ProxyJump hop."""
+    jump_calls = []
+    final_calls = []
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        if alias == "route":
+            return {
+                "alias": "route",
+                "hostname": "final.example",
+                "user": "agent",
+                "port": 22,
+                "identityfiles": (),
+                "jumps": (
+                    {
+                        "alias": "jump",
+                        "hostname": "jump.example",
+                        "user": "agent",
+                        "port": 22,
+                        "identityfiles": (),
+                        "jumps": (),
+                    },
+                ),
+            }
+        return {
+            "alias": alias,
+            "hostname": alias,
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        jump_calls.append(kwargs)
+        return _FakeRouteConn()
+
+    async def fake_connect(host, **kwargs):
+        final_calls.append(kwargs)
+        return _FakeRouteConn()
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.asyncssh.connect", fake_connect)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    target = TargetConfig(
+        name="t",
+        user="agent",
+        transport=TransportConfig(
+            kind="tunnel", ssh_targets=("route",), remote_host="cn", remote_port=1
+        ),
+        route_host_key_sha256=(
+            "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        ),
+    )
+    mgr = TunnelManager(SSHConfig())
+    local_port = allocate_loopback_port(mgr.ssh, mgr._reserved)
+    tunnel = await asyncio.wait_for(
+        mgr.open_for_route(target, "route", local_port, factor="SECRET"),
+        CONNECT_TIMEOUT,
+    )
+    try:
+        assert jump_calls[0]["prompter"] is None
+        assert jump_calls[0]["passphrase"] is None
+        assert final_calls[0]["passphrase"] == "SECRET"
+        client = final_calls[0]["client_factory"]()
+        assert client._prompter is not None
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
