@@ -202,21 +202,22 @@ async def test_dial_route_accept_any_uses_empty_trusted_set(monkeypatch):
 
 # -- make_factor_prompter ----------------------------------------------------
 
-async def test_factor_prompter_answers_password_and_kbdint():
+async def test_factor_prompter_answers_only_the_first_prompt():
     from compute_mcp.ssh_backend import make_factor_prompter
 
     prompter = make_factor_prompter("SECRET")
     assert await prompter("Password: ", False) == "SECRET"
-    assert await prompter("OTP code: ", True) == "SECRET"
+    # A second prompt is a replay of a single-use factor and must not be sent.
+    assert await prompter("OTP code: ", True) is None
 
 
-async def test_factor_prompter_caps_at_three():
-    from compute_mcp.ssh_backend import make_factor_prompter
+async def test_factor_prompter_never_replays():
+    from compute_mcp.ssh_backend import FACTOR_MAX_USES, make_factor_prompter
 
+    assert FACTOR_MAX_USES == 1
     prompter = make_factor_prompter("SECRET")
     answers = [await prompter("p", False) for _ in range(5)]
-    assert answers[:3] == ["SECRET", "SECRET", "SECRET"]
-    assert answers[3:] == [None, None]
+    assert answers == ["SECRET", None, None, None, None]
 
 
 async def test_factor_prompter_never_leaks_secret_in_repr(caplog):
@@ -260,6 +261,41 @@ async def test_empty_route_user_uses_asyncssh_sentinel(monkeypatch):
     )
     assert seen["username"] == ()
     assert seen["username"] is not None
+
+
+async def test_dial_route_prefers_keyboard_interactive_for_the_factor(monkeypatch):
+    """The factor must reach the keyboard-interactive prompt, not a password.
+
+    On a server that advertises both methods, a single-use code spent on
+    ``password`` would leave the real 2FA prompt unanswered.
+    """
+    from compute_mcp.ssh_backend import dial_route
+
+    seen = {}
+
+    async def fake_connect(host, **connect_kwargs):
+        seen.update(connect_kwargs)
+        return _FakeSSHClient()
+
+    monkeypatch.setattr("compute_mcp.ssh_backend.asyncssh.connect", fake_connect)
+    await dial_route(
+        name="route",
+        host="127.0.0.1",
+        port=22,
+        username="agent",
+        client_keys=None,
+        passphrase=None,
+        prompter=lambda prompt, echo: None,
+        host_key_sha256=None,
+        known_hosts=None,
+        host_key_algorithms=(),
+        host_key_check="on",
+    )
+    assert list(seen["preferred_auth"]) == [
+        "publickey",
+        "keyboard-interactive",
+        "password",
+    ]
 
 
 # -- container hop uses the container login user, not the route user ---------

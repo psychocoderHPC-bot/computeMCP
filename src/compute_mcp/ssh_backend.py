@@ -154,31 +154,30 @@ class InteractiveSSHClient(asyncssh.SSHClient):
 # Backwards-compatible name used by earlier code paths / tests.
 PinnedHostKeyClient = InteractiveSSHClient
 
-# Maximum number of interactive factor prompts answered before giving up.
-# Mirrors ``Gateway.MAX_AUTH_PROMPTS`` so the route dial and the container dial
-# bound operator prompts identically.
-MAX_FACTOR_PROMPTS = 3
+# A per-request second factor is single use.  Submitting a one-time code more
+# than once counts as a failed login at the site and can lock the account.
+FACTOR_MAX_USES = 1
 
 
 def make_factor_prompter(secret: str) -> _Prompter:
-    """Return a prompter that answers every auth prompt with ``secret``.
+    """Return a prompter that submits ``secret`` at most once.
 
     Used for a per-request second factor (password / OTP) on the gateway ->
-    login-node (route) connection.  The same value is returned for password and
-    keyboard-interactive prompts; attempts are capped at
-    :data:`MAX_FACTOR_PROMPTS`, after which ``None`` is returned so the SSH
-    library stops instead of retrying forever.  The secret is never logged.
+    login-node (route) connection.  One-time codes are single use, so a second
+    prompt is not answered: replaying the same code would only add a failed
+    authentication attempt at the site.  The prompter therefore returns ``None``
+    after the first use, which stops that auth method instead of retrying with
+    the same secret.  The secret is never logged.
     """
-    attempts = 0
+    uses = 0
 
     async def prompter(prompt: str, echo: bool) -> str | None:
-        nonlocal attempts
-        attempts += 1
-        if attempts > MAX_FACTOR_PROMPTS:
+        nonlocal uses
+        uses += 1
+        if uses > FACTOR_MAX_USES:
             log.warning(
-                "route authentication: giving up after %d interactive "
-                "attempt(s)",
-                MAX_FACTOR_PROMPTS,
+                "route authentication: refusing to replay a single-use second "
+                "factor; aborting this attempt"
             )
             return None
         return secret
@@ -254,6 +253,10 @@ async def dial_route(
             known_hosts=selected_known_hosts,
             client_factory=client_factory,
             server_host_key_algs=host_key_algorithms or (),
+            # Prefer the natural 2FA method.  When a server offers both
+            # ``password`` and ``keyboard-interactive``, spending a single-use
+            # factor on the wrong method would leave the real prompt unanswered.
+            preferred_auth=("publickey", "keyboard-interactive", "password"),
             connect_timeout=connect_timeout,
             keepalive_interval=keepalive_interval,
             keepalive_count_max=keepalive_count_max,

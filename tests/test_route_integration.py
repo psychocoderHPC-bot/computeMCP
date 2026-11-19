@@ -249,12 +249,10 @@ async def test_wrong_factor_fails_without_hang(tmp_path_factory, monkeypatch):
         target = _target(login)
         with pytest.raises((TunnelError, SSHError)):
             await _open(mgr, target, factor="WRONG")
-        # The server observed the (wrong) password and refused.  The capped
-        # prompter retried exactly MAX_FACTOR_PROMPTS times, never unbounded.
+        # The server observed the (wrong) password exactly once: a single-use
+        # factor must never be replayed on a second prompt.
         assert login.state is not None
-        from compute_mcp.ssh_backend import MAX_FACTOR_PROMPTS
-
-        assert login.state.get("seen_passwords") == ["WRONG"] * MAX_FACTOR_PROMPTS
+        assert login.state.get("seen_passwords") == ["WRONG"]
     finally:
         await login.close()
 
