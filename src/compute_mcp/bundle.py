@@ -29,6 +29,7 @@ import subprocess
 import asyncssh
 
 from .config import TargetConfig
+from .ssh_backend import with_channel_open_retry
 
 log = logging.getLogger(__name__)
 
@@ -302,7 +303,9 @@ async def ensure_deployed(
 
 
 async def _run(conn, command: str, timeout: float = 120.0):
-    return await conn.run(command, check=False, encoding=None, timeout=timeout)
+    return await with_channel_open_retry(
+        lambda: conn.run(command, check=False, encoding=None, timeout=timeout)
+    )
 
 
 async def _marker_present(conn, deploy_dir: str, marker: str, run) -> bool:

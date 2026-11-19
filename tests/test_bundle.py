@@ -468,3 +468,35 @@ async def test_ensure_deployed_keeps_both_deploy_errors(tmp_path):
     assert "sftp refused" in message
     assert "base64 fallback" in message
     assert "could not write" in message
+
+
+@pytest.mark.asyncio
+async def test_run_retries_a_refused_route_channel(monkeypatch):
+    """A refused session channel is transient on a single-session route."""
+    import asyncio
+
+    import asyncssh
+
+    from compute_mcp import bundle as bundle_module
+
+    async def _no_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    class _Conn:
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, command, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise asyncssh.ChannelOpenError(
+                    asyncssh.OPEN_CONNECT_FAILED, "open failed"
+                )
+            return _Result(0)
+
+    conn = _Conn()
+    result = await bundle_module._run(conn, "mkdir -p /scratch/x")
+    assert conn.calls == 2
+    assert result.exit_status == 0

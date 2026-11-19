@@ -42,6 +42,7 @@ from .ssh_backend import (
     _empty_known_hosts,
     dial_route,
     make_factor_prompter,
+    with_channel_open_retry,
 )
 
 log = logging.getLogger("compute_mcp.tunnel")
@@ -634,11 +635,13 @@ class TunnelManager:
                 target.name, route, " ".join(argv_tuple),
             )
             try:
-                result = await conn.run(
-                    command,
-                    check=False,
-                    timeout=target.provision_timeout,
-                    encoding=None,
+                result = await with_channel_open_retry(
+                    lambda: conn.run(
+                        command,
+                        check=False,
+                        timeout=target.provision_timeout,
+                        encoding=None,
+                    )
                 )
             except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
                 for opened_conn in reversed(opened):
@@ -737,11 +740,13 @@ class TunnelManager:
             target.name, label, route, " ".join(argv),
         )
         try:
-            result = await connection.run(
-                command,
-                check=False,
-                timeout=timeout,
-                encoding=None,
+            result = await with_channel_open_retry(
+                lambda: connection.run(
+                    command,
+                    check=False,
+                    timeout=timeout,
+                    encoding=None,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - advisory, never fatal
             log.warning(

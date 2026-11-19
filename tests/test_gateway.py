@@ -4265,3 +4265,55 @@ async def test_error_middleware_passes_http_exceptions_through():
         await _error_middleware(object(), handler)
     assert excinfo.value.status == 404
     assert excinfo.value.text == "missing"
+
+
+async def test_connect_command_serializes_on_the_route_connection(monkeypatch):
+    """Two container dials must not run connect_command concurrently.
+
+    The command opens a session channel on the route connection, and the login
+    node may allow only one at a time.
+    """
+    gw = make_gateway()
+    target = _tunnel_target(
+        connect_command=("/bin/up.sh",), connect_command_mode="always"
+    )
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    route_conn = object()
+
+    async def fake_ensure(name):
+        gw.runtimes[name].tunnel = _FakeTunnel(
+            target, route="hal", local_port=2222, connection=route_conn
+        )
+        return gw.runtimes[name]
+
+    inflight = 0
+    max_inflight = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_run_connect_command(t, route, connection=None):
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        started.set()
+        await release.wait()
+        inflight -= 1
+
+    async def fake_connection(t, host, port, prompter=None):
+        return "CONN"
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw, "_endpoint", lambda runtime: ("127.0.0.1", 2222))
+    monkeypatch.setattr(gw.tunnels, "run_connect_command", fake_run_connect_command)
+    monkeypatch.setattr(gw.backend, "connection", fake_connection)
+
+    first = asyncio.create_task(gw._open_container_conn("hal"))
+    await started.wait()
+    second = asyncio.create_task(gw._open_container_conn("hal"))
+    await asyncio.sleep(0.05)
+    assert max_inflight == 1
+    release.set()
+    await asyncio.gather(first, second)
+    assert max_inflight == 1

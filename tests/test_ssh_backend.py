@@ -980,3 +980,54 @@ async def test_sftp_state_released_on_redial(monkeypatch):
     assert await backend.connection(target, "127.0.0.1", 2222) is new
     assert id(old) not in backend._sftp_locks
     assert id(old) not in backend._sftp_sems
+
+
+async def test_channel_open_retry_retries_a_refused_open(monkeypatch):
+    from compute_mcp.ssh_backend import with_channel_open_retry
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        if len(calls) == 1:
+            raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_CONNECT_FAILED, "open failed"
+            )
+        return "ok"
+
+    assert await with_channel_open_retry(operation) == "ok"
+    assert len(calls) == 2
+
+
+async def test_channel_open_retry_gives_up_after_the_budget(monkeypatch):
+    from compute_mcp.ssh_backend import (
+        ROUTE_SESSION_ATTEMPTS,
+        with_channel_open_retry,
+    )
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "open failed")
+
+    with pytest.raises(asyncssh.ChannelOpenError):
+        await with_channel_open_retry(operation)
+    assert len(calls) == ROUTE_SESSION_ATTEMPTS
+
+
+async def test_channel_open_retry_does_not_retry_other_errors(monkeypatch):
+    from compute_mcp.ssh_backend import with_channel_open_retry
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        raise ValueError("not a channel open failure")
+
+    with pytest.raises(ValueError):
+        await with_channel_open_retry(operation)
+    assert len(calls) == 1

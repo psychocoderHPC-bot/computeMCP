@@ -48,7 +48,7 @@ class HostKeyError(SSHError):
     pass
 
 
-def _is_channel_open_error(exc: BaseException) -> bool:
+def is_channel_open_error(exc: BaseException) -> bool:
     """Return True when *exc* is asyncssh's channel-open failure.
 
     ``asyncssh.ChannelOpenError`` is exported at the top level in asyncssh
@@ -58,6 +58,41 @@ def _is_channel_open_error(exc: BaseException) -> bool:
     """
     channel_open_error = getattr(asyncssh, "ChannelOpenError", None)
     return channel_open_error is not None and isinstance(exc, channel_open_error)
+
+
+# A route connection can transiently refuse the next session channel while the
+# previous one is still being torn down (OpenSSH MaxSessions).  A refused open
+# means the command was never sent, so a bounded retry is safe.
+ROUTE_SESSION_ATTEMPTS = 3
+ROUTE_SESSION_BACKOFF_BASE = 0.25
+
+
+async def with_channel_open_retry(
+    operation,
+    *,
+    attempts: int = ROUTE_SESSION_ATTEMPTS,
+    base_delay: float = ROUTE_SESSION_BACKOFF_BASE,
+):
+    """Await ``operation()``, retrying only a refused session-channel open.
+
+    ``operation`` must open a fresh channel and run its command.  A
+    ``ChannelOpenError`` is raised before the command reaches the remote side,
+    so retrying cannot duplicate side effects, including for provisioning.
+    Other errors propagate unchanged.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except asyncssh.ChannelOpenError as exc:
+            if attempt >= attempts:
+                raise
+            log.warning(
+                "route session channel refused (%s); retry %d/%d",
+                exc,
+                attempt,
+                attempts - 1,
+            )
+            await asyncio.sleep(base_delay * 2 ** (attempt - 1))
 
 
 def _channel_open_message(prefix: str, exc: BaseException) -> str:
@@ -514,7 +549,7 @@ class SSHBackend:
             # sshd refused a new session channel on this connection, typically
             # because its per-connection MaxSessions cap was reached.  Drop the
             # cached connection so the next request can redial.
-            if _is_channel_open_error(exc):
+            if is_channel_open_error(exc):
                 await self.discard_connection(conn)
                 raise SSHError(
                     _channel_open_message(
@@ -544,7 +579,7 @@ class SSHBackend:
                 request_pty=True,
             )
         except asyncssh.Error as exc:
-            if _is_channel_open_error(exc):
+            if is_channel_open_error(exc):
                 await self.discard_connection(conn)
                 raise SSHError(
                     _channel_open_message(
@@ -596,7 +631,7 @@ class SSHBackend:
                             # A bare OSError is not retried: only asyncssh's
                             # channel-open refusal has evidence of transience.
                             transient = (
-                                _is_channel_open_error(exc)
+                                is_channel_open_error(exc)
                                 and getattr(exc, "code", None) != _SFTP_OPEN_PROHIBITED
                             )
                             if attempt >= SFTP_OPEN_MAX_ATTEMPTS or not transient:
