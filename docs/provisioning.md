@@ -64,6 +64,15 @@ Because a bundle block is present, `provision_command` is **not** required:
 the gateway itself runs the deployed helper. Only set `provision_command` to
 opt back into manual management.
 
+The gateway deploys the bundle over the route connection. It creates
+`deploy-dir` with `mkdir -p` over the exec channel first, uploads over SFTP
+(or a base64 stream when SFTP is unavailable), and closes the SFTP channel
+before the provision command runs. Deploy and provision therefore use one
+session channel at a time, which a login node with `MaxSessions 1` requires.
+A reconnect with an unchanged bundle skips the upload (content hash marker);
+`auto-deploy = false` pins the deployed copy.
+
+
 ### 1.2 Bundle keys
 
 | Key | Type | Behavior |

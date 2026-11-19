@@ -169,11 +169,16 @@ computeMCP-gatewayctl target-connect --2fa SECRET myTargetHost
 computeMCP-gatewayctl target-refresh --2fa SECRET myTargetHost
 ```
 
-The factor is used once per request and is never persisted or logged. An
-interactive target does not auto-connect or auto-reconnect; a request that
-omits the factor fails closed (state unchanged) with a warning. When
-`interactive_auth` is false and `--2fa` is given, the gateway warns, ignores
-the factor, and proceeds with a key-based connect.
+The factor is used once per request and is never persisted or logged. The
+gateway submits it at most once: if the server asks again in the same
+connection, the attempt is aborted instead of replaying a one-time code, which
+would count as another failed login and can lock the account. An interactive
+target does not auto-connect or auto-reconnect; a request that omits the factor
+fails closed (state unchanged) with a warning, and a disconnected interactive
+target also refuses `exec`, session and file requests without dialing.
+`target-connect`/`target-refresh` with `--2fa` are the only ways to connect it.
+When `interactive_auth` is false and `--2fa` is given, the gateway warns,
+ignores the factor, and proceeds with a key-based connect.
 
 ### Allocation overrides (`--set`) and previews (`--dry-run`)
 
