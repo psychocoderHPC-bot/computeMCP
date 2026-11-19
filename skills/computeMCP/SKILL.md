@@ -295,6 +295,12 @@ the site. Ask the operator if a proxy path is officially approved. Only then
 fetch the dependencies here (this container has internet), upload the
 artifacts, and install them offline:
 
+The distro release matters for two things: the Python ABI (`cp312` vs `cp314`)
+and system packages. A pure-Python `py3-none-any` wheel works across Ubuntu
+releases; a CPython-specific binary wheel must match the target Python and a
+manylinux tag its glibc satisfies. `.deb` files must come from the target
+release.
+
 1. Match the target first: `python3 -V`, `uname -m`, `/etc/os-release`. For the
    same Python and platform:
    `pip download --only-binary=:all: -d /tmp/wheels -r requirements.txt`.
