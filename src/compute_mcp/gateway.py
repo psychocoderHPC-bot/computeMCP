@@ -464,6 +464,17 @@ class Gateway:
         *,
         overrides: dict[str, Any] | None = None,
     ) -> TargetRuntime:
+        if target.interactive_auth and factor is None:
+            # Fail closed before dialing.  Without a factor the route login is
+            # guaranteed to fail, and every such attempt counts as a failed
+            # authentication at the site.  Only connect_target/refresh_target
+            # may supply the per-request factor.
+            runtime.awaiting_factor = True
+            runtime.last_error = (
+                "interactive authentication required; run "
+                f"'target-connect --2fa <secret> {target.name}'"
+            )
+            raise InteractiveAuthRequired(target.name)
         runtime.state = "connecting"
         runtime.last_error = None
         provision_env: dict[str, str] | None = None

@@ -2099,6 +2099,43 @@ async def test_factor_matrix_non_interactive_without_factor(monkeypatch):
     assert "warning" not in result
 
 
+async def test_ensure_connected_refuses_interactive_target_without_factor(monkeypatch):
+    """The exec/file path must not dial a disconnected interactive target.
+
+    connect_target() already refuses without a factor.  ensure_connected() is
+    reached from _open_container_conn() for exec/session/file calls and used to
+    dial anyway, which produced a factor-less login attempt that the site can
+    count as a failure.
+    """
+    from compute_mcp.gateway import InteractiveAuthRequired
+
+    gw, _ = _interactive_gateway()
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    with pytest.raises(InteractiveAuthRequired):
+        await gw.ensure_connected("hal")
+
+    assert rec["calls"] == []
+    runtime = gw.runtimes["hal"]
+    assert runtime.awaiting_factor is True
+    assert "interactive authentication required" in runtime.last_error
+
+
+async def test_ensure_connected_live_interactive_target_does_not_dial(monkeypatch):
+    gw, target = _interactive_gateway()
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.tunnel = _FakeTunnel(target, route="hal", local_port=2222, alive=True)
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    returned = await gw.ensure_connected("hal")
+
+    assert returned is runtime
+    assert rec["calls"] == []
+
+
 async def test_refresh_interactive_no_factor_no_teardown(monkeypatch):
     gw, _ = _interactive_gateway()
     rec = {"calls": []}
