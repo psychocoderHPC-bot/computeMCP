@@ -265,16 +265,38 @@ async def ensure_deployed(
         )
         return deploy_dir
 
+    # Create the directory over the exec channel first.  sftp.makedirs() reports
+    # a bare "No such file" when it cannot create a component, and asyncssh
+    # hides a permission denial on an intermediate component.  mkdir -p gives
+    # the real error and makes the SFTP path a no-op when everything exists.
+    result = await run(conn, f"mkdir -p {shlex.quote(deploy_dir)}")
+    if getattr(result, "exit_status", 1) != 0:
+        stderr = (getattr(result, "stderr", b"") or b"").decode(
+            errors="replace"
+        ).strip()
+        raise BundleError(
+            f"cannot create deploy dir {deploy_dir!r}: {stderr or 'no stderr'}"
+        )
+
     factory = sftp_factory or _sftp_client
     try:
         await _deploy_sftp(factory, conn, deploy_dir, contents, marker)
-    except (asyncssh.Error, OSError, BundleError) as exc:
+    except (asyncssh.Error, OSError, BundleError) as sftp_exc:
         log.warning(
-            "target %s: SFTP bundle deploy failed (%s); falling back to base64",
+            "target %s: SFTP deploy to %s failed (%s); falling back to base64",
             target.name,
-            exc,
+            deploy_dir,
+            sftp_exc,
         )
-        await _deploy_shell(conn, deploy_dir, contents, marker, run)
+        try:
+            await _deploy_shell(conn, deploy_dir, contents, marker, run)
+        except (asyncssh.Error, OSError, BundleError) as shell_exc:
+            # Keep both causes: the fallback error alone hid the real deploy
+            # failure behind a secondary "open failed" on a busy route channel.
+            raise BundleError(
+                f"bundle deploy to {deploy_dir!r} failed: "
+                f"SFTP: {sftp_exc}; base64 fallback: {shell_exc}"
+            ) from shell_exc
     log.info("target %s: deployed bundle %s to %s", target.name, bundle_cfg.source, deploy_dir)
     return deploy_dir
 
