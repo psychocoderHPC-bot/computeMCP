@@ -202,21 +202,22 @@ async def test_dial_route_accept_any_uses_empty_trusted_set(monkeypatch):
 
 # -- make_factor_prompter ----------------------------------------------------
 
-async def test_factor_prompter_answers_password_and_kbdint():
+async def test_factor_prompter_answers_only_the_first_prompt():
     from compute_mcp.ssh_backend import make_factor_prompter
 
     prompter = make_factor_prompter("SECRET")
     assert await prompter("Password: ", False) == "SECRET"
-    assert await prompter("OTP code: ", True) == "SECRET"
+    # A second prompt is a replay of a single-use factor and must not be sent.
+    assert await prompter("OTP code: ", True) is None
 
 
-async def test_factor_prompter_caps_at_three():
-    from compute_mcp.ssh_backend import make_factor_prompter
+async def test_factor_prompter_never_replays():
+    from compute_mcp.ssh_backend import FACTOR_MAX_USES, make_factor_prompter
 
+    assert FACTOR_MAX_USES == 1
     prompter = make_factor_prompter("SECRET")
     answers = [await prompter("p", False) for _ in range(5)]
-    assert answers[:3] == ["SECRET", "SECRET", "SECRET"]
-    assert answers[3:] == [None, None]
+    assert answers == ["SECRET", None, None, None, None]
 
 
 async def test_factor_prompter_never_leaks_secret_in_repr(caplog):
@@ -260,6 +261,41 @@ async def test_empty_route_user_uses_asyncssh_sentinel(monkeypatch):
     )
     assert seen["username"] == ()
     assert seen["username"] is not None
+
+
+async def test_dial_route_prefers_keyboard_interactive_for_the_factor(monkeypatch):
+    """The factor must reach the keyboard-interactive prompt, not a password.
+
+    On a server that advertises both methods, a single-use code spent on
+    ``password`` would leave the real 2FA prompt unanswered.
+    """
+    from compute_mcp.ssh_backend import dial_route
+
+    seen = {}
+
+    async def fake_connect(host, **connect_kwargs):
+        seen.update(connect_kwargs)
+        return _FakeSSHClient()
+
+    monkeypatch.setattr("compute_mcp.ssh_backend.asyncssh.connect", fake_connect)
+    await dial_route(
+        name="route",
+        host="127.0.0.1",
+        port=22,
+        username="agent",
+        client_keys=None,
+        passphrase=None,
+        prompter=lambda prompt, echo: None,
+        host_key_sha256=None,
+        known_hosts=None,
+        host_key_algorithms=(),
+        host_key_check="on",
+    )
+    assert list(seen["preferred_auth"]) == [
+        "publickey",
+        "keyboard-interactive",
+        "password",
+    ]
 
 
 # -- container hop uses the container login user, not the route user ---------
@@ -641,11 +677,17 @@ class _FakeSftpClient:
     def __init__(self, conn) -> None:
         self._conn = conn
         self.exited = False
+        self.closed = False
 
     def exit(self) -> None:
         if not self.exited:
             self.exited = True
+            self._conn.events.append("exit")
             self._conn.channels_open -= 1
+
+    async def wait_closed(self) -> None:
+        self.closed = True
+        self._conn.events.append("wait_closed")
 
 
 class _SftpConn:
@@ -663,6 +705,7 @@ class _SftpConn:
         self.channels_open = 0
         self.max_channels = 0
         self.closed = False
+        self.events: list[str] = []
         self.gate = None
         self.clients: list[_FakeSftpClient] = []
 
@@ -717,6 +760,25 @@ async def test_concurrent_sftp_opens_serialize():
     assert conn.attempts == 5
     assert conn.max_inflight == 1
     assert all(client.exited for client in clients)
+
+
+async def test_sftp_client_waits_for_close_before_next_use():
+    """The bounded slot is released only after the channel is gone.
+
+    A server that caps concurrent session channels must not see the next open
+    while the previous SFTP channel is still counted.
+    """
+    from compute_mcp.ssh_backend import SSHBackend
+
+    conn = _SftpConn()
+    backend = SSHBackend()
+
+    async with backend.sftp_client(conn) as client:
+        conn.events.append("body")
+    conn.events.append("after")
+
+    assert conn.events == ["body", "exit", "wait_closed", "after"]
+    assert client.closed is True
 
 
 async def test_sftp_semaphore_bounds_concurrent_sessions():
@@ -918,3 +980,54 @@ async def test_sftp_state_released_on_redial(monkeypatch):
     assert await backend.connection(target, "127.0.0.1", 2222) is new
     assert id(old) not in backend._sftp_locks
     assert id(old) not in backend._sftp_sems
+
+
+async def test_channel_open_retry_retries_a_refused_open(monkeypatch):
+    from compute_mcp.ssh_backend import with_channel_open_retry
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        if len(calls) == 1:
+            raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_CONNECT_FAILED, "open failed"
+            )
+        return "ok"
+
+    assert await with_channel_open_retry(operation) == "ok"
+    assert len(calls) == 2
+
+
+async def test_channel_open_retry_gives_up_after_the_budget(monkeypatch):
+    from compute_mcp.ssh_backend import (
+        ROUTE_SESSION_ATTEMPTS,
+        with_channel_open_retry,
+    )
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "open failed")
+
+    with pytest.raises(asyncssh.ChannelOpenError):
+        await with_channel_open_retry(operation)
+    assert len(calls) == ROUTE_SESSION_ATTEMPTS
+
+
+async def test_channel_open_retry_does_not_retry_other_errors(monkeypatch):
+    from compute_mcp.ssh_backend import with_channel_open_retry
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    calls = []
+
+    async def operation():
+        calls.append(1)
+        raise ValueError("not a channel open failure")
+
+    with pytest.raises(ValueError):
+        await with_channel_open_retry(operation)
+    assert len(calls) == 1

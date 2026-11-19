@@ -48,7 +48,7 @@ class HostKeyError(SSHError):
     pass
 
 
-def _is_channel_open_error(exc: BaseException) -> bool:
+def is_channel_open_error(exc: BaseException) -> bool:
     """Return True when *exc* is asyncssh's channel-open failure.
 
     ``asyncssh.ChannelOpenError`` is exported at the top level in asyncssh
@@ -58,6 +58,43 @@ def _is_channel_open_error(exc: BaseException) -> bool:
     """
     channel_open_error = getattr(asyncssh, "ChannelOpenError", None)
     return channel_open_error is not None and isinstance(exc, channel_open_error)
+
+
+# A route connection can transiently refuse the next session channel while the
+# previous one is still being torn down (OpenSSH MaxSessions).  A refused open
+# means the command was never sent, so a bounded retry is safe.
+ROUTE_SESSION_ATTEMPTS = 3
+ROUTE_SESSION_BACKOFF_BASE = 0.25
+
+
+async def with_channel_open_retry(
+    operation,
+    *,
+    attempts: int = ROUTE_SESSION_ATTEMPTS,
+    base_delay: float = ROUTE_SESSION_BACKOFF_BASE,
+):
+    """Await ``operation()``, retrying only a refused session-channel open.
+
+    ``operation`` must open a fresh channel and run its command.  A
+    ``ChannelOpenError`` is raised before the command reaches the remote side,
+    so retrying cannot duplicate side effects, including for provisioning.
+    Other errors propagate unchanged.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except asyncssh.Error as exc:
+            if not is_channel_open_error(exc):
+                raise
+            if attempt >= attempts:
+                raise
+            log.warning(
+                "route session channel refused (%s); retry %d/%d",
+                exc,
+                attempt,
+                attempts - 1,
+            )
+            await asyncio.sleep(base_delay * 2 ** (attempt - 1))
 
 
 def _channel_open_message(prefix: str, exc: BaseException) -> str:
@@ -154,31 +191,30 @@ class InteractiveSSHClient(asyncssh.SSHClient):
 # Backwards-compatible name used by earlier code paths / tests.
 PinnedHostKeyClient = InteractiveSSHClient
 
-# Maximum number of interactive factor prompts answered before giving up.
-# Mirrors ``Gateway.MAX_AUTH_PROMPTS`` so the route dial and the container dial
-# bound operator prompts identically.
-MAX_FACTOR_PROMPTS = 3
+# A per-request second factor is single use.  Submitting a one-time code more
+# than once counts as a failed login at the site and can lock the account.
+FACTOR_MAX_USES = 1
 
 
 def make_factor_prompter(secret: str) -> _Prompter:
-    """Return a prompter that answers every auth prompt with ``secret``.
+    """Return a prompter that submits ``secret`` at most once.
 
     Used for a per-request second factor (password / OTP) on the gateway ->
-    login-node (route) connection.  The same value is returned for password and
-    keyboard-interactive prompts; attempts are capped at
-    :data:`MAX_FACTOR_PROMPTS`, after which ``None`` is returned so the SSH
-    library stops instead of retrying forever.  The secret is never logged.
+    login-node (route) connection.  One-time codes are single use, so a second
+    prompt is not answered: replaying the same code would only add a failed
+    authentication attempt at the site.  The prompter therefore returns ``None``
+    after the first use, which stops that auth method instead of retrying with
+    the same secret.  The secret is never logged.
     """
-    attempts = 0
+    uses = 0
 
     async def prompter(prompt: str, echo: bool) -> str | None:
-        nonlocal attempts
-        attempts += 1
-        if attempts > MAX_FACTOR_PROMPTS:
+        nonlocal uses
+        uses += 1
+        if uses > FACTOR_MAX_USES:
             log.warning(
-                "route authentication: giving up after %d interactive "
-                "attempt(s)",
-                MAX_FACTOR_PROMPTS,
+                "route authentication: refusing to replay a single-use second "
+                "factor; aborting this attempt"
             )
             return None
         return secret
@@ -254,6 +290,10 @@ async def dial_route(
             known_hosts=selected_known_hosts,
             client_factory=client_factory,
             server_host_key_algs=host_key_algorithms or (),
+            # Prefer the natural 2FA method.  When a server offers both
+            # ``password`` and ``keyboard-interactive``, spending a single-use
+            # factor on the wrong method would leave the real prompt unanswered.
+            preferred_auth=("publickey", "keyboard-interactive", "password"),
             connect_timeout=connect_timeout,
             keepalive_interval=keepalive_interval,
             keepalive_count_max=keepalive_count_max,
@@ -511,7 +551,7 @@ class SSHBackend:
             # sshd refused a new session channel on this connection, typically
             # because its per-connection MaxSessions cap was reached.  Drop the
             # cached connection so the next request can redial.
-            if _is_channel_open_error(exc):
+            if is_channel_open_error(exc):
                 await self.discard_connection(conn)
                 raise SSHError(
                     _channel_open_message(
@@ -541,7 +581,7 @@ class SSHBackend:
                 request_pty=True,
             )
         except asyncssh.Error as exc:
-            if _is_channel_open_error(exc):
+            if is_channel_open_error(exc):
                 await self.discard_connection(conn)
                 raise SSHError(
                     _channel_open_message(
@@ -593,7 +633,7 @@ class SSHBackend:
                             # A bare OSError is not retried: only asyncssh's
                             # channel-open refusal has evidence of transience.
                             transient = (
-                                _is_channel_open_error(exc)
+                                is_channel_open_error(exc)
                                 and getattr(exc, "code", None) != _SFTP_OPEN_PROHIBITED
                             )
                             if attempt >= SFTP_OPEN_MAX_ATTEMPTS or not transient:
@@ -627,6 +667,11 @@ class SSHBackend:
                 if client is not None:
                     with contextlib.suppress(Exception):
                         client.exit()
+                    # Release the bounded slot only after the server has
+                    # dropped the channel; otherwise the next open can race a
+                    # connection whose session budget is still exhausted.
+                    with contextlib.suppress(Exception):
+                        await client.wait_closed()
                 if self._target_for_conn(conn) is None:
                     # Dedicated/one-shot connections are closed by the caller
                     # after this context exits; drop their bound state now.

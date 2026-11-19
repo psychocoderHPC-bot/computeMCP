@@ -351,3 +351,152 @@ async def test_ensure_deployed_expands_home_for_sftp(tmp_path):
     assert resolved == "/home/remote/computemcp/bundle"
     digest = load_bundle("computemcp-slurm").digest
     assert f"/home/remote/computemcp/bundle/{marker_name(digest)}" in store
+
+
+class _CloseTrackingSFTP:
+    def __init__(self, events):
+        self.events = events
+
+    def exit(self):
+        self.events.append("exit")
+
+    async def wait_closed(self):
+        self.events.append("wait_closed")
+
+
+class _SftpStartConn:
+    def __init__(self, events):
+        self.events = events
+
+    async def start_sftp_client(self):
+        self.events.append("start")
+        return _CloseTrackingSFTP(self.events)
+
+
+@pytest.mark.asyncio
+async def test_sftp_client_waits_for_the_channel_to_close():
+    """The next route command must not race a still-open SFTP channel.
+
+    A login node can cap session channels per connection at one.  Closing the
+    SFTP client is asynchronous, so the context manager has to wait for the
+    channel to disappear before its caller opens the next session channel.
+    """
+    from compute_mcp.bundle import _sftp_client
+
+    events: list[str] = []
+    async with _sftp_client(_SftpStartConn(events)) as client:
+        assert isinstance(client, _CloseTrackingSFTP)
+        events.append("body")
+    events.append("after")
+
+    assert events == ["start", "body", "exit", "wait_closed", "after"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_deployed_creates_the_dir_before_opening_sftp(tmp_path):
+    """mkdir -p runs first, so sftp.makedirs() never has to create parents.
+
+    A failed parent creation surfaced as a bare "No such file"; doing it over
+    the exec channel reports the real error and keeps the SFTP step simple.
+    """
+    target = _bundle_target(tmp_path)
+    deploy_dir = resolve_deploy_dir(target)
+    store: dict[str, bytes] = {}
+    events: list[tuple[str, str]] = []
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            events.append(("run", command))
+            if command.startswith("test -f "):
+                return _Result(1)
+            return _Result(0)
+
+    def factory(_conn):
+        @contextlib.asynccontextmanager
+        async def manager():
+            events.append(("sftp", ""))
+            yield _FakeSFTP(store)
+
+        return manager()
+
+    await ensure_deployed(_Conn(), target, sftp_factory=factory)
+
+    mkdirs = [c for k, c in events if k == "run" and c.startswith("mkdir -p ")]
+    assert mkdirs == [f"mkdir -p {deploy_dir}"]
+    assert events.index(("run", mkdirs[0])) < events.index(("sftp", ""))
+
+
+@pytest.mark.asyncio
+async def test_ensure_deployed_reports_a_real_mkdir_error(tmp_path):
+    target = _bundle_target(tmp_path)
+    deploy_dir = resolve_deploy_dir(target)
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            if command.startswith("test -f "):
+                return _Result(1)
+            return _Result(1, stderr=b"Permission denied")
+
+    with pytest.raises(BundleError) as excinfo:
+        await ensure_deployed(_Conn(), target, sftp_factory=_sftp_factory({}))
+    message = str(excinfo.value)
+    assert "cannot create deploy dir" in message
+    assert deploy_dir in message
+    assert "Permission denied" in message
+
+
+@pytest.mark.asyncio
+async def test_ensure_deployed_keeps_both_deploy_errors(tmp_path):
+    """A failed fallback must not hide the original SFTP failure."""
+    target = _bundle_target(tmp_path)
+    deploy_dir = resolve_deploy_dir(target)
+
+    class _Conn:
+        async def run(self, command, **kwargs):
+            if command.startswith("test -f "):
+                return _Result(1)
+            if "base64 -d" in command:
+                return _Result(1, stderr=b"disk full")
+            return _Result(0)
+
+    with pytest.raises(BundleError) as excinfo:
+        await ensure_deployed(
+            _Conn(), target, sftp_factory=_sftp_factory({}, fail=True)
+        )
+    message = str(excinfo.value)
+    assert deploy_dir in message
+    assert "sftp refused" in message
+    assert "base64 fallback" in message
+    assert "could not write" in message
+
+
+@pytest.mark.asyncio
+async def test_run_retries_a_refused_route_channel(monkeypatch):
+    """A refused session channel is transient on a single-session route."""
+    import asyncio
+
+    import asyncssh
+
+    from compute_mcp import bundle as bundle_module
+
+    async def _no_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    class _Conn:
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, command, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise asyncssh.ChannelOpenError(
+                    asyncssh.OPEN_CONNECT_FAILED, "open failed"
+                )
+            return _Result(0)
+
+    conn = _Conn()
+    result = await bundle_module._run(conn, "mkdir -p /scratch/x")
+    assert conn.calls == 2
+    assert result.exit_status == 0

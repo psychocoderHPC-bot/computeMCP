@@ -29,6 +29,7 @@ import subprocess
 import asyncssh
 
 from .config import TargetConfig
+from .ssh_backend import with_channel_open_retry
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,11 @@ async def _sftp_client(conn):
         if client is not None:
             with contextlib.suppress(Exception):
                 client.exit()
+            # Wait for the server to drop the channel.  A login node may allow
+            # only one session channel per connection (OpenSSH MaxSessions), so
+            # the next command must not race a still-open SFTP channel.
+            with contextlib.suppress(Exception):
+                await client.wait_closed()
 
 
 MARKER_PREFIX = ".computemcp-bundle-"
@@ -260,22 +266,46 @@ async def ensure_deployed(
         )
         return deploy_dir
 
+    # Create the directory over the exec channel first.  sftp.makedirs() reports
+    # a bare "No such file" when it cannot create a component, and asyncssh
+    # hides a permission denial on an intermediate component.  mkdir -p gives
+    # the real error and makes the SFTP path a no-op when everything exists.
+    result = await run(conn, f"mkdir -p {shlex.quote(deploy_dir)}")
+    if getattr(result, "exit_status", 1) != 0:
+        stderr = (getattr(result, "stderr", b"") or b"").decode(
+            errors="replace"
+        ).strip()
+        raise BundleError(
+            f"cannot create deploy dir {deploy_dir!r}: {stderr or 'no stderr'}"
+        )
+
     factory = sftp_factory or _sftp_client
     try:
         await _deploy_sftp(factory, conn, deploy_dir, contents, marker)
-    except (asyncssh.Error, OSError, BundleError) as exc:
+    except (asyncssh.Error, OSError, BundleError) as sftp_exc:
         log.warning(
-            "target %s: SFTP bundle deploy failed (%s); falling back to base64",
+            "target %s: SFTP deploy to %s failed (%s); falling back to base64",
             target.name,
-            exc,
+            deploy_dir,
+            sftp_exc,
         )
-        await _deploy_shell(conn, deploy_dir, contents, marker, run)
+        try:
+            await _deploy_shell(conn, deploy_dir, contents, marker, run)
+        except (asyncssh.Error, OSError, BundleError) as shell_exc:
+            # Keep both causes: the fallback error alone hid the real deploy
+            # failure behind a secondary "open failed" on a busy route channel.
+            raise BundleError(
+                f"bundle deploy to {deploy_dir!r} failed: "
+                f"SFTP: {sftp_exc}; base64 fallback: {shell_exc}"
+            ) from shell_exc
     log.info("target %s: deployed bundle %s to %s", target.name, bundle_cfg.source, deploy_dir)
     return deploy_dir
 
 
 async def _run(conn, command: str, timeout: float = 120.0):
-    return await conn.run(command, check=False, encoding=None, timeout=timeout)
+    return await with_channel_open_retry(
+        lambda: conn.run(command, check=False, encoding=None, timeout=timeout)
+    )
 
 
 async def _marker_present(conn, deploy_dir: str, marker: str, run) -> bool:

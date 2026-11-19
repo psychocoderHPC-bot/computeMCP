@@ -464,6 +464,17 @@ class Gateway:
         *,
         overrides: dict[str, Any] | None = None,
     ) -> TargetRuntime:
+        if target.interactive_auth and factor is None:
+            # Fail closed before dialing.  Without a factor the route login is
+            # guaranteed to fail, and every such attempt counts as a failed
+            # authentication at the site.  Only connect_target/refresh_target
+            # may supply the per-request factor.
+            runtime.awaiting_factor = True
+            runtime.last_error = (
+                "interactive authentication required; run "
+                f"'target-connect --2fa <secret> {target.name}'"
+            )
+            raise InteractiveAuthRequired(target.name)
         runtime.state = "connecting"
         runtime.last_error = None
         provision_env: dict[str, str] | None = None
@@ -1057,12 +1068,8 @@ class Gateway:
         # "always": run the trusted recovery command before every open.  It must
         # be a no-op when the container already runs.
         if target.connect_command and target.connect_command_mode == "always":
-            route = runtime.active_route or (
-                target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
-            )
-            connection = runtime.tunnel.connection if runtime.tunnel else None
-            await self.tunnels.run_connect_command(
-                target, route, connection=connection, **connect_kwargs
+            await self._run_connect_command_locked(
+                name, target, runtime, connect_kwargs
             )
 
         try:
@@ -1073,16 +1080,12 @@ class Gateway:
             # stopped).  In "on_failure" mode run the recovery command on the
             # remote host and retry once.
             if target.connect_command and target.connect_command_mode == "on_failure":
-                route = runtime.active_route or (
-                    target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
-                )
                 log.info(
                     "target %s unreachable (%s); running connect_command",
                     name, first,
                 )
-                connection = runtime.tunnel.connection if runtime.tunnel else None
-                await self.tunnels.run_connect_command(
-                    target, route, connection=connection, **connect_kwargs
+                await self._run_connect_command_locked(
+                    name, target, runtime, connect_kwargs
                 )
                 # Drop any cached (dead) connection before retrying.
                 await self.backend.disconnect(name)
@@ -1097,6 +1100,31 @@ class Gateway:
             if self._factor_outstanding(target, runtime):
                 raise InteractiveAuthRequired(name, detail=str(first)) from None
             raise first
+
+    async def _run_connect_command_locked(
+        self,
+        name: str,
+        target: TargetConfig,
+        runtime: TargetRuntime,
+        connect_kwargs: dict[str, Any],
+    ) -> None:
+        """Run ``connect_command`` on the route with the target lock held.
+
+        The command uses a session channel on the route connection, and a login
+        node can allow only one session channel per connection.  Serializing on
+        the target prevents two concurrent container dials from opening two
+        route sessions at once.
+        """
+        route = runtime.active_route or (
+            target.transport.ssh_targets[0]
+            if target.transport.ssh_targets
+            else "direct"
+        )
+        async with self._lock(name):
+            connection = runtime.tunnel.connection if runtime.tunnel else None
+            await self.tunnels.run_connect_command(
+                target, route, connection=connection, **connect_kwargs
+            )
 
     async def _connection_provider(self, name: str):
         return await self._open_container_conn(name)

@@ -42,6 +42,7 @@ from .ssh_backend import (
     _empty_known_hosts,
     dial_route,
     make_factor_prompter,
+    with_channel_open_retry,
 )
 
 log = logging.getLogger("compute_mcp.tunnel")
@@ -283,22 +284,25 @@ async def _apply_configured_proxy_jump(
     return merged
 
 
-def _route_client_keys(target: TargetConfig, info: dict) -> list[str]:
-    """Build the route key list from resolved identities plus the config key.
+def _route_client_keys(info: dict) -> list[str]:
+    """Build the route key list from the resolved ssh-config identities.
 
     Every hop's ``IdentityFile`` entries are collected (jump hosts first).  The
     local ``ssh -G`` reports the OpenSSH default identity filenames whether or
-    not they exist; OpenSSH ignores missing ones, asyncssh raises on them.  Skip
-    non-existent inherited identities, but always keep an explicitly configured
-    ``client_key`` so a bad path fails loudly.
+    not they exist; OpenSSH ignores missing ones, asyncssh raises on them, so
+    skip non-existent inherited identities.
+
+    ``target.client_key`` is deliberately NOT part of this list: it is the
+    gateway -> container key and must not be offered to the login node.  Doing
+    so adds a rejected publickey attempt to every route login, which counts as
+    a failed authentication on some sites, and merges the two credential
+    scopes.  A bad container key still fails loudly on the container dial.
     """
     keys: list[str] = []
     for hop in _iter_hops(info):
         for path in hop.get("identityfiles", ()):
             if os.path.isfile(path) and path not in keys:
                 keys.append(path)
-    if target.client_key and target.client_key not in keys:
-        keys.append(target.client_key)
     return keys
 
 
@@ -501,7 +505,7 @@ class TunnelManager:
                 route, route_info, proxy_jump, self.ssh
             )
 
-        client_keys = _route_client_keys(target, route_info)
+        client_keys = _route_client_keys(route_info)
         pin = target.route_host_key_sha256 or None
 
         opened: list[asyncssh.SSHClientConnection] = []
@@ -575,7 +579,7 @@ class TunnelManager:
                 route, route_info, proxy_jump, self.ssh
             )
 
-        client_keys = _route_client_keys(target, route_info)
+        client_keys = _route_client_keys(route_info)
         prompter = make_factor_prompter(factor) if factor is not None else None
         pin = target.route_host_key_sha256 or None
 
@@ -584,16 +588,20 @@ class TunnelManager:
         try:
             for hop in _iter_hops(route_info):
                 is_final = hop is route_info
+                # The per-request factor is the credential for the route
+                # (final) login, never for a ProxyJump hop.  A one-time code
+                # consumed by an intermediate host would leave the real 2FA
+                # prompt unanswered.
                 tunnel_conn = await _dial_hop(
                     hop,
                     tunnel=conn,
                     client_keys=client_keys,
-                    prompter=prompter,
+                    prompter=prompter if is_final else None,
                     pin=pin if is_final else None,
                     ssh=self.ssh,
                     name=route,
                     fallback_user=target.user,
-                    passphrase=factor,
+                    passphrase=factor if is_final else None,
                 )
                 opened.append(tunnel_conn)
                 conn = tunnel_conn
@@ -634,11 +642,13 @@ class TunnelManager:
                 target.name, route, " ".join(argv_tuple),
             )
             try:
-                result = await conn.run(
-                    command,
-                    check=False,
-                    timeout=target.provision_timeout,
-                    encoding=None,
+                result = await with_channel_open_retry(
+                    lambda: conn.run(
+                        command,
+                        check=False,
+                        timeout=target.provision_timeout,
+                        encoding=None,
+                    )
                 )
             except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
                 for opened_conn in reversed(opened):
@@ -737,11 +747,13 @@ class TunnelManager:
             target.name, label, route, " ".join(argv),
         )
         try:
-            result = await connection.run(
-                command,
-                check=False,
-                timeout=timeout,
-                encoding=None,
+            result = await with_channel_open_retry(
+                lambda: connection.run(
+                    command,
+                    check=False,
+                    timeout=timeout,
+                    encoding=None,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - advisory, never fatal
             log.warning(
