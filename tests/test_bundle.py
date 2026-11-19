@@ -351,3 +351,42 @@ async def test_ensure_deployed_expands_home_for_sftp(tmp_path):
     assert resolved == "/home/remote/computemcp/bundle"
     digest = load_bundle("computemcp-slurm").digest
     assert f"/home/remote/computemcp/bundle/{marker_name(digest)}" in store
+
+
+class _CloseTrackingSFTP:
+    def __init__(self, events):
+        self.events = events
+
+    def exit(self):
+        self.events.append("exit")
+
+    async def wait_closed(self):
+        self.events.append("wait_closed")
+
+
+class _SftpStartConn:
+    def __init__(self, events):
+        self.events = events
+
+    async def start_sftp_client(self):
+        self.events.append("start")
+        return _CloseTrackingSFTP(self.events)
+
+
+@pytest.mark.asyncio
+async def test_sftp_client_waits_for_the_channel_to_close():
+    """The next route command must not race a still-open SFTP channel.
+
+    A login node can cap session channels per connection at one.  Closing the
+    SFTP client is asynchronous, so the context manager has to wait for the
+    channel to disappear before its caller opens the next session channel.
+    """
+    from compute_mcp.bundle import _sftp_client
+
+    events: list[str] = []
+    async with _sftp_client(_SftpStartConn(events)) as client:
+        assert isinstance(client, _CloseTrackingSFTP)
+        events.append("body")
+    events.append("after")
+
+    assert events == ["start", "body", "exit", "wait_closed", "after"]

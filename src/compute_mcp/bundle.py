@@ -48,6 +48,11 @@ async def _sftp_client(conn):
         if client is not None:
             with contextlib.suppress(Exception):
                 client.exit()
+            # Wait for the server to drop the channel.  A login node may allow
+            # only one session channel per connection (OpenSSH MaxSessions), so
+            # the next command must not race a still-open SFTP channel.
+            with contextlib.suppress(Exception):
+                await client.wait_closed()
 
 
 MARKER_PREFIX = ".computemcp-bundle-"

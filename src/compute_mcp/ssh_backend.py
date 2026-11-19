@@ -630,6 +630,11 @@ class SSHBackend:
                 if client is not None:
                     with contextlib.suppress(Exception):
                         client.exit()
+                    # Release the bounded slot only after the server has
+                    # dropped the channel; otherwise the next open can race a
+                    # connection whose session budget is still exhausted.
+                    with contextlib.suppress(Exception):
+                        await client.wait_closed()
                 if self._target_for_conn(conn) is None:
                     # Dedicated/one-shot connections are closed by the caller
                     # after this context exits; drop their bound state now.

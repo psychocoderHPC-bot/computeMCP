@@ -677,11 +677,17 @@ class _FakeSftpClient:
     def __init__(self, conn) -> None:
         self._conn = conn
         self.exited = False
+        self.closed = False
 
     def exit(self) -> None:
         if not self.exited:
             self.exited = True
+            self._conn.events.append("exit")
             self._conn.channels_open -= 1
+
+    async def wait_closed(self) -> None:
+        self.closed = True
+        self._conn.events.append("wait_closed")
 
 
 class _SftpConn:
@@ -699,6 +705,7 @@ class _SftpConn:
         self.channels_open = 0
         self.max_channels = 0
         self.closed = False
+        self.events: list[str] = []
         self.gate = None
         self.clients: list[_FakeSftpClient] = []
 
@@ -753,6 +760,25 @@ async def test_concurrent_sftp_opens_serialize():
     assert conn.attempts == 5
     assert conn.max_inflight == 1
     assert all(client.exited for client in clients)
+
+
+async def test_sftp_client_waits_for_close_before_next_use():
+    """The bounded slot is released only after the channel is gone.
+
+    A server that caps concurrent session channels must not see the next open
+    while the previous SFTP channel is still counted.
+    """
+    from compute_mcp.ssh_backend import SSHBackend
+
+    conn = _SftpConn()
+    backend = SSHBackend()
+
+    async with backend.sftp_client(conn) as client:
+        conn.events.append("body")
+    conn.events.append("after")
+
+    assert conn.events == ["body", "exit", "wait_closed", "after"]
+    assert client.closed is True
 
 
 async def test_sftp_semaphore_bounds_concurrent_sessions():
