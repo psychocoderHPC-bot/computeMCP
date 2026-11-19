@@ -286,11 +286,14 @@ nodes resolve DNS but block outbound TCP. Test before installing:
 computeMCP_exec(target="...", command="curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://pypi.org/simple/")
 ```
 
-A timeout or a non-2xx status means no egress. Do not build a tunnel to bypass
-the site. Ask the operator if a proxy path is officially approved.
+A 2xx status means the target has egress. Use it and install directly on the
+target with `pip install`, `apt-get install`, or `git clone`; the staging
+workflow below is only for a target whose test fails or times out.
 
-When the target has no egress, fetch the dependencies here (this container has
-internet), upload the artifacts, and install them offline:
+A timeout or a non-2xx status means no egress. Do not build a tunnel to bypass
+the site. Ask the operator if a proxy path is officially approved. Only then
+fetch the dependencies here (this container has internet), upload the
+artifacts, and install them offline:
 
 1. Match the target first: `python3 -V`, `uname -m`, `/etc/os-release`. For the
    same Python and platform:
@@ -373,7 +376,8 @@ computeMCP_session_close(sid)
 - Use `computeMCP_exec` for short commands; sessions for anything long-running.
 - Use multiple sessions on the same target for parallelism.
 - Use `computeMCP_file_upload`/`computeMCP_file_download` for large or binary files.
-- Assume compute nodes have no egress. Download dependencies in this container,
+- Check egress before installing. If the target has internet, install there
+  directly. Only when it does not, download the dependencies in this container,
   upload them with `computeMCP_file_upload*`, and install with
   `--no-index --find-links`.
 - If a target is unavailable, report the `computeMCP_status`/error — do not try to
