@@ -156,14 +156,19 @@ async def _start_login(tmp_path_factory, **auth) -> _Login:
     return _Login(server, host_key.get_fingerprint("sha256"), state)
 
 
-def _route_alias(monkeypatch, login: _Login, user: str = "agent") -> None:
+def _route_alias(
+    monkeypatch,
+    login: _Login,
+    user: str = "agent",
+    identityfiles: tuple[str, ...] = (),
+) -> None:
     async def fake_resolve(alias, ssh, _seen=None):
         return {
             "alias": alias,
             "hostname": "127.0.0.1",
             "user": user,
             "port": login.port,
-            "identityfiles": (),
+            "identityfiles": tuple(identityfiles),
             "jumps": (),
         }
 
@@ -308,8 +313,8 @@ async def test_encrypted_client_key_unlocked_with_factor(
     """
     login = await _start_login(tmp_path_factory, pubkey=True)
     try:
-        _route_alias(monkeypatch, login)
         key_path = _write_encrypted_key(tmp_path_factory, b"SECRET")
+        _route_alias(monkeypatch, login, identityfiles=(key_path,))
 
         mgr = TunnelManager(SSHConfig())
         target = _target(login, client_key=key_path)
@@ -337,8 +342,8 @@ async def test_encrypted_client_key_wrong_factor_fails_cleanly(
     """
     login = await _start_login(tmp_path_factory, pubkey=True)
     try:
-        _route_alias(monkeypatch, login)
         key_path = _write_encrypted_key(tmp_path_factory, b"SECRET")
+        _route_alias(monkeypatch, login, identityfiles=(key_path,))
 
         mgr = TunnelManager(SSHConfig())
         target = _target(login, client_key=key_path)

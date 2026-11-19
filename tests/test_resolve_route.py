@@ -240,7 +240,7 @@ def test_iter_hops_yields_jumps_first_then_route():
 # _route_client_keys filtering
 # ---------------------------------------------------------------------------
 
-def test_route_client_keys_skips_missing_and_keeps_target_key(tmp_path):
+def test_route_client_keys_skips_missing_identities(tmp_path):
     present_a = tmp_path / "id_a"
     present_a.write_text("key-a")
     present_b = tmp_path / "id_b"
@@ -263,19 +263,21 @@ def test_route_client_keys_skips_missing_and_keeps_target_key(tmp_path):
             ),
         ),
     )
-    keys = _route_client_keys(target, info)
+    keys = _route_client_keys(info)
     # Jump hops come first (dial order), missing inherited defaults skipped,
-    # duplicates removed, and the target.client_key already present is kept.
+    # duplicates removed.  The container client_key is never a route key.
     assert keys == [str(present_b), str(present_a)]
 
 
-def test_route_client_keys_keeps_missing_explicit_client_key(tmp_path):
-    missing_explicit = tmp_path / "explicit-missing"
+def test_route_client_keys_never_returns_the_container_key(tmp_path):
+    """client_key authenticates the container hop, not the login node."""
+    container_key = tmp_path / "container-key"
+    container_key.write_text("key")
     target = TargetConfig(
         name="hal",
         user="agent",
         transport=TransportConfig(kind="tunnel", ssh_targets=("hal",)),
-        client_key=str(missing_explicit),
+        client_key=str(container_key),
     )
-    keys = _route_client_keys(target, _route("hal"))
-    assert keys == [str(missing_explicit)]
+    assert target.client_key
+    assert _route_client_keys(_route("hal")) == []
