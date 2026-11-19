@@ -1,6 +1,6 @@
 ---
 name: computeMCP
-description: Use the Terok `compute` MCP to work on remote development/compute containers. Covers discovering available systems, running commands, persistent parallel PTY sessions, and transferring files. Trigger on remote compute, remote build/test/debug, run on another machine, GPU job, parallel remote sessions, copy files to/from a remote system, computeMCP_targets, computeMCP_exec, computeMCP_session_*, computeMCP_file_*.
+description: Use the Terok `compute` MCP to work on remote development/compute containers. Covers discovering available systems, running commands, persistent parallel PTY sessions, and transferring files. Trigger on remote compute, remote build/test/debug, run on another machine, GPU job, parallel remote sessions, copy files to/from a remote system, offline install without internet, computeMCP_targets, computeMCP_exec, computeMCP_session_*, computeMCP_file_*.
 ---
 
 # computeMCP
@@ -277,6 +277,42 @@ with `skip_existing=True` to send only files still missing remotely, and use
 - All paths are paths **inside the remote container**. The gateway host
   filesystem is not accessible.
 
+## 4.1 Offline installs: compute nodes usually have no internet
+
+Do not assume the remote container can reach the network. Many HPC compute
+nodes resolve DNS but block outbound TCP. Test before installing:
+
+```
+computeMCP_exec(target="...", command="curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://pypi.org/simple/")
+```
+
+A timeout or a non-2xx status means no egress. Do not build a tunnel to bypass
+the site. Ask the operator if a proxy path is officially approved.
+
+When the target has no egress, fetch the dependencies here (this container has
+internet), upload the artifacts, and install them offline:
+
+1. Match the target first: `python3 -V`, `uname -m`, `/etc/os-release`. For the
+   same Python and platform:
+   `pip download --only-binary=:all: -d /tmp/wheels -r requirements.txt`.
+   For a different Python or platform add
+   `--python-version 3.12 --implementation cp --abi cp312 --platform manylinux2014_x86_64`
+   (only together with `--only-binary=:all:`). Prefer wheels; a source build
+   needs a compiler and headers on the target.
+2. Record hashes (`sha256sum /tmp/wheels/*`) and upload the directory with
+   `computeMCP_file_upload_tree(..., skip_existing=True)`. Put it on shared
+   storage when login and compute nodes must both see it.
+3. Install with no index:
+   `python3 -m pip install --no-index --find-links DIR --target /path/pylibs -r requirements.txt`
+   then run with `PYTHONPATH=/path/pylibs`, or install into a venv. For system
+   packages, download matching `.deb` files and use `apt-get install
+   --no-download` or `dpkg -i`. For conda, `conda-pack` an environment here and
+   unpack it on the target.
+
+Worked example: `pip download tabulate` here, upload the wheel, then on the
+target `pip install --no-index --find-links DIR --target pylibs tabulate` and
+`PYTHONPATH=pylibs python3 -c 'import tabulate; print(tabulate.__version__)'`.
+
 ## 5. Tool reference
 
 | Tool | Purpose |
@@ -337,6 +373,9 @@ computeMCP_session_close(sid)
 - Use `computeMCP_exec` for short commands; sessions for anything long-running.
 - Use multiple sessions on the same target for parallelism.
 - Use `computeMCP_file_upload`/`computeMCP_file_download` for large or binary files.
+- Assume compute nodes have no egress. Download dependencies in this container,
+  upload them with `computeMCP_file_upload*`, and install with
+  `--no-index --find-links`.
 - If a target is unavailable, report the `computeMCP_status`/error — do not try to
   reach the host directly.
 - Close sessions you create.
