@@ -83,7 +83,9 @@ async def with_channel_open_retry(
     for attempt in range(1, attempts + 1):
         try:
             return await operation()
-        except asyncssh.ChannelOpenError as exc:
+        except asyncssh.Error as exc:
+            if not is_channel_open_error(exc):
+                raise
             if attempt >= attempts:
                 raise
             log.warning(
