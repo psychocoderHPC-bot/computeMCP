@@ -2557,6 +2557,35 @@ async def test_http_exec_still_returns_2fa_when_awaiting(monkeypatch):
         await client.close()
 
 
+async def test_http_exec_disconnected_interactive_no_factor_does_not_dial(monkeypatch):
+    """A disconnected 2FA target must fail closed from the exec path.
+
+    The host gateway guard in ``_connect_locked`` rejects the request before the
+    route dial.  This pins the user-facing /v1/exec path, which is the one the
+    container-side computeMCP uses for commands and file access.
+    """
+    gw, _ = _interactive_gateway()
+    gw.runtimes["hal"].state = "disconnected"
+    gw.runtimes["hal"].awaiting_factor = False
+    rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, rec)
+
+    client = await make_client(gw)
+    try:
+        resp = await client.post(
+            "/v1/exec",
+            headers=auth("alpaka-token"),
+            json={"target": "hal", "command": "hostname"},
+        )
+        assert resp.status == 503
+        text = await resp.text()
+        assert "requires interactive authentication" in text
+        assert "--2fa" in text
+        assert rec["calls"] == []
+    finally:
+        await client.close()
+
+
 def test_public_status_exposes_awaiting_factor():
     gw, _ = _interactive_gateway()
     assert gw.public_status("hal")["awaiting_factor"] is False
