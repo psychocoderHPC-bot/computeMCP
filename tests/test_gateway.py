@@ -4501,6 +4501,22 @@ async def test_refresh_invalid_override_leaves_healthy_target_untouched(
     )
     runtime.tunnel = live
 
+    epoch = runtime.route_epoch
+    disrupted = []
+
+    async def fake_disconnect(name):
+        disrupted.append(("disconnect", name))
+
+    async def fake_close_for_target(name, reason="refresh"):
+        disrupted.append(("sessions", name))
+
+    async def fake_close(name):
+        disrupted.append(("close", name))
+
+    monkeypatch.setattr(gw.backend, "disconnect", fake_disconnect)
+    monkeypatch.setattr(gw.sessions, "close_for_target", fake_close_for_target)
+    monkeypatch.setattr(gw, "_run_close_command", fake_close)
+
     with pytest.raises(ConfigError, match="unknown --set key"):
         await gw.refresh_target("hal", overrides={"unknown": 1})
 
@@ -4511,6 +4527,8 @@ async def test_refresh_invalid_override_leaves_healthy_target_untouched(
     assert runtime.provisioned_endpoint == "127.0.0.1:2222"
     assert live.fenced is False
     assert reprovision_rec["calls"] == []
+    assert runtime.route_epoch == epoch
+    assert disrupted == []
 
 
 async def test_refresh_missing_route_with_factor_dials_a_new_login(monkeypatch):
@@ -4599,9 +4617,9 @@ async def test_open_container_conn_discards_dial_that_raced_a_refresh(monkeypatc
     async def fake_connection(t, host, port, prompter=None):
         dialed.append((host, port))
         if len(dialed) == 1:
-            # A refresh completed while this dial was in flight.
+            # A refresh completed while this dial was in flight.  The local
+            # port is reused by refresh, so only the epoch can invalidate it.
             runtime.route_epoch += 1
-            runtime.local_port = 31100
             return "OLD"
         return "NEW"
 
@@ -4619,6 +4637,33 @@ async def test_open_container_conn_discards_dial_that_raced_a_refresh(monkeypatc
     _, conn = await gw._open_container_conn("hal")
 
     assert conn == "NEW"
-    assert dialed == [("127.0.0.1", 31000), ("127.0.0.1", 31100)]
+    assert dialed == [("127.0.0.1", 31000), ("127.0.0.1", 31000)]
     assert discarded == ["OLD"]
     assert closed == ["OLD"]
+
+
+async def test_refresh_live_forward_failure_reports_forward_stage(monkeypatch):
+    from compute_mcp.tunnel import ForwardError, TunnelError
+
+    gw, _ = _interactive_gateway()
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.local_port = 31000
+    runtime.tunnel = _FakeTunnel(
+        gw.config.targets["hal"], route="hal", local_port=31000,
+        connection=object(),
+    )
+
+    async def boom(*args, **kwargs):
+        raise ForwardError("route could not establish forwarding")
+
+    monkeypatch.setattr(gw.tunnels, "reprovision_on_route", boom)
+
+    with pytest.raises(TunnelError, match="refresh forward stage failed"):
+        await gw.refresh_target("hal", factor=None)
+
+    assert runtime.state == "failed"
+    assert "forward" in (runtime.last_error or "")
+    assert runtime.tunnel is None
+    assert runtime.awaiting_factor is True

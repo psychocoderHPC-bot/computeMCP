@@ -54,6 +54,10 @@ class TunnelError(RuntimeError):
     pass
 
 
+class ForwardError(TunnelError):
+    """The retained route could not install or probe the new forward."""
+
+
 # Mirrors ``gateway._parse_provision_endpoint``.  Duplicated here (rather than
 # imported) to avoid a circular import: gateway imports tunnel, so tunnel must
 # not import gateway at module load time.
@@ -457,9 +461,17 @@ def _forwarded_tcp_channels(connection) -> list:
     """
     channels = getattr(connection, "_channels", None)
     if not isinstance(channels, dict):
+        log.warning(
+            "asyncssh connection has no channel table; cannot discover "
+            "forwarded channels for draining"
+        )
         return []
     tcp_cls = getattr(asyncssh, "SSHTCPChannel", None)
     if tcp_cls is None:
+        log.warning(
+            "asyncssh has no SSHTCPChannel class; cannot discover forwarded "
+            "channels for draining"
+        )
         return []
     try:
         live = list(channels.values())
@@ -961,7 +973,7 @@ class TunnelManager:
                 "127.0.0.1", local_port, dest_host, dest_port, **kwargs
             )
         except (OSError, asyncssh.Error) as exc:
-            raise TunnelError(
+            raise ForwardError(
                 f"route {route!r} could not establish forwarding to "
                 f"{dest_host}:{dest_port}: {exc}"
             ) from exc
@@ -969,7 +981,7 @@ class TunnelManager:
         if not await probe("127.0.0.1", local_port):
             await tunnel.fence_forward()
             await tunnel.drain_forwarded_channels()
-            raise TunnelError(
+            raise ForwardError(
                 f"route {route!r} did not establish forwarding to "
                 f"{dest_host}:{dest_port}"
             )

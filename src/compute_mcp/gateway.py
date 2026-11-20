@@ -69,7 +69,13 @@ from .sessions import (
     SessionNotFound,
 )
 from .ssh_backend import HostKeyError, SSHError, SSHBackend
-from .tunnel import RouteTunnel, Tunnel, TunnelError, TunnelManager
+from .tunnel import (
+    ForwardError,
+    RouteTunnel,
+    Tunnel,
+    TunnelError,
+    TunnelManager,
+)
 
 log = logging.getLogger("compute_mcp.gateway")
 
@@ -722,9 +728,8 @@ class Gateway:
                     old_tunnel.connection,
                     provision_env,
                 )
-            except Exception as exc:  # noqa: BLE001 - stage classification
-                if "forward" in str(exc).lower():
-                    stage = "forward"
+            except ForwardError:
+                stage = "forward"
                 raise
             stage = "adopt"
             runtime.tunnel = new_tunnel

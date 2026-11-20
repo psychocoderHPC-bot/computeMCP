@@ -81,6 +81,10 @@ class _LoginSession(asyncssh.SSHServerSession):
     def exec_requested(self, command) -> bool:
         self.state["commands"].append(command)
         self._command = command
+        if "provision" in command:
+            self.state["provision_requests"] = (
+                self.state.get("provision_requests", 0) + 1
+            )
         return True
 
     def session_started(self) -> None:
@@ -288,6 +292,10 @@ class _ContainerSession(asyncssh.SSHServerSession):
     def exec_requested(self, command) -> bool:
         self._command = command
         self.state["commands"].append(command)
+        if "provision" in command:
+            self.state["provision_requests"] = (
+                self.state.get("provision_requests", 0) + 1
+            )
         return True
 
     def session_started(self) -> None:
@@ -329,6 +337,7 @@ async def _start_login(tmp_path_factory, **auth) -> _Login:
         "live_channels": 0,
         "max_channels": 0,
         "provision_count": 0,
+        "provision_requests": 0,
         "close_count": 0,
     }
     server = await asyncssh.listen(
@@ -935,6 +944,7 @@ async def test_live_refresh_reuses_login_connection_and_one_channel(
         assert login.state["auths"] == 1
         assert login.state["connections"] == 1
         assert login.state["provision_count"] == 1
+        assert login.state["provision_requests"] == 1
         old_conn = runtime.tunnel.connection
 
         _, conn = await asyncio.wait_for(
@@ -1055,3 +1065,124 @@ async def test_refresh_route_loss_mid_refresh_reports_stage_without_retry(
         assert login.state["auths"] == 1
         assert login.state["connections"] == 1
         assert login.state["provision_count"] == 1
+
+
+async def test_refresh_drains_a_raw_forward_channel(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A forwarded channel that is not a cached container SSH conn must close.
+
+    This exercises the private asyncssh channel discovery and drain path: the
+    raw TCP client has no cached container connection for backend.disconnect to
+    close, so only the drain can release the MaxSessions slot before close.
+    """
+    async with _live_refresh_gateway(
+        tmp_path, tmp_path_factory, monkeypatch
+    ) as (login, _containers, states, gw, runtime, ports):
+        await asyncio.wait_for(
+            gw.connect_target("hal", factor="SECRET"), 20
+        )
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", runtime.local_port
+        )
+        try:
+            for _ in range(200):
+                if login.state["live_channels"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert login.state["live_channels"] == 1
+
+            refreshed = await asyncio.wait_for(
+                gw.refresh_target("hal", factor=None), 30
+            )
+            assert refreshed["state"] == "connected"
+            assert login.state["auths"] == 1
+            assert login.state["close_count"] == 1
+            assert login.state["provision_count"] == 2
+            assert login.state["max_channels"] == 1
+
+            async def read_to_eof():
+                try:
+                    while True:
+                        data = await reader.read(4096)
+                        if not data:
+                            return True
+                except (ConnectionError, asyncio.IncompleteReadError):
+                    return True
+
+            assert await asyncio.wait_for(read_to_eof(), 10) is True
+            _, conn = await asyncio.wait_for(
+                gw._open_container_conn("hal"), 15
+            )
+            result = await asyncio.wait_for(
+                conn.run("after-drain", encoding=None), 10
+            )
+            assert result.stdout == b"container:after-drain\n"
+            assert states[1]["commands"] == ["after-drain"]
+            assert login.state["max_channels"] == 1
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+
+async def test_dial_started_during_refresh_teardown_does_not_use_old_forward(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A dial blocked before connect is released only after the old fence.
+
+    It may fail on the closed listener or re-dial the replacement endpoint; it
+    must never run a container command on the old endpoint.
+    """
+    from compute_mcp.ssh_backend import SSHError
+
+    async with _live_refresh_gateway(
+        tmp_path, tmp_path_factory, monkeypatch
+    ) as (login, _containers, states, gw, runtime, ports):
+        await asyncio.wait_for(
+            gw.connect_target("hal", factor="SECRET"), 20
+        )
+        original = gw.backend.connection
+        calls = []
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed(target, host, port, prompter=None):
+            calls.append((host, port))
+            if len(calls) == 1:
+                blocked.set()
+                await release.wait()
+            return await original(target, host, port, prompter=prompter)
+
+        monkeypatch.setattr(gw.backend, "connection", delayed)
+        task = asyncio.create_task(gw._open_container_conn("hal"))
+        await asyncio.wait_for(blocked.wait(), 10)
+
+        refresh_task = asyncio.create_task(
+            gw.refresh_target("hal", factor=None)
+        )
+        for _ in range(500):
+            if "close" in login.state["commands"]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("refresh did not reach the close stage")
+        # The old listener has been fenced and drained; release the dial now.
+        release.set()
+        refreshed = await asyncio.wait_for(refresh_task, 30)
+        assert refreshed["state"] == "connected"
+
+        conn = None
+        try:
+            _, conn = await asyncio.wait_for(task, 20)
+        except (SSHError, OSError):
+            conn = None
+        if conn is not None:
+            result = await asyncio.wait_for(
+                conn.run("race-during-teardown", encoding=None), 10
+            )
+            assert result.stdout == b"container:race-during-teardown\n"
+            assert states[1]["commands"] == ["race-during-teardown"]
+        assert states[0]["commands"] == []
+        assert login.state["auths"] == 1
+        assert login.state["max_channels"] == 1

@@ -1404,3 +1404,134 @@ async def test_reprovision_on_route_error_keeps_connection_open(monkeypatch):
     # Caller owns the retained connection.
     assert conn.closed is False
     assert conn.forwarded == []
+
+
+async def test_reprovision_probe_failure_closes_listener_and_keeps_connection(
+    monkeypatch,
+):
+    """A failed readiness probe must not leak the new listener or channel."""
+    import dataclasses
+
+    from compute_mcp.tunnel import ForwardError
+
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), provision_command=("provision",)
+    )
+    bucket = {}
+    probe_channel = _DrainChannel(bucket)
+    bucket[id(probe_channel)] = probe_channel
+    conn = _ProvConn(bucket)
+    mgr = TunnelManager(SSHConfig(internal_port_min=31630, internal_port_max=31630))
+
+    async def fake_probe(host, port, timeout=8.0):
+        return False
+
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+    monkeypatch.setattr(
+        "compute_mcp.tunnel._forwarded_tcp_channels",
+        lambda connection: list(bucket.values()),
+    )
+
+    with pytest.raises(ForwardError, match="did not establish forwarding"):
+        await mgr.reprovision_on_route(
+            target, "hal", 31630, target.transport, conn
+        )
+
+    assert conn.listener.closed is True
+    assert conn.listener.waited is True
+    assert probe_channel.closed is True
+    assert probe_channel.waited is True
+    assert bucket == {}
+    # The retained route connection is not closed by the failed forward.
+    assert conn.closed is False
+
+
+class _DelayedCloseChannel:
+    def __init__(self, bucket):
+        self.bucket = bucket
+        self.closed = 0
+        self.aborted = False
+        self.waited = 0
+
+    def close(self):
+        self.closed += 1
+
+    def abort(self):
+        self.aborted = True
+
+    async def wait_closed(self):
+        self.waited += 1
+        if self.waited < 2:
+            return
+        self.bucket.pop(id(self), None)
+
+
+async def test_route_tunnel_drain_loops_until_delayed_channel_closes(monkeypatch):
+    from compute_mcp.tunnel import RouteTunnel
+
+    target = make_target("hal", ["hal"])
+    conn = _ChanConn()
+    bucket = {}
+    channel = _DelayedCloseChannel(bucket)
+    bucket[id(channel)] = channel
+    monkeypatch.setattr(
+        "compute_mcp.tunnel._forwarded_tcp_channels",
+        lambda connection: list(bucket.values()),
+    )
+    tunnel = RouteTunnel(
+        target=target, route="hal", local_port=31631, connection=conn
+    )
+
+    await tunnel.drain_forwarded_channels(timeout=1.0)
+
+    assert bucket == {}
+    assert channel.closed == 2
+    assert channel.waited == 2
+    assert channel.aborted is False
+    assert conn.closed is False
+
+
+class _NeverCloseChannel:
+    def __init__(self):
+        self.closed = False
+        self.aborted = False
+        self.waited = False
+
+    def close(self):
+        self.closed = True
+
+    def abort(self):
+        self.aborted = True
+
+    async def wait_closed(self):
+        self.waited = True
+        await asyncio.Event().wait()
+
+
+async def test_route_tunnel_drain_aborts_a_channel_that_never_closes(monkeypatch):
+    from compute_mcp.tunnel import RouteTunnel
+
+    target = make_target("hal", ["hal"])
+    conn = _ChanConn()
+    channel = _NeverCloseChannel()
+    listener = _FakeListener()
+    monkeypatch.setattr(
+        "compute_mcp.tunnel._forwarded_tcp_channels",
+        lambda connection: [channel],
+    )
+    tunnel = RouteTunnel(
+        target=target,
+        route="hal",
+        local_port=31632,
+        connection=conn,
+        forward_listener=listener,
+    )
+
+    await tunnel.fence_forward()
+    await tunnel.drain_forwarded_channels(timeout=0.05)
+
+    assert channel.closed is True
+    assert channel.aborted is True
+    assert channel.waited is True
+    assert listener.closed is True
+    assert conn.closed is False
