@@ -50,9 +50,10 @@ name a configured target, and an arbitrary SSH hostname is never accepted.
 - **Tokens are the whole credential surface.** Hash-only on the gateway
   (`sha256:`), compared in constant time, and minted only by
   `--generate-tokens` or an approved enrollment.
-- **Second factors are ephemeral.** A `--2fa` value is used once per request,
-  never persisted or logged, and never replayed on a re-prompt; interactive
-  targets fail closed on route loss rather than reusing a rotated factor.
+- **Second factors are ephemeral.** A `--2fa` prompt value is used once per
+  request, never persisted or logged, and never replayed on a re-prompt;
+  interactive targets fail closed on route loss rather than reusing a rotated
+  factor. The token is not accepted on the command line.
 - **Commands and recovery scripts are operator TOML, never client input.**
   `provision_command`, `close_command`, and `connect_command` run on the remote
   machine over the authenticated route connection and come only from the

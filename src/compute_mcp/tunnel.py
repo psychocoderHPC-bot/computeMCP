@@ -923,8 +923,8 @@ class TunnelManager:
                     raise TunnelError(
                         f"2FA factor was already used on route {route!r}; "
                         f"refusing to replay it on another route. Supply a "
-                        f"fresh factor with 'target-connect --2fa <new secret> "
-                        f"{target.name}'."
+                        f"fresh factor with 'target-connect --2fa {target.name}' "
+                        f"(you will be prompted)."
                     ) from exc
         if prompter is not None:
             prompter.clear()

@@ -30,8 +30,8 @@ The console is enabled automatically on a TTY and disabled with `--no-console`
 `client-refresh|connect|stop <name> [target]`, `client-kill <name>`,
 `sessions [target]`, `close-session <id>`, `enrollments`,
 `approve <request-id>`, `deny <request-id>`, `quit`. `connect` and `refresh`
-accept `--2fa SECRET` for an interactive target, for example
-`connect --2fa SECRET myTargetHost`.
+accept `--2fa` for an interactive target; the token is prompted on the
+terminal with hidden input, for example `connect --2fa myTargetHost`.
 
 Every configuration change, new target, or token rotation is applied with
 `reload`: the full include graph is re-parsed and validated, the token file is
@@ -162,23 +162,25 @@ hashes are never returned, only a short `sha256:` fingerprint.
 
 ### Second factor (`--2fa`)
 
-For an `interactive_auth` target, pass the per-request second factor:
+For an `interactive_auth` target, pass `--2fa`; the command prompts for the
+per-request second factor on the terminal without echoing it:
 
 ```bash
-computeMCP-gatewayctl target-connect --2fa SECRET myTargetHost
-computeMCP-gatewayctl target-refresh --2fa SECRET myTargetHost
+computeMCP-gatewayctl target-connect --2fa myTargetHost
+computeMCP-gatewayctl target-refresh --2fa myTargetHost
 ```
 
-The factor is used once per request and is never persisted or logged. The
-gateway submits it at most once: if the server asks again in the same
-connection, the attempt is aborted instead of replaying a one-time code, which
-would count as another failed login and can lock the account. An interactive
-target does not auto-connect or auto-reconnect; a request that omits the factor
-fails closed (state unchanged) with a warning, and a disconnected interactive
-target also refuses `exec`, session and file requests without dialing.
-`target-connect`/`target-refresh` with `--2fa` are the only ways to connect it.
-When `interactive_auth` is false and `--2fa` is given, the gateway warns,
-ignores the factor, and proceeds with a key-based connect.
+The token is not accepted on the command line. The factor is used once per
+request and is never persisted or logged. The gateway submits it at most once:
+if the server asks again in the same connection, the attempt is aborted instead
+of replaying a one-time code, which would count as another failed login and
+can lock the account. An interactive target does not auto-connect or
+auto-reconnect; a request that omits the factor fails closed (state unchanged)
+with a warning, and a disconnected interactive target also refuses `exec`,
+session and file requests without dialing. `target-connect`/`target-refresh`
+with `--2fa` are the only ways to connect it. When `interactive_auth` is false
+and `--2fa` is given, the gateway warns, ignores the factor, and proceeds with
+a key-based connect.
 
 ### Allocation overrides (`--set`) and previews (`--dry-run`)
 
@@ -427,8 +429,8 @@ shield:
 - Sessions are owned by the client that created them; another client's
   session id maps to `404`.
 - Tokens are compared in constant time and stored as `sha256:` hashes.
-- A second factor passed with `--2fa` (or the JSON `factor` field) is used once
-  per request and is never persisted or logged.
+- A second factor entered at the `--2fa` prompt (or the JSON `factor` field) is
+  used once per request and is never persisted or logged.
 - The gateway runs provisioning and recovery commands on the remote machine
   over the authenticated route connection; they are trusted operator TOML and
   are never taken from a client.

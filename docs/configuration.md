@@ -570,7 +570,9 @@ Subcommands: `status`, `targets`, `clients`, `sessions`, `reload`,
 `main` errors if neither a command nor `--add-target` is given.
 `target-connect` and `target-refresh` additionally accept:
 
-- `--2fa SECRET` — second factor (password/OTP) for `interactive_auth` targets;
+- `--2fa` — prompt on the terminal for the second factor (password/OTP) for
+  `interactive_auth` targets; input is hidden and the token is not accepted on
+  the command line;
 - `--set KEY=VALUE` (repeatable) — allocation overrides; accepted keys are
   `nodes`, `gpus-per-node`, `cpus-per-node`, `mem-per-node`, `mode`;
 - `--timeout SECONDS` — per-request timeout override (default: target's

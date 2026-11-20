@@ -72,18 +72,19 @@ def test_parser_accepts_all_commands():
 
 # -- CLI: --2fa factor threading and warning rendering -----------------------
 
-def test_parser_parses_2fa_factor():
+def test_parser_parses_2fa_flag():
     parser = build_parser()
     args = parser.parse_args(
-        ["--config", "x.toml", "target-connect", "hal", "--2fa", "SECRET"]
+        ["--config", "x.toml", "target-connect", "hal", "--2fa"]
     )
     assert args.command == "target-connect"
-    assert args.factor == "SECRET"
+    assert args.use_2fa is True
+    assert not hasattr(args, "factor")
     args = parser.parse_args(
-        ["--config", "x.toml", "target-refresh", "--2fa", "SECRET", "hal"]
+        ["--config", "x.toml", "target-refresh", "--2fa", "hal"]
     )
     assert args.command == "target-refresh"
-    assert args.factor == "SECRET"
+    assert args.use_2fa is True
 
 
 async def _run_control(monkeypatch, argv, response, cfg=None):
@@ -115,6 +116,7 @@ async def _run_control(monkeypatch, argv, response, cfg=None):
     monkeypatch.setattr(control_mod, "_resolve_gateway", lambda *a, **k: "http://x")
     monkeypatch.setattr(control_mod, "_resolve_token", lambda *a, **k: "tok")
     monkeypatch.setattr(control_mod, "Control", FakeControl)
+    monkeypatch.setattr(control_mod, "prompt_factor", lambda: "SECRET")
 
     args = build_parser().parse_args(["--config", "x.toml"] + argv)
     rc = await control_mod._run(args)
@@ -125,7 +127,7 @@ async def _run_control(monkeypatch, argv, response, cfg=None):
 async def test_control_target_connect_sends_factor(monkeypatch, capsys):
     calls, _ = await _run_control(
         monkeypatch,
-        ["target-connect", "hal", "--2fa", "SECRET"],
+        ["target-connect", "hal", "--2fa"],
         {"name": "hal", "state": "connected", "active_route": "hal"},
     )
     assert calls == [
@@ -199,7 +201,7 @@ async def test_control_set_body_and_back_compat(monkeypatch):
 async def test_control_set_with_factor_combined_body(monkeypatch):
     calls, _ = await _run_control(
         monkeypatch,
-        ["target-connect", "hal", "--2fa", "SECRET", "--set", "nodes=2"],
+        ["target-connect", "hal", "--2fa", "--set", "nodes=2"],
         {"name": "hal", "state": "connected", "active_route": "hal"},
     )
     assert calls == [
@@ -275,7 +277,7 @@ async def test_control_target_connect_without_factor_sends_no_body(monkeypatch):
 async def test_control_target_refresh_sends_factor(monkeypatch):
     calls, _ = await _run_control(
         monkeypatch,
-        ["target-refresh", "hal", "--2fa", "SECRET"],
+        ["target-refresh", "hal", "--2fa"],
         {"name": "hal", "state": "connected", "active_route": "hal"},
     )
     assert calls == [
@@ -297,18 +299,72 @@ async def test_control_prints_gateway_warning(monkeypatch, capsys):
     assert "warning:" in captured.err
     assert "requires interactive authentication" in captured.err
 
-def test_parser_2fa_without_value_is_usage_error():
-    """`target-connect hal --2fa` (no value) must exit 2, not silently accept."""
+def test_parser_2fa_is_value_less_flag():
+    parser = build_parser()
+    args = parser.parse_args(
+        ["--config", "x.toml", "target-connect", "hal", "--2fa"]
+    )
+    assert args.command == "target-connect"
+    assert args.use_2fa is True
+
+
+def test_parser_2fa_rejects_value():
     parser = build_parser()
     with pytest.raises(SystemExit) as excinfo:
-        parser.parse_args(["--config", "x.toml", "target-connect", "hal", "--2fa"])
+        parser.parse_args(
+            ["--config", "x.toml", "target-connect", "hal", "--2fa", "SECRET"]
+        )
     assert excinfo.value.code == 2
 
-def test_parser_refresh_2fa_without_value_is_usage_error():
-    parser = build_parser()
+
+def test_prompt_factor_uses_hidden_getpass(monkeypatch):
+    import compute_mcp.factor as factor_mod
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        factor_mod.sys, "stdin", SimpleNamespace(isatty=lambda: True)
+    )
+    seen = []
+
+    def fake_getpass(prompt=""):
+        seen.append(prompt)
+        return "SECRET"
+
+    monkeypatch.setattr(factor_mod.getpass, "getpass", fake_getpass)
+    assert factor_mod.prompt_factor() == "SECRET"
+    assert seen == ["2FA token: "]
+
+
+def test_prompt_factor_requires_a_tty(monkeypatch):
+    import compute_mcp.factor as factor_mod
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        factor_mod.sys, "stdin", SimpleNamespace(isatty=lambda: False)
+    )
+    with pytest.raises(factor_mod.FactorPromptError):
+        factor_mod.prompt_factor()
+
+
+async def test_control_2fa_prompt_error_exits(monkeypatch):
+    import compute_mcp.control as control_mod
+    from compute_mcp.factor import FactorPromptError
+
+    cfg = make_config()
+    monkeypatch.setattr(control_mod, "load_config", lambda *a, **k: cfg)
+    monkeypatch.setattr(control_mod, "_resolve_gateway", lambda *a, **k: "http://x")
+    monkeypatch.setattr(control_mod, "_resolve_token", lambda *a, **k: "tok")
+
+    def fail():
+        raise FactorPromptError("no tty")
+
+    monkeypatch.setattr(control_mod, "prompt_factor", fail)
+    args = build_parser().parse_args(
+        ["--config", "x.toml", "target-connect", "hal", "--2fa"]
+    )
     with pytest.raises(SystemExit) as excinfo:
-        parser.parse_args(["--config", "x.toml", "target-refresh", "hal", "--2fa"])
-    assert excinfo.value.code == 2
+        await control_mod._run(args)
+    assert "no tty" in str(excinfo.value)
 
 def _parse(argv):
     return build_parser().parse_args(["--config", "x.toml"] + argv)

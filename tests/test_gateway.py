@@ -929,7 +929,8 @@ async def test_tunnel_connect_provision_flag_depends_on_override(monkeypatch):
     flags = []
 
     async def fake_open_for_route(
-        self, target, route, local_port, transport=None, *, factor=None, provision=True
+        self, target, route, local_port, transport=None, *, factor=None,
+        prompter=None, provision=True
     ):
         flags.append(provision)
         return _FakeTunnel(target, route=route, local_port=local_port)
@@ -2291,6 +2292,7 @@ async def _async_noop_kw(*a, **k):
 async def test_console_connect_factor_before_and_after_target(monkeypatch):
     gw = make_gateway()
     seen = []
+    monkeypatch.setattr("compute_mcp.gateway.prompt_factor", lambda: "SECRET")
 
     async def fake_connect(name, factor=None):
         seen.append((name, factor))
@@ -2300,7 +2302,7 @@ async def test_console_connect_factor_before_and_after_target(monkeypatch):
     import io
     import contextlib
 
-    for line in ("connect --2fa SECRET t", "connect t --2fa SECRET"):
+    for line in ("connect --2fa t", "connect t --2fa"):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             await gw._console_command(line)
@@ -2311,6 +2313,7 @@ async def test_console_connect_factor_before_and_after_target(monkeypatch):
 async def test_console_refresh_factor(monkeypatch):
     gw = make_gateway()
     seen = []
+    monkeypatch.setattr("compute_mcp.gateway.prompt_factor", lambda: "SECRET")
 
     async def fake_refresh(name, factor=None):
         seen.append((name, factor))
@@ -2322,17 +2325,56 @@ async def test_console_refresh_factor(monkeypatch):
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        await gw._console_command("refresh --2fa SECRET t")
+        await gw._console_command("refresh --2fa t")
     assert "SECRET" not in buf.getvalue()
     assert seen == [("t", "SECRET")]
 
 
-async def test_console_2fa_without_value_is_usage_error(capsys):
+async def test_console_2fa_without_target_is_usage_error(monkeypatch, capsys):
     gw = make_gateway()
+
+    def fail_prompt():
+        raise AssertionError("prompt must not run without a target")
+
+    monkeypatch.setattr("compute_mcp.gateway.prompt_factor", fail_prompt)
     keep_going = await gw._console_command("connect --2fa")
     out = capsys.readouterr().out
     assert keep_going is True
     assert out.startswith("usage: connect")
+
+
+async def test_console_2fa_rejects_old_value_form(monkeypatch, capsys):
+    gw = make_gateway()
+    called = []
+
+    def fail_prompt():
+        raise AssertionError("prompt must not run for the old value form")
+
+    async def fake_connect(name, factor=None):
+        called.append(name)
+        return {"state": "connected"}
+
+    monkeypatch.setattr("compute_mcp.gateway.prompt_factor", fail_prompt)
+    monkeypatch.setattr(gw, "connect_target", fake_connect)
+    await gw._console_command("connect --2fa SECRET t")
+    out = capsys.readouterr().out
+    assert out.startswith("usage: connect")
+    assert called == []
+
+
+async def test_console_2fa_prompt_error_keeps_console(monkeypatch, capsys):
+    from compute_mcp.factor import FactorPromptError
+
+    gw = make_gateway()
+
+    def fail_prompt():
+        raise FactorPromptError("no tty")
+
+    monkeypatch.setattr("compute_mcp.gateway.prompt_factor", fail_prompt)
+    keep_going = await gw._console_command("connect --2fa t")
+    out = capsys.readouterr().out
+    assert keep_going is True
+    assert "no tty" in out
 
 
 async def test_factor_never_in_status_or_logs(monkeypatch, caplog):
@@ -2727,14 +2769,18 @@ async def test_interactive_loss_no_recovery_task_and_actionable_error(monkeypatc
 # Console --2fa missing value (refresh variant) and factor leakage
 # ============================================================================
 
-async def test_console_refresh_2fa_without_value_is_usage(monkeypatch, capsys):
+async def test_console_refresh_2fa_without_target_is_usage(monkeypatch, capsys):
     gw = make_gateway()
     called = []
+
+    def fail_prompt():
+        raise AssertionError("prompt must not run without a target")
 
     async def fake_refresh(name, factor=None):
         called.append(name)
         return {"state": "connected"}
 
+    monkeypatch.setattr("compute_mcp.gateway.prompt_factor", fail_prompt)
     monkeypatch.setattr(gw, "refresh_target", fake_refresh)
     keep_going = await gw._console_command("refresh --2fa")
     out = capsys.readouterr().out
