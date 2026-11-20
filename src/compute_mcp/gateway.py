@@ -69,7 +69,7 @@ from .sessions import (
     SessionNotFound,
 )
 from .ssh_backend import HostKeyError, SSHError, SSHBackend
-from .tunnel import Tunnel, TunnelError, TunnelManager
+from .tunnel import RouteTunnel, Tunnel, TunnelError, TunnelManager
 
 log = logging.getLogger("compute_mcp.gateway")
 
@@ -218,6 +218,10 @@ class InteractiveAuthRequired(RuntimeError):
         self.detail = detail
 
 
+class _RouteChangedDuringDial(SSHError):
+    """A container dial raced a refresh and could not be re-based on the route."""
+
+
 @dataclass
 class TargetRuntime:
     name: str
@@ -240,6 +244,11 @@ class TargetRuntime:
     resolved_plan: dict | None = None
     resolved_overrides: dict[str, Any] = field(default_factory=dict)
     recovery_task: asyncio.Task | None = field(default=None, repr=False)
+    # Monotonic guard for concurrent container dials.  A dial that passed
+    # ``ensure_connected`` remembers this value; a refresh advances it before
+    # disturbing the route and again after adopting the new one, so the dial
+    # cannot hand out a connection on the old forward or stale endpoint.
+    route_epoch: int = 0
 
     def public(self, clients: int = 0) -> dict:
         return {
@@ -476,6 +485,8 @@ class Gateway:
                 f"'target-connect --2fa {target.name}'"
             )
             raise InteractiveAuthRequired(target.name)
+        # Invalidate any container dial that already passed ensure_connected.
+        runtime.route_epoch += 1
         runtime.state = "connecting"
         runtime.last_error = None
         provision_env: dict[str, str] | None = None
@@ -538,6 +549,8 @@ class Gateway:
         return runtime
 
     def _mark_lost(self, runtime: TargetRuntime, reason: str) -> None:
+        # Invalidate any container dial that captured the lost route.
+        runtime.route_epoch += 1
         if runtime.tunnel is not None:
             self.tunnels.release(runtime.tunnel)
             runtime.tunnel = None
@@ -605,45 +618,174 @@ class Gateway:
         target = self._target(name)
         async with self._lock(name):
             runtime = self.runtimes[name]
-            # Fail closed before any teardown when a second factor is needed
-            # but not supplied for this request.
-            if target.interactive_auth and factor is None:
-                return self._interactive_skip(runtime)
-            warning = self._factor_warning(target, factor)
-            if warning is not None:
-                factor = None  # key-only downstream
-            # A refresh without explicit overrides re-applies the settings the
-            # target already retained, so recovery never silently reverts to
-            # defaults.  Resolve/validate before any teardown: a bad override
-            # must not destroy a still-active allocation.
+            # Validate/resolve first.  A bad override must raise for a healthy
+            # target without touching the tunnel, state or allocation.
             effective = (
                 overrides
                 if overrides is not None
                 else (runtime.resolved_overrides or None)
             )
+            plan = None
+            provision_env: dict[str, str] | None = None
             if effective or self._env_configured(target):
-                self._resolve_allocation(target, effective)
-            # Release the old allocation before provisioning a new one.  The
-            # route connection is still alive here, so the command can run.
-            await self._run_close_command(name)
-            await self._stop_locked(name)
-            # The old allocation is released.  Drop the gateway-side cached
-            # container connection so the next exec/session dials the freshly
-            # provisioned endpoint; the provider is not even called until the
-            # new tunnel is up.  ``_connect_locked`` re-resolves the endpoint
-            # from ``tunnel.provisioned_endpoint`` and makes the new value
-            # authoritative.  A plain connect while connected would have kept
-            # the stale endpoint (idempotent early return); the explicit
-            # refresh is the guaranteed re-provision point.
-            await self.backend.disconnect(name)
-            await self.sessions.close_for_target(name, reason="refresh")
-            await self._connect_locked(
-                target, runtime, factor=factor, overrides=effective
+                plan, provision_env = self._resolve_allocation(target, effective)
+            warning = self._factor_warning(target, factor)
+            if warning is not None:
+                factor = None  # key-only downstream
+
+            direct = target.transport.kind == "direct"
+            live = self._target_connected_live(target, runtime)
+            retained = (
+                live
+                and not direct
+                and runtime.tunnel is not None
+                and runtime.tunnel.connection is not None
             )
+
+            if retained:
+                # A usable authenticated login connection is reused: no dial
+                # and no second factor.  A supplied factor stays unused.
+                await self._refresh_live_tunnel(
+                    name, target, runtime, plan, effective, provision_env
+                )
+            else:
+                # Missing/closed route (or direct transport, which has no
+                # retained login connection): preserve the old behaviour.  An
+                # interactive target without a factor is refused before any
+                # teardown or close command.
+                if target.interactive_auth and factor is None:
+                    return self._interactive_skip(runtime)
+                # Release the old allocation before provisioning a new one.
+                # The route connection (if any) is still alive here.
+                runtime.route_epoch += 1
+                await self._run_close_command(name)
+                await self._stop_locked(name)
+                # Drop the cached container connection so the next exec/session
+                # dials the freshly provisioned endpoint.
+                await self.backend.disconnect(name)
+                await self.sessions.close_for_target(name, reason="refresh")
+                await self._connect_locked(
+                    target, runtime, factor=factor, overrides=effective
+                )
             result = runtime.public(self.sessions.count_for_target(name))
         if warning:
             result["warning"] = warning
         return result
+
+    async def _refresh_live_tunnel(
+        self,
+        name: str,
+        target: TargetConfig,
+        runtime: TargetRuntime,
+        plan,
+        effective: dict[str, Any] | None,
+        provision_env: dict[str, str] | None,
+    ) -> None:
+        """Re-provision over the retained login connection and adopt it.
+
+        The old forward is fenced and every accepted direct-tcpip channel is
+        closed and awaited before the close/provision session is opened, so a
+        login node with ``MaxSessions=1`` cannot reject the refresh.  No factor
+        is consumed and no second allocation is started.
+        """
+        old_tunnel = runtime.tunnel
+        assert old_tunnel is not None
+        route = runtime.active_route or old_tunnel.route
+        if route is None:
+            raise TunnelError(
+                f"target {name!r}: no active route to refresh"
+            )
+        # The retained listener is bound to the old tunnel's port.  Fence it
+        # before rebinding; reusing that exact port keeps clients and the
+        # reservation consistent.
+        local_port = self.tunnels.reserve_local_port(old_tunnel.local_port)
+        runtime.state = "refreshing"
+        runtime.route_epoch += 1
+        stage = "fence"
+        new_tunnel: RouteTunnel | None = None
+        try:
+            await old_tunnel.fence_forward()
+            stage = "sessions"
+            await self.sessions.close_for_target(name, reason="refresh")
+            await self.backend.disconnect(name)
+            stage = "drain"
+            await old_tunnel.drain_forwarded_channels()
+            stage = "close"
+            await self._run_close_command(name)
+            stage = "provision"
+            try:
+                new_tunnel = await self.tunnels.reprovision_on_route(
+                    target,
+                    route,
+                    local_port,
+                    target.transport,
+                    old_tunnel.connection,
+                    provision_env,
+                )
+            except Exception as exc:  # noqa: BLE001 - stage classification
+                if "forward" in str(exc).lower():
+                    stage = "forward"
+                raise
+            stage = "adopt"
+            runtime.tunnel = new_tunnel
+            runtime.active_route = new_tunnel.route
+            runtime.local_port = new_tunnel.local_port
+            if new_tunnel.provisioned_endpoint is not None:
+                host, port = new_tunnel.provisioned_endpoint
+                runtime.provisioned_endpoint = f"{host}:{port}"
+            else:
+                runtime.provisioned_endpoint = None
+            if plan is not None:
+                runtime.resolved_plan = plan_summary(target, plan)
+                runtime.resolved_overrides = dict(plan.overrides)
+            else:
+                runtime.resolved_plan = None
+                runtime.resolved_overrides = (
+                    dict(effective) if effective is not None else {}
+                )
+            runtime.connected_since = datetime.now(timezone.utc)
+            runtime.needs_refresh = False
+            runtime.backoff = 0.0
+            runtime.last_error = None
+            runtime.state = "connected"
+            runtime.awaiting_factor = False
+            runtime.route_epoch += 1
+        except Exception as exc:  # noqa: BLE001 - classified and re-raised below
+            message = f"refresh {stage} stage failed: {exc}"
+            await self._fail_live_refresh(
+                name, target, runtime, old_tunnel, new_tunnel, local_port, message
+            )
+            raise TunnelError(message) from exc
+
+    async def _fail_live_refresh(
+        self,
+        name: str,
+        target: TargetConfig,
+        runtime: TargetRuntime,
+        old_tunnel: RouteTunnel,
+        new_tunnel: RouteTunnel | None,
+        local_port: int,
+        message: str,
+    ) -> None:
+        """Leave an accurate, recoverable failed state after a live refresh."""
+        log.warning("target %s: %s", name, message)
+        runtime.state = "failed"
+        runtime.last_error = message
+        runtime.active_route = None
+        runtime.local_port = None
+        runtime.provisioned_endpoint = None
+        runtime.connected_since = None
+        runtime.awaiting_factor = target.interactive_auth
+        # The retained connection may already be dead.  Close only what this
+        # refresh still owns, then release the port.  A later explicit
+        # target-refresh (with a factor for an interactive target) may retry.
+        if new_tunnel is not None and new_tunnel is not old_tunnel:
+            with contextlib.suppress(Exception):
+                await new_tunnel.stop()
+        with contextlib.suppress(Exception):
+            await old_tunnel.stop()
+        runtime.tunnel = None
+        self.tunnels.release_local_port(local_port)
 
     def preview_target(
         self, name: str, overrides: dict[str, Any] | None = None
@@ -825,6 +967,7 @@ class Gateway:
 
     async def _stop_locked(self, name: str) -> None:
         runtime = self.runtimes[name]
+        runtime.route_epoch += 1
         if runtime.recovery_task is not None:
             runtime.recovery_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1051,7 +1194,6 @@ class Gateway:
             and runtime.state != "connected"
         ):
             raise InteractiveAuthRequired(name)
-        host, port = self._endpoint(runtime)
         dedicated = force_dedicated or target.connect_mode == "dedicated"
 
         # A bundle-backed recovery command needs the COMPUTEMCP_* contract too,
@@ -1061,7 +1203,7 @@ class Gateway:
         if target.bundle is not None:
             connect_kwargs["provision_env"] = self._target_provision_env(target)
 
-        async def attempt():
+        async def attempt(host: str, port: int):
             if dedicated:
                 return await self.backend.open_connection(target, host, port)
             return await self.backend.connection(target, host, port)
@@ -1074,8 +1216,12 @@ class Gateway:
             )
 
         try:
-            conn = await attempt()
+            conn = await self._dial_container_guarded(
+                name, target, dedicated, attempt
+            )
             return target, conn
+        except _RouteChangedDuringDial:
+            raise
         except SSHError as first:
             # The tunnel is up but the container is unreachable (e.g. it is
             # stopped).  In "on_failure" mode run the recovery command on the
@@ -1091,8 +1237,12 @@ class Gateway:
                 # Drop any cached (dead) connection before retrying.
                 await self.backend.disconnect(name)
                 try:
-                    conn = await attempt()
+                    conn = await self._dial_container_guarded(
+                        name, target, dedicated, attempt
+                    )
                     return target, conn
+                except _RouteChangedDuringDial:
+                    raise
                 except SSHError:
                     pass
             # Only map to 503 while a factor is genuinely outstanding.  A real
@@ -1101,6 +1251,72 @@ class Gateway:
             if self._factor_outstanding(target, runtime):
                 raise InteractiveAuthRequired(name, detail=str(first)) from None
             raise first
+
+    def _route_current(
+        self,
+        runtime: TargetRuntime,
+        epoch: int,
+        host: str,
+        port: int,
+    ) -> bool:
+        """Whether a dial's captured route is still the live one."""
+        if runtime.route_epoch != epoch or runtime.state == "refreshing":
+            return False
+        try:
+            return self._endpoint(runtime) == (host, port)
+        except TunnelError:
+            return False
+
+    async def _discard_dialed_conn(
+        self, name: str, conn, dedicated: bool
+    ) -> None:
+        """Drop/close a connection dialed against a route a refresh replaced."""
+        if not dedicated:
+            # Only removes it from the cache when this exact connection is
+            # cached; a dedicated connection is not tracked there.
+            await self.backend.discard_connection(conn)
+        await self.backend.close_connection(conn)
+
+    async def _dial_container_guarded(
+        self,
+        name: str,
+        target: TargetConfig,
+        dedicated: bool,
+        attempt,
+    ):
+        """Dial once, then re-check the route epoch/state.
+
+        A request can pass ``ensure_connected`` while a refresh is about to
+        fence the old forward.  The epoch advances before disruption and again
+        after adoption, so a connection opened on the old forward/stale
+        endpoint is discarded.  One retry waits for the refresh lock, then
+        dials the new route; if the route is still moving (or the refresh
+        failed) the request fails rather than reopening a second allocation.
+        """
+        runtime = self.runtimes[name]
+        epoch = runtime.route_epoch
+        host, port = self._endpoint(runtime)
+        conn = await attempt(host, port)
+        if self._route_current(runtime, epoch, host, port):
+            return conn
+        await self._discard_dialed_conn(name, conn, dedicated)
+
+        async with self._lock(name):
+            current = self.runtimes[name]
+            if not self._target_connected_live(target, current):
+                raise _RouteChangedDuringDial(
+                    f"target {name!r} route changed during container "
+                    "connection attempt"
+                )
+            epoch = current.route_epoch
+            host, port = self._endpoint(current)
+        conn = await attempt(host, port)
+        if self._route_current(self.runtimes[name], epoch, host, port):
+            return conn
+        await self._discard_dialed_conn(name, conn, dedicated)
+        raise _RouteChangedDuringDial(
+            f"target {name!r} route changed during container connection attempt"
+        )
 
     async def _run_connect_command_locked(
         self,

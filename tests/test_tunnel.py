@@ -1168,3 +1168,239 @@ async def test_dial_hop_empty_user_uses_asyncssh_sentinel(monkeypatch):
         fallback_user="",
     )
     assert seen["username"] == ()
+
+
+# ---------------------------------------------------------------------------
+# Live-refresh primitives: fenced listener, drained forwarding channels, and
+# re-provision on a retained authenticated connection.
+# ---------------------------------------------------------------------------
+
+class _FakeListener:
+    def __init__(self):
+        self.closed = False
+        self.waited = False
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        self.waited = True
+
+
+class _DrainChannel:
+    def __init__(self, bucket):
+        self.bucket = bucket
+        self.closed = False
+        self.aborted = False
+        self.waited = False
+
+    def close(self):
+        self.closed = True
+
+    def abort(self):
+        self.aborted = True
+
+    async def wait_closed(self):
+        self.waited = True
+        self.bucket.pop(id(self), None)
+
+
+class _ChanConn:
+    def __init__(self):
+        self._channels = {}
+        self.closed = False
+        self.waited = False
+
+    def is_closed(self):
+        return self.closed
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        self.waited = True
+
+
+async def test_route_tunnel_fence_stops_accepting_but_keeps_connection():
+    from compute_mcp.tunnel import RouteTunnel
+
+    target = make_target("hal", ["hal"])
+    listener = _FakeListener()
+    conn = _ChanConn()
+    tunnel = RouteTunnel(
+        target=target, route="hal", local_port=31600,
+        connection=conn, forward_listener=listener,
+    )
+
+    assert tunnel._accept_forward("127.0.0.1", 1234) is True
+    await tunnel.fence_forward()
+
+    # No new forwarded connection is accepted once fenced.  The listener is
+    # closed immediately but not awaited until accepted channels are gone.
+    assert tunnel._accept_forward("127.0.0.1", 1234) is False
+    assert listener.closed is True
+    assert listener.waited is False
+    # The outer authenticated connection is retained.
+    assert conn.closed is False
+    assert tunnel.connection is conn
+
+    await tunnel.drain_forwarded_channels()
+    assert listener.waited is True
+
+
+async def test_route_tunnel_drain_waits_for_accepted_channels(monkeypatch):
+    from compute_mcp.tunnel import RouteTunnel
+
+    target = make_target("hal", ["hal"])
+    conn = _ChanConn()
+    bucket = {}
+    channels = []
+    for _ in range(2):
+        channel = _DrainChannel(bucket)
+        bucket[id(channel)] = channel
+        channels.append(channel)
+    monkeypatch.setattr(
+        "compute_mcp.tunnel._forwarded_tcp_channels",
+        lambda connection: list(bucket.values()),
+    )
+    tunnel = RouteTunnel(
+        target=target, route="hal", local_port=31601, connection=conn
+    )
+
+    await tunnel.drain_forwarded_channels(timeout=1.0)
+
+    assert bucket == {}
+    assert all(channel.closed and channel.waited for channel in channels)
+    assert conn.closed is False  # retained
+
+
+async def test_route_tunnel_stop_closes_listener_channels_and_connection(
+    monkeypatch,
+):
+    from compute_mcp.tunnel import RouteTunnel
+
+    target = make_target("hal", ["hal"])
+    conn = _ChanConn()
+    bucket = {}
+    channel = _DrainChannel(bucket)
+    bucket[id(channel)] = channel
+    monkeypatch.setattr(
+        "compute_mcp.tunnel._forwarded_tcp_channels",
+        lambda connection: list(bucket.values()),
+    )
+    listener = _FakeListener()
+    tunnel = RouteTunnel(
+        target=target, route="hal", local_port=31602,
+        connection=conn, forward_listener=listener,
+    )
+
+    await tunnel.stop()
+
+    assert listener.closed and listener.waited
+    assert channel.closed and channel.waited
+    assert conn.closed is True
+    assert conn.waited is True
+    assert tunnel.connection is None
+
+
+class _ProvConn:
+    def __init__(self, bucket):
+        self.bucket = bucket
+        self.forwarded = []
+        self.listener = _FakeListener()
+        self.accept_handler = None
+        self.closed = False
+        self.commands = []
+
+    def is_closed(self):
+        return self.closed
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
+
+    async def run(self, command, **kwargs):
+        self.commands.append(command)
+        return _FakeRunResult(0, b"ENDPOINT cn01:2222\n", b"")
+
+    async def forward_local_port(
+        self, host, port, dest_host, dest_port, accept_handler=None
+    ):
+        self.forwarded.append((host, port, dest_host, dest_port))
+        self.accept_handler = accept_handler
+        return self.listener
+
+
+async def test_reprovision_on_route_reuses_connection_without_dial(monkeypatch):
+    """The retained connection is re-provisioned; nothing is dialed or closed."""
+    import dataclasses
+
+    from compute_mcp.tunnel import RouteTunnel
+
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), provision_command=("provision", "--ensure")
+    )
+    bucket = {}
+    probe = _DrainChannel(bucket)
+    bucket[id(probe)] = probe
+    conn = _ProvConn(bucket)
+    mgr = TunnelManager(SSHConfig(internal_port_min=31610, internal_port_max=31610))
+
+    async def no_dial(*args, **kwargs):
+        raise AssertionError("reprovision must not dial the route")
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", no_dial)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", no_dial)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+    monkeypatch.setattr(
+        "compute_mcp.tunnel._forwarded_tcp_channels",
+        lambda connection: list(bucket.values()),
+    )
+
+    tunnel = await mgr.reprovision_on_route(
+        target, "hal", 31610, target.transport, conn,
+        provision_env={"COMPUTEMCP_SYSTEM": "hal"},
+    )
+
+    assert isinstance(tunnel, RouteTunnel)
+    assert tunnel.connection is conn
+    assert conn.closed is False
+    assert conn.commands and "COMPUTEMCP_SYSTEM=hal" in conn.commands[0]
+    assert conn.forwarded == [("127.0.0.1", 31610, "cn01", 2222)]
+    assert tunnel.provisioned_endpoint == ("cn01", 2222)
+    # The accept handler is fenced with this tunnel.
+    assert conn.accept_handler("127.0.0.1", 1) is True
+    await tunnel.fence_forward()
+    assert conn.accept_handler("127.0.0.1", 1) is False
+    # The readiness probe's transient channel was awaited before returning.
+    assert probe.waited is True
+    assert bucket == {}
+
+
+async def test_reprovision_on_route_error_keeps_connection_open(monkeypatch):
+    import dataclasses
+
+    target = dataclasses.replace(
+        make_target("hal", ["hal"]), provision_command=("provision",)
+    )
+
+    class _FailConn(_ProvConn):
+        async def run(self, command, **kwargs):
+            return _FakeRunResult(3, b"", b"boom")
+
+    bucket = {}
+    conn = _FailConn(bucket)
+    mgr = TunnelManager(SSHConfig(internal_port_min=31620, internal_port_max=31620))
+
+    with pytest.raises(TunnelError, match="exited 3"):
+        await mgr.reprovision_on_route(
+            target, "hal", 31620, target.transport, conn
+        )
+    # Caller owns the retained connection.
+    assert conn.closed is False
+    assert conn.forwarded == []

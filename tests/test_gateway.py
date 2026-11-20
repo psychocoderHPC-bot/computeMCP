@@ -1000,9 +1000,21 @@ class _FakeTunnel:
         self.process = None
         self._alive = alive
         self.stopped = False
+        self.fenced = False
+        self.drained = False
+        self.waited_idle = False
 
     def is_alive(self):
         return self._alive
+
+    async def fence_forward(self):
+        self.fenced = True
+
+    async def drain_forwarded_channels(self, timeout=5.0, *, close=True):
+        self.drained = True
+
+    async def wait_forward_idle(self, timeout=2.0):
+        self.waited_idle = True
 
     async def stop(self):
         self.stopped = True
@@ -2045,6 +2057,30 @@ def _install_fake_connect(monkeypatch, gw, recorder):
     monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
 
 
+def _install_fake_reprovision(monkeypatch, gw, recorder, endpoint=None):
+    async def fake_reprovision(
+        target, route, local_port, transport, connection, provision_env=None
+    ):
+        recorder["calls"].append(
+            {
+                "target": target.name,
+                "route": route,
+                "local_port": local_port,
+                "connection": connection,
+                "provision_env": provision_env,
+            }
+        )
+        return _FakeTunnel(
+            target,
+            route=route,
+            local_port=local_port,
+            provisioned_endpoint=endpoint,
+            connection=connection,
+        )
+
+    monkeypatch.setattr(gw.tunnels, "reprovision_on_route", fake_reprovision)
+
+
 async def test_factor_matrix_interactive_with_factor(monkeypatch):
     gw, _ = _interactive_gateway()
     rec = {"calls": []}
@@ -2137,10 +2173,18 @@ async def test_ensure_connected_live_interactive_target_does_not_dial(monkeypatc
     assert rec["calls"] == []
 
 
-async def test_refresh_interactive_no_factor_no_teardown(monkeypatch):
+async def test_refresh_interactive_live_no_factor_reuses_connection(monkeypatch):
+    """A live interactive refresh must work without --2fa.
+
+    The authenticated route connection is retained: no dial, no factor, no
+    full stop.  The old forward is fenced/drained and the same connection is
+    re-provisioned.
+    """
     gw, _ = _interactive_gateway()
-    rec = {"calls": []}
-    _install_fake_connect(monkeypatch, gw, rec)
+    connect_rec = {"calls": []}
+    reprovision_rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, connect_rec)
+    _install_fake_reprovision(monkeypatch, gw, reprovision_rec)
 
     disconnected = []
     stopped = []
@@ -2151,21 +2195,36 @@ async def test_refresh_interactive_no_factor_no_teardown(monkeypatch):
     async def fake_stop():
         stopped.append("tunnel")
 
-    # Simulate an existing live tunnel that must NOT be torn down.
     gw.runtimes["hal"].state = "connected"
+    conn = object()
     live = _FakeTunnel(
-        gw.config.targets["hal"], route="hal", local_port=31000, connection=object()
+        gw.config.targets["hal"], route="hal", local_port=31000, connection=conn
     )
     live.stop = fake_stop
     gw.runtimes["hal"].tunnel = live
+    gw.runtimes["hal"].active_route = "hal"
+    gw.runtimes["hal"].local_port = 31000
 
     monkeypatch.setattr(gw.backend, "disconnect", fake_disconnect)
     result = await gw.refresh_target("hal", factor=None)
-    assert rec["calls"] == []  # no reconnect dial
-    assert disconnected == []
-    assert stopped == []  # no teardown
+
+    assert connect_rec["calls"] == []  # no fresh dial
+    assert reprovision_rec["calls"] == [
+        {
+            "target": "hal",
+            "route": "hal",
+            "local_port": 31000,
+            "connection": conn,
+            "provision_env": None,
+        }
+    ]
+    assert disconnected == ["hal"]
+    assert stopped == []  # the retained connection is not stopped
+    assert live.fenced is True
+    assert live.drained is True
     assert result["state"] == "connected"
-    assert "warning" in result
+    assert result["awaiting_factor"] is False
+    assert "warning" not in result
 
 
 # -- auto_connect guard -----------------------------------------------------
@@ -2856,7 +2915,7 @@ async def test_refresh_target_runs_close_command(monkeypatch):
     gw, target = _close_gateway()
     monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
     rec = {"calls": []}
-    _install_fake_connect(monkeypatch, gw, rec)
+    _install_fake_reprovision(monkeypatch, gw, rec)
     conn = object()
     _connect_fake_tunnel(gw, target, conn)
     calls = _record_close(gw, monkeypatch)
@@ -2866,27 +2925,35 @@ async def test_refresh_target_runs_close_command(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["connection"] is conn
     assert calls[0]["tunnel_alive"] is True
-    # A fresh route was provisioned after the close.
-    assert rec["calls"] == [{"target": "hal", "factor": None}]
+    # The retained connection was re-provisioned, not dialed again.
+    assert [c["connection"] for c in rec["calls"]] == [conn]
     assert result["state"] == "connected"
 
 
-async def test_refresh_interactive_no_factor_does_not_run_close(monkeypatch):
+async def test_refresh_interactive_no_factor_does_not_run_close_without_route(
+    monkeypatch,
+):
+    """A missing/closed route still reports the factor need before close."""
     gw = make_gateway()
     target = _tunnel_target(interactive_auth=True, close_command=("scancel",))
     gw.config = dataclasses.replace(
         gw.config, targets={**gw.config.targets, "hal": target}
     )
-    conn = object()
-    _connect_fake_tunnel(gw, target, conn)
+    # Connected state but no usable tunnel connection: not live.
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].active_route = "hal"
+    gw.runtimes["hal"].tunnel = None
     calls = _record_close(gw, monkeypatch)
+    reprovision_rec = {"calls": []}
+    _install_fake_reprovision(monkeypatch, gw, reprovision_rec)
 
     result = await gw.refresh_target("hal", factor=None)
 
     # A skipped refresh must not release the still-active allocation.
     assert calls == []
+    assert reprovision_rec["calls"] == []
     assert result["awaiting_factor"] is True
-    assert gw.runtimes["hal"].tunnel is not None
+    assert gw.runtimes["hal"].tunnel is None
 
 
 async def test_stop_target_runs_bundle_stop_when_close_command_unset(monkeypatch):
@@ -3176,7 +3243,7 @@ async def test_failing_close_command_still_refreshes(monkeypatch, caplog):
     monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
     monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
     rec = {"calls": []}
-    _install_fake_connect(monkeypatch, gw, rec)
+    _install_fake_reprovision(monkeypatch, gw, rec)
     _connect_fake_tunnel(gw, target, object())
     _record_close(gw, monkeypatch, boom=True)
 
@@ -3967,10 +4034,13 @@ def _endpoint_gateway(kind="tunnel", **target_overrides):
 
 
 def _wire_refresh_noops(gw, monkeypatch):
-    """Null out close_command / sessions during a refresh so it stays pure."""
+    """Null out close_command / sessions during a refresh so it stays pure.
+
+    ``backend.disconnect`` is deliberately left real: dropping the cached
+    container connection is part of the live-refresh contract these tests pin.
+    """
     monkeypatch.setattr(gw.tunnels, "run_close_command", _async_noop_kw)
     monkeypatch.setattr(gw.sessions, "close_for_target", _async_noop_kw)
-    monkeypatch.setattr(gw.backend, "disconnect", _async_noop)
 
 
 async def test_stop_locked_clears_provisioned_endpoint(monkeypatch):
@@ -4019,35 +4089,25 @@ async def test_connect_locked_reprovisions_and_updates_endpoint(monkeypatch):
 
 
 async def test_refresh_reprovisions_and_dials_new_tunnel_forward(monkeypatch):
-    """Tunnel target: an endpoint-changing refresh re-dials the NEW loopback
-    forward port and does not hand out the connection cached on the previous
-    forward.  The provisioned (published host) endpoint is tracked on the
-    runtime.
+    """Tunnel target: an endpoint-changing refresh reuses the old loopback
+    forward port while re-provisioning the NEW published endpoint on the
+    retained connection.
     """
     gw, target = _endpoint_gateway(kind="tunnel")
-    # Publish ports: first connect -> 3010, refresh -> 9501.
-    provisioned = iterator = iter([
-        ("127.0.0.1", 3010),
-        ("127.0.0.1", 9501),
-    ])
 
     async def fake_connect(t2, on_route=None, factor=None, **kwargs):
-        ep = next(iterator)
-        # Each tunnel gets a FRESH loopback forward port (31000 then 31100).
         return _FakeTunnel(
-            t2, route="hal", local_port=(31000 if ep == ("127.0.0.1", 3010) else 31100),
-            provisioned_endpoint=ep, connection=object(),
+            t2, route="hal", local_port=31000,
+            provisioned_endpoint=("127.0.0.1", 3010), connection=object(),
         )
 
     monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
     _wire_refresh_noops(gw, monkeypatch)
 
-    # First connect: published port 3010, loopback forward 31000.
     result1 = await gw.connect_target("hal")
     assert result1["provisioned_endpoint"] == "127.0.0.1:3010"
     assert gw.runtimes["hal"].local_port == 31000
 
-    # An exec while connected dials the current forward (127.0.0.1:31000).
     dialed = []
 
     async def fake_conn(t, host, port, prompter=None):
@@ -4059,42 +4119,37 @@ async def test_refresh_reprovisions_and_dials_new_tunnel_forward(monkeypatch):
     assert dialed == [("127.0.0.1", 31000)]
     dialed.clear()
 
-    # Refresh: re-provision publishes 9501 via the NEW forward 31100.
+    rec = {"calls": []}
+    _install_fake_reprovision(
+        monkeypatch, gw, rec, endpoint=("127.0.0.1", 9501)
+    )
     result2 = await gw.refresh_target("hal")
     assert result2["state"] == "connected"
-    # The runtime endpoint is replaced by the freshest provision.
     assert result2["provisioned_endpoint"] == "127.0.0.1:9501"
-    assert gw.runtimes["hal"].local_port == 31100
-    # The next exec dials the NEW forward, not the old loopback.
+    # The old loopback port is reused; the forward now targets the new port.
+    assert gw.runtimes["hal"].local_port == 31000
+    assert rec["calls"][0]["local_port"] == 31000
     await gw._open_container_conn("hal")
-    assert dialed == [("127.0.0.1", 31100)]
+    assert dialed == [("127.0.0.1", 31000)]
 
 
 async def test_refresh_drops_cached_container_conn_real_backend(monkeypatch):
     """502 guard, tunnel target, production cache.
 
     After an exec caches a container connection on the current loopback
-    forward, a refresh re-provisions to a NEW published port via a NEW forward.
-    The next exec must NOT be handed the cached connection dialled to the old
-    forward: the production ``SSHBackend`` cache is keyed to the (host, port)
-    it dialed, so it dials the new forward and the old entry is dropped.
+    forward, a refresh re-provisions to a NEW published port on the retained
+    connection.  The next exec must NOT be handed the cached connection dialled
+    through the old destination: the live refresh drops it explicitly, so the
+    next exec dials the re-established forward.
     """
     from compute_mcp.ssh_backend import SSHBackend
 
     gw, target = _endpoint_gateway(kind="tunnel")
-    # Provision order: connect publishes 3010 (forward 31000); refresh
-    # re-publishes 3500 (forward 31100).  The container hops always arrive at
-    # the gateway via the loopback forward (127.0.0.1:local_port).
-    provisioned = iter([
-        (("127.0.0.1", 3010), 31000),
-        (("127.0.0.1", 3500), 31100),
-    ])
 
     async def fake_connect(t2, on_route=None, factor=None, **kwargs):
-        (ep, forward) = next(provisioned)
         return _FakeTunnel(
-            t2, route="hal", local_port=forward,
-            provisioned_endpoint=ep, connection=object(),
+            t2, route="hal", local_port=31000,
+            provisioned_endpoint=("127.0.0.1", 3010), connection=object(),
         )
 
     monkeypatch.setattr(gw.tunnels, "connect", fake_connect)
@@ -4135,17 +4190,21 @@ async def test_refresh_drops_cached_container_conn_real_backend(monkeypatch):
     assert dialed == [("127.0.0.1", 31000)]
     assert first_conn is minted[0]
 
-    # Refresh while the cached connection is still "live": re-provision moves
-    # the forward to 31100.  The old cache entry must be dropped so the next
-    # exec cannot reuse it.
+    # Refresh while the cached connection is still "live": the retained
+    # connection re-provisions to published port 3500.  The old cache entry
+    # must be dropped so the next exec cannot reuse it.
+    rec = {"calls": []}
+    _install_fake_reprovision(
+        monkeypatch, gw, rec, endpoint=("127.0.0.1", 3500)
+    )
     result2 = await gw.refresh_target("hal")
     assert result2["state"] == "connected"
     assert result2["provisioned_endpoint"] == "127.0.0.1:3500"
 
-    # Second exec: a fresh dial to the NEW forward, and a NEW connection object
-    # (the cached 31000 one was invalidated, not returned).
+    # Second exec: a fresh dial on the reused loopback port, and a NEW
+    # connection object (the cached one was invalidated, not returned).
     _, second_conn = await gw._open_container_conn("hal")
-    assert dialed == [("127.0.0.1", 31000), ("127.0.0.1", 31100)]
+    assert dialed == [("127.0.0.1", 31000), ("127.0.0.1", 31000)]
     assert second_conn is minted[1]
     assert second_conn is not first_conn
     # The STALE connection was closed by the invalidation.
@@ -4392,3 +4451,174 @@ async def test_connect_command_serializes_on_the_route_connection(monkeypatch):
     release.set()
     await asyncio.gather(first, second)
     assert max_inflight == 1
+
+
+# ============================================================================
+# Live target-refresh: retained authenticated connection, fence/drain ordering,
+# unused factor, validation before disruption, and recoverable failures.
+# ============================================================================
+
+async def test_refresh_live_interactive_supplied_factor_is_unused(monkeypatch):
+    gw, _ = _interactive_gateway()
+    connect_rec = {"calls": []}
+    reprovision_rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, connect_rec)
+    _install_fake_reprovision(monkeypatch, gw, reprovision_rec)
+
+    gw.runtimes["hal"].state = "connected"
+    gw.runtimes["hal"].active_route = "hal"
+    gw.runtimes["hal"].local_port = 31000
+    live = _FakeTunnel(
+        gw.config.targets["hal"], route="hal", local_port=31000, connection=object()
+    )
+    gw.runtimes["hal"].tunnel = live
+
+    result = await gw.refresh_target("hal", factor="OTP-SECRET")
+
+    assert connect_rec["calls"] == []  # no new login, so no factor use
+    assert len(reprovision_rec["calls"]) == 1
+    assert result["state"] == "connected"
+    assert "OTP-SECRET" not in json.dumps(result)
+
+
+async def test_refresh_invalid_override_leaves_healthy_target_untouched(
+    monkeypatch,
+):
+    gw, target = _allocation_gateway(
+        transport=TransportConfig(kind="tunnel", ssh_targets=("hal",))
+    )
+    reprovision_rec = {"calls": []}
+    _install_fake_reprovision(monkeypatch, gw, reprovision_rec)
+
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.local_port = 31000
+    runtime.provisioned_endpoint = "127.0.0.1:2222"
+    live = _FakeTunnel(
+        target, route="hal", local_port=31000,
+        provisioned_endpoint=("127.0.0.1", 2222), connection=object(),
+    )
+    runtime.tunnel = live
+
+    with pytest.raises(ConfigError, match="unknown --set key"):
+        await gw.refresh_target("hal", overrides={"unknown": 1})
+
+    # Validation ran before any disruption.
+    assert runtime.state == "connected"
+    assert runtime.tunnel is live
+    assert runtime.local_port == 31000
+    assert runtime.provisioned_endpoint == "127.0.0.1:2222"
+    assert live.fenced is False
+    assert reprovision_rec["calls"] == []
+
+
+async def test_refresh_missing_route_with_factor_dials_a_new_login(monkeypatch):
+    gw, _ = _interactive_gateway()
+    connect_rec = {"calls": []}
+    reprovision_rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, connect_rec)
+    _install_fake_reprovision(monkeypatch, gw, reprovision_rec)
+
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.local_port = 31000
+    runtime.tunnel = None  # route already gone
+
+    result = await gw.refresh_target("hal", factor="OTP-123")
+
+    assert connect_rec["calls"] == [{"target": "hal", "factor": "OTP-123"}]
+    assert reprovision_rec["calls"] == []
+    assert result["state"] == "connected"
+
+
+async def test_refresh_live_mid_stage_failure_is_recoverable(monkeypatch):
+    from compute_mcp.tunnel import TunnelError
+
+    gw, _ = _interactive_gateway()
+    connect_rec = {"calls": []}
+    _install_fake_connect(monkeypatch, gw, connect_rec)
+
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.local_port = 31000
+    runtime.provisioned_endpoint = "127.0.0.1:2222"
+    live = _FakeTunnel(
+        gw.config.targets["hal"], route="hal", local_port=31000,
+        provisioned_endpoint=("127.0.0.1", 2222), connection=object(),
+    )
+    runtime.tunnel = live
+
+    calls = []
+
+    async def boom(target, route, local_port, transport, connection, provision_env=None):
+        calls.append(local_port)
+        raise TunnelError("route dropped during provisioning")
+
+    monkeypatch.setattr(gw.tunnels, "reprovision_on_route", boom)
+
+    with pytest.raises(TunnelError, match="refresh provision stage failed"):
+        await gw.refresh_target("hal")
+
+    # Exactly one provision attempt: no OTP replay and no second allocation.
+    assert calls == [31000]
+    assert connect_rec["calls"] == []
+    assert runtime.state == "failed"
+    assert "provision" in (runtime.last_error or "")
+    assert runtime.active_route is None
+    assert runtime.local_port is None
+    assert runtime.provisioned_endpoint is None
+    assert runtime.connected_since is None
+    assert runtime.tunnel is None
+    assert live.stopped is True
+    # Recoverable: a later explicit refresh may retry.
+    assert runtime.awaiting_factor is True
+
+
+async def test_open_container_conn_discards_dial_that_raced_a_refresh(monkeypatch):
+    gw = make_gateway()
+    target = _tunnel_target()
+    gw.config = dataclasses.replace(
+        gw.config, targets={**gw.config.targets, "hal": target}
+    )
+    runtime = gw.runtimes["hal"]
+    runtime.state = "connected"
+    runtime.active_route = "hal"
+    runtime.local_port = 31000
+    runtime.tunnel = _FakeTunnel(target, route="hal", local_port=31000)
+
+    async def fake_ensure(name):
+        return runtime
+
+    dialed = []
+    discarded = []
+    closed = []
+
+    async def fake_connection(t, host, port, prompter=None):
+        dialed.append((host, port))
+        if len(dialed) == 1:
+            # A refresh completed while this dial was in flight.
+            runtime.route_epoch += 1
+            runtime.local_port = 31100
+            return "OLD"
+        return "NEW"
+
+    async def fake_discard(conn):
+        discarded.append(conn)
+
+    async def fake_close(conn):
+        closed.append(conn)
+
+    monkeypatch.setattr(gw, "ensure_connected", fake_ensure)
+    monkeypatch.setattr(gw.backend, "connection", fake_connection)
+    monkeypatch.setattr(gw.backend, "discard_connection", fake_discard)
+    monkeypatch.setattr(gw.backend, "close_connection", fake_close)
+
+    _, conn = await gw._open_container_conn("hal")
+
+    assert conn == "NEW"
+    assert dialed == [("127.0.0.1", 31000), ("127.0.0.1", 31100)]
+    assert discarded == ["OLD"]
+    assert closed == ["OLD"]

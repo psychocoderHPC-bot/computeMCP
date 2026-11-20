@@ -162,25 +162,33 @@ hashes are never returned, only a short `sha256:` fingerprint.
 
 ### Second factor (`--2fa`)
 
-For an `interactive_auth` target, pass `--2fa`; the command prompts for the
-per-request second factor on the terminal without echoing it:
+For an `interactive_auth` target, `target-connect` needs `--2fa`; the command
+prompts for the per-request second factor on the terminal without echoing it.
+A refresh only needs a factor when it cannot reuse a live login connection:
 
 ```bash
 computeMCP-gatewayctl target-connect --2fa myTargetHost
+# live login connection: no factor, no new authentication
+computeMCP-gatewayctl target-refresh myTargetHost
+# login connection gone: a fresh login needs a new factor
 computeMCP-gatewayctl target-refresh --2fa myTargetHost
 ```
 
-The token is not accepted on the command line. The factor is used once per
-request and is never persisted or logged. The gateway submits it at most once:
-if the server asks again in the same connection, the attempt is aborted instead
-of replaying a one-time code, which would count as another failed login and
-can lock the account. An interactive target does not auto-connect or
-auto-reconnect; a request that omits the factor fails closed (state unchanged)
-with a warning, and a disconnected interactive target also refuses `exec`,
-session and file requests without dialing. `target-connect`/`target-refresh`
-with `--2fa` are the only ways to connect it. When `interactive_auth` is false
-and `--2fa` is given, the gateway warns, ignores the factor, and proceeds with
-a key-based connect.
+A refresh first fences the old container forward, closes its sessions and
+connections, and reuses the authenticated login connection
+for the close/provision/forward sequence. If that login connection is usable,
+the refresh needs no factor; a supplied factor is ignored. If the connection
+is gone, the refresh reports the 2FA requirement before destructive work and
+needs a fresh factor. The token is not accepted on the command line. It is
+used once per fresh login and is never persisted or logged. The gateway
+submits it at most once: if the server asks again in the same connection, the
+attempt is aborted instead of replaying a one-time code, which would count as
+another failed login and can lock the account. An interactive target does not
+auto-connect or auto-reconnect; a connect or a refresh that needs a fresh
+login without a factor fails closed (state unchanged), and a disconnected
+interactive target also refuses `exec`, session and file requests without
+dialing. When `interactive_auth` is false and `--2fa` is given, the gateway
+warns, ignores the factor, and proceeds with a key-based connect.
 
 ### Allocation overrides (`--set`) and previews (`--dry-run`)
 

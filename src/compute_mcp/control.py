@@ -208,8 +208,9 @@ def build_parser() -> argparse.ArgumentParser:
             "--2fa",
             dest="use_2fa",
             action="store_true",
-            help="prompt on the terminal for the per-request second factor "
-            "(input is hidden)",
+            help="prompt for the second factor (input is hidden); "
+            "target-connect needs it for interactive_auth, target-refresh "
+            "only when no live login connection remains",
         )
         p.add_argument(
             "--set", dest="overrides", action="append", default=None,
