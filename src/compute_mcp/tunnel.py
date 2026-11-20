@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import re
 import shlex
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import asyncssh
@@ -51,6 +52,10 @@ log = logging.getLogger("compute_mcp.tunnel")
 
 class TunnelError(RuntimeError):
     pass
+
+
+class ForwardError(TunnelError):
+    """The retained route could not install or probe the new forward."""
 
 
 # Mirrors ``gateway._parse_provision_endpoint``.  Duplicated here (rather than
@@ -432,6 +437,71 @@ def allocate_loopback_port(ssh: SSHConfig, reserved: set[int]) -> int:
     raise TunnelError("no free internal port in configured range")
 
 
+# A refresh must not open the close/provision session while the old forward
+# still has accepted direct-tcpip channels.  A login node may set MaxSessions=1,
+# counting session and forwarding channels against the same budget, so the old
+# forward is fenced and every accepted channel is closed and awaited first.
+_FORWARD_DRAIN_TIMEOUT = 5.0
+# The readiness probe opens one transient direct-tcpip channel.  It must be
+# gone before the caller opens a session channel on the same connection.
+_PROBE_DRAIN_TIMEOUT = 2.0
+# The probe's local TCP accept and the SSH direct-tcpip channel open on the
+# event loop.  Require a short channel-free window so a channel that is still
+# being created is not missed by an immediate check.
+_PROBE_QUIET_SECONDS = 0.05
+
+
+def _forwarded_tcp_channels(connection) -> list:
+    """Live direct-tcpip channels on a connection, or an empty list.
+
+    ``SSHConnection._channels`` is private.  It is the only way to find the
+    channels the listener already accepted (``SSHListener.close`` leaves them
+    open).  Guard every access so a different asyncssh version degrades to a
+    no-op rather than crashing a refresh.
+    """
+    channels = getattr(connection, "_channels", None)
+    if not isinstance(channels, dict):
+        log.warning(
+            "asyncssh connection has no channel table; cannot discover "
+            "forwarded channels for draining"
+        )
+        return []
+    tcp_cls = getattr(asyncssh, "SSHTCPChannel", None)
+    if tcp_cls is None:
+        log.warning(
+            "asyncssh has no SSHTCPChannel class; cannot discover forwarded "
+            "channels for draining"
+        )
+        return []
+    try:
+        live = list(channels.values())
+    except Exception:  # noqa: BLE001 - private structure changed concurrently
+        log.warning(
+            "asyncssh channel table could not be iterated; cannot discover "
+            "forwarded channels for draining",
+            exc_info=True,
+        )
+        return []
+    return [channel for channel in live if isinstance(channel, tcp_cls)]
+
+
+def _supports_accept_handler(forward_local_port) -> bool:
+    """Whether a connection's forwarder accepts an ``accept_handler``.
+
+    ``asyncssh`` does; minimal stand-ins used by tests may not.  Checking the
+    signature avoids treating an internal TypeError as "unsupported".
+    """
+    try:
+        parameters = inspect.signature(forward_local_port).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "accept_handler"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 @dataclass
 class RouteTunnel:
     """A managed local port forwarding backed by a live asyncssh connection.
@@ -448,6 +518,14 @@ class RouteTunnel:
     local_port: int
     connection: asyncssh.SSHClientConnection | None = None
     provisioned_endpoint: tuple[str, int] | None = None
+    forward_listener: "asyncssh.SSHListener | None" = None
+    # Fence captured by the listener's accept_handler.  Once true no new
+    # forwarded connection is accepted, while the outer connection stays up.
+    _draining: bool = field(default=False, repr=False)
+
+    def _accept_forward(self, orig_host, orig_port) -> bool:
+        """Listener accept handler: deny every new connection while draining."""
+        return not self._draining
 
     @property
     def is_direct(self) -> bool:
@@ -458,7 +536,125 @@ class RouteTunnel:
         conn = self.connection
         return conn is not None and not conn.is_closed()
 
+    async def fence_forward(self) -> None:
+        """Stop accepting forwarded connections immediately.
+
+        Accepted connections are deliberately left open: :meth:`drain` closes
+        and awaits them separately.  The listener itself is only awaited after
+        those connections are gone, because ``asyncio.Server.wait_closed()``
+        waits for accepted connections on some Python versions.  Idempotent.
+        """
+        self._draining = True
+        listener = self.forward_listener
+        if listener is None:
+            return
+        with contextlib.suppress(Exception):
+            listener.close()
+
+    async def _wait_forward_listener(self) -> None:
+        listener = self.forward_listener
+        if listener is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                listener.wait_closed(), _FORWARD_DRAIN_TIMEOUT
+            )
+        self.forward_listener = None
+
+    async def drain_forwarded_channels(
+        self, timeout: float = _FORWARD_DRAIN_TIMEOUT, *, close: bool = True
+    ) -> None:
+        """Close/abort accepted direct-tcpip channels and await each close.
+
+        Loops until no forwarded channel remains, bounded by ``timeout``.  The
+        outer connection is retained.  With ``close=False`` the channels are
+        only awaited (used after the readiness probe); at the deadline they are
+        aborted so a stuck probe cannot consume the last channel slot.
+        """
+        connection = self.connection
+        if connection is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while True:
+            channels = _forwarded_tcp_channels(connection)
+            if not channels:
+                await self._wait_forward_listener()
+                return
+            if close:
+                for channel in channels:
+                    with contextlib.suppress(Exception):
+                        channel.close()
+            remaining = max(0.0, deadline - loop.time())
+            if remaining <= 0:
+                # A forced close is the last resort when a peer never
+                # acknowledges; returning with the channel still open would
+                # keep a MaxSessions slot occupied.
+                for channel in channels:
+                    with contextlib.suppress(Exception):
+                        channel.abort()
+                await self._wait_forward_listener()
+                return
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(channel.wait_closed() for channel in channels),
+                        return_exceptions=True,
+                    ),
+                    remaining,
+                )
+            # Closing is asynchronous; yield so remove_channel() can run.
+            await asyncio.sleep(0)
+
+    async def wait_forward_idle(
+        self, timeout: float = _PROBE_DRAIN_TIMEOUT
+    ) -> None:
+        """Wait for transient forwarded channels (the readiness probe) to go.
+
+        The outer connection and listener stay live.  A short channel-free
+        window covers the race between the probe's local TCP accept and the
+        asynchronous direct-tcpip channel creation; otherwise a MaxSessions=1
+        login could still see the probe channel when the next session opens.
+        """
+        connection = self.connection
+        if connection is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        quiet_since: float | None = None
+        while True:
+            channels = _forwarded_tcp_channels(connection)
+            now = loop.time()
+            if channels:
+                quiet_since = None
+                remaining = max(0.0, deadline - now)
+                if remaining <= 0:
+                    for channel in channels:
+                        with contextlib.suppress(Exception):
+                            channel.abort()
+                    return
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *(channel.wait_closed() for channel in channels),
+                            return_exceptions=True,
+                        ),
+                        remaining,
+                    )
+                await asyncio.sleep(0)
+                continue
+            if quiet_since is None:
+                quiet_since = now
+            if now - quiet_since >= _PROBE_QUIET_SECONDS:
+                return
+            if now >= deadline:
+                return
+            await asyncio.sleep(min(0.01, max(0.0, deadline - now)))
+
     async def stop(self) -> None:
+        """Fence, drain and fully close the outer connection."""
+        await self.fence_forward()
+        await self.drain_forwarded_channels()
         await _close_connection(self.connection)
         self.connection = None
 
@@ -615,102 +811,187 @@ class TunnelManager:
 
         assert conn is not None  # _iter_hops always yields at least the route
 
-        provisioned: tuple[str, int] | None = None
-        dest_host = transport.remote_host
-        dest_port = transport.remote_port
-        if provision and (target.provision_command or target.bundle):
-            resolved_dir: str | None = None
-            if target.bundle:
-                # Deploy the shipped bundle over the live route, then run it
-                # from the deploy directory.  The upload is skipped when the
-                # remote content marker matches; explicit provision_command or
-                # close_command still take precedence over the bundle.
-                try:
-                    resolved_dir = await bundle_module.ensure_deployed(conn, target)
-                except (bundle_module.BundleError, asyncssh.Error, OSError) as exc:
-                    for opened_conn in reversed(opened):
-                        await _close_connection(opened_conn)
-                    raise TunnelError(
-                        f"target {target.name!r} bundle deploy on route "
-                        f"{route!r} failed: {exc}"
-                    ) from exc
-            argv_tuple = bundle_module.provision_argv(
-                target, "provision", deploy_dir=resolved_dir
-            )
-            argv = " ".join(shlex.quote(p) for p in argv_tuple)
-            prefix = format_provision_env(provision_env)
-            command = f"{prefix} {argv}" if prefix else argv
-            log.info(
-                "target %s: provisioning on route %s: %s",
-                target.name, route, " ".join(argv_tuple),
-            )
-            try:
-                result = await with_channel_open_retry(
-                    lambda: conn.run(
-                        command,
-                        check=False,
-                        timeout=target.provision_timeout,
-                        encoding=None,
+        try:
+            if provision:
+                dest_host, dest_port, provisioned = (
+                    await self._provision_on_connection(
+                        target, route, conn, transport, provision_env
                     )
                 )
-            except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
-                for opened_conn in reversed(opened):
-                    await _close_connection(opened_conn)
+            else:
+                dest_host = transport.remote_host
+                dest_port = transport.remote_port
+                provisioned = None
+            return await self._establish_forward(
+                target,
+                route,
+                local_port,
+                conn,
+                dest_host,
+                dest_port,
+                provisioned,
+            )
+        except TunnelError:
+            # This method owns the freshly dialed connection: an error before
+            # the caller receives a RouteTunnel closes every opened hop.
+            for opened_conn in reversed(opened):
+                await _close_connection(opened_conn)
+            raise
+
+    async def reprovision_on_route(
+        self,
+        target: TargetConfig,
+        route: str,
+        local_port: int,
+        transport: TransportConfig | None,
+        connection: asyncssh.SSHClientConnection | None,
+        provision_env: dict[str, str] | None = None,
+    ) -> RouteTunnel:
+        """Re-provision and forward on an already-authenticated route.
+
+        The retained ``connection`` is reused exactly as-is: no dial, no
+        factor, no ProxyJump and no close.  The caller owns the connection and
+        must close it on failure.  Runs sequentially: deploy/provision, install
+        the fenced forward, probe, then wait out the probe's transient
+        direct-tcpip channel so a MaxSessions=1 login is not left full.
+        """
+        if transport is None:
+            transport = target.transport
+        if connection is None:
+            raise TunnelError(
+                f"target {target.name!r}: no retained route connection to "
+                "re-provision"
+            )
+        dest_host, dest_port, provisioned = await self._provision_on_connection(
+            target, route, connection, transport, provision_env
+        )
+        return await self._establish_forward(
+            target,
+            route,
+            local_port,
+            connection,
+            dest_host,
+            dest_port,
+            provisioned,
+        )
+
+    async def _provision_on_connection(
+        self,
+        target: TargetConfig,
+        route: str,
+        connection: asyncssh.SSHClientConnection,
+        transport: TransportConfig,
+        provision_env: dict[str, str] | None,
+    ) -> tuple[str, int, tuple[str, int] | None]:
+        """Deploy/provision on ``connection``; never close it on error."""
+        dest_host = transport.remote_host
+        dest_port = transport.remote_port
+        if not (target.provision_command or target.bundle):
+            return dest_host, dest_port, None
+
+        resolved_dir: str | None = None
+        if target.bundle:
+            # Deploy the shipped bundle over the live route, then run it from
+            # the deploy directory.  The upload is skipped when the remote
+            # content marker matches; explicit provision_command or
+            # close_command still take precedence over the bundle.
+            try:
+                resolved_dir = await bundle_module.ensure_deployed(
+                    connection, target
+                )
+            except (bundle_module.BundleError, asyncssh.Error, OSError) as exc:
                 raise TunnelError(
-                    f"target {target.name!r} provisioning on route {route!r} "
-                    f"failed: {exc}"
+                    f"target {target.name!r} bundle deploy on route "
+                    f"{route!r} failed: {exc}"
                 ) from exc
-            stdout = result.stdout or b""
-            stderr = result.stderr or b""
-            if result.exit_status != 0:
-                detail = stderr.decode(errors="replace").strip() or "no stderr"
-                for opened_conn in reversed(opened):
-                    await _close_connection(opened_conn)
-                raise TunnelError(
-                    f"target {target.name!r} provisioning exited "
-                    f"{result.exit_status}: {detail}"
-                )
-            endpoint = parse_provision_endpoint(stdout.decode(errors="replace"))
-            if endpoint is None:
-                for opened_conn in reversed(opened):
-                    await _close_connection(opened_conn)
-                raise TunnelError(
-                    f"target {target.name!r} provisioning printed no "
-                    "host:port endpoint"
-                )
-            dest_host, dest_port = endpoint
-            provisioned = endpoint
-            log.info(
-                "target %s provisioned endpoint %s:%d", target.name, dest_host, dest_port
-            )
-
+        argv_tuple = bundle_module.provision_argv(
+            target, "provision", deploy_dir=resolved_dir
+        )
+        argv = " ".join(shlex.quote(p) for p in argv_tuple)
+        prefix = format_provision_env(provision_env)
+        command = f"{prefix} {argv}" if prefix else argv
+        log.info(
+            "target %s: provisioning on route %s: %s",
+            target.name, route, " ".join(argv_tuple),
+        )
         try:
-            await conn.forward_local_port(
-                "127.0.0.1", local_port, dest_host, dest_port
+            result = await with_channel_open_retry(
+                lambda: connection.run(
+                    command,
+                    check=False,
+                    timeout=target.provision_timeout,
+                    encoding=None,
+                )
             )
-        except (OSError, asyncssh.Error) as exc:
-            for opened_conn in reversed(opened):
-                await _close_connection(opened_conn)
+        except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
             raise TunnelError(
-                f"route {route!r} could not establish forwarding to "
-                f"{dest_host}:{dest_port}: {exc}"
+                f"target {target.name!r} provisioning on route {route!r} "
+                f"failed: {exc}"
             ) from exc
-
-        if not await probe("127.0.0.1", local_port):
-            for opened_conn in reversed(opened):
-                await _close_connection(opened_conn)
+        stdout = result.stdout or b""
+        stderr = result.stderr or b""
+        if result.exit_status != 0:
+            detail = stderr.decode(errors="replace").strip() or "no stderr"
             raise TunnelError(
-                f"route {route!r} did not establish forwarding to "
-                f"{dest_host}:{dest_port}"
+                f"target {target.name!r} provisioning exited "
+                f"{result.exit_status}: {detail}"
             )
+        endpoint = parse_provision_endpoint(stdout.decode(errors="replace"))
+        if endpoint is None:
+            raise TunnelError(
+                f"target {target.name!r} provisioning printed no "
+                "host:port endpoint"
+            )
+        dest_host, dest_port = endpoint
+        log.info(
+            "target %s provisioned endpoint %s:%d", target.name, dest_host, dest_port
+        )
+        return dest_host, dest_port, endpoint
 
-        return RouteTunnel(
+    async def _establish_forward(
+        self,
+        target: TargetConfig,
+        route: str,
+        local_port: int,
+        connection: asyncssh.SSHClientConnection,
+        dest_host: str,
+        dest_port: int,
+        provisioned: tuple[str, int] | None,
+    ) -> RouteTunnel:
+        """Install the fenced listener, probe, and wait out the probe channel.
+
+        On failure the temporary listener/channels are fenced and drained, but
+        ``connection`` is left open (the caller decides whether to close it).
+        """
+        tunnel = RouteTunnel(
             target=target,
             route=route,
             local_port=local_port,
-            connection=conn,
+            connection=connection,
             provisioned_endpoint=provisioned,
         )
+        try:
+            kwargs = {}
+            if _supports_accept_handler(connection.forward_local_port):
+                kwargs["accept_handler"] = tunnel._accept_forward
+            listener = await connection.forward_local_port(
+                "127.0.0.1", local_port, dest_host, dest_port, **kwargs
+            )
+        except (OSError, asyncssh.Error) as exc:
+            raise ForwardError(
+                f"route {route!r} could not establish forwarding to "
+                f"{dest_host}:{dest_port}: {exc}"
+            ) from exc
+        tunnel.forward_listener = listener
+        if not await probe("127.0.0.1", local_port):
+            await tunnel.fence_forward()
+            await tunnel.drain_forwarded_channels()
+            raise ForwardError(
+                f"route {route!r} did not establish forwarding to "
+                f"{dest_host}:{dest_port}"
+            )
+        await tunnel.wait_forward_idle()
+        return tunnel
 
     async def _run_advisory_command(
         self,
@@ -931,6 +1212,21 @@ class TunnelManager:
         raise TunnelError(
             f"no working route for target {target.name!r}: {last_error}"
         )
+
+    def reserve_local_port(self, preferred: int | None = None) -> int:
+        """Keep ``preferred`` reserved (a refresh's old port) or allocate one.
+
+        Reusing the old loopback port is safe because a live refresh fences and
+        waits for the old listener before installing the new one; clients that
+        already know the port keep working.  A missing value allocates cleanly.
+        """
+        if preferred is not None:
+            self._reserved.add(preferred)
+            return preferred
+        return allocate_loopback_port(self.ssh, self._reserved)
+
+    def release_local_port(self, port: int) -> None:
+        self._reserved.discard(port)
 
     def release(self, tunnel: RouteTunnel) -> None:
         if tunnel.route is not None:

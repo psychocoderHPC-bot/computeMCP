@@ -23,7 +23,17 @@ import pytest
 
 import asyncssh
 
-from compute_mcp.config import SSHConfig, TargetConfig, TransportConfig
+from compute_mcp.auth import hash_token
+from compute_mcp.config import (
+    ClientConfig,
+    GatewayConfig,
+    ServerConfig,
+    SessionConfig,
+    SSHConfig,
+    TargetConfig,
+    TransportConfig,
+)
+from compute_mcp.gateway import Gateway
 from compute_mcp.ssh_backend import SSHError
 from compute_mcp.tunnel import (
     TunnelError,
@@ -55,21 +65,136 @@ class _LoginSession(asyncssh.SSHServerSession):
 
     def connection_made(self, chan) -> None:
         self._chan = chan
+        self.state["live_channels"] = (
+            self.state.get("live_channels", 0) + 1
+        )
+        self.state["max_channels"] = max(
+            self.state.get("max_channels", 0),
+            self.state["live_channels"],
+        )
+
+    def connection_lost(self, exc) -> None:
+        self.state["live_channels"] = max(
+            0, self.state.get("live_channels", 0) - 1
+        )
 
     def exec_requested(self, command) -> bool:
         self.state["commands"].append(command)
         self._command = command
+        if "provision" in command:
+            self.state["provision_requests"] = (
+                self.state.get("provision_requests", 0) + 1
+            )
         return True
 
     def session_started(self) -> None:
         out = ""
         if "provision" in self._command:
-            out = f"ENDPOINT 127.0.0.1:{self.state['dest_port']}\n"
+            self.state["provision_count"] = (
+                self.state.get("provision_count", 0) + 1
+            )
+            ports = self.state.get("endpoint_ports") or [
+                self.state["dest_port"]
+            ]
+            port = ports[
+                min(self.state["provision_count"] - 1, len(ports) - 1)
+            ]
+            self.state["dest_port"] = port
+            out = f"ENDPOINT 127.0.0.1:{port}\n"
+        elif "close" in self._command:
+            self.state["close_count"] = (
+                self.state.get("close_count", 0) + 1
+            )
+            if self.state.get("drop_on_close"):
+                conn = self.state.get("conn")
+                if conn is not None:
+                    conn.close()
         self._chan.write(out.encode())
         self._chan.exit(0)
 
     def shell_requested(self) -> bool:
         return False
+
+
+class _ForwardSession(asyncssh.SSHTCPSession):
+    """Count and relay one direct-tcpip channel to the requested destination."""
+
+    def __init__(self, state: dict, dest_host: str, dest_port: int) -> None:
+        self.state = state
+        self.dest = (dest_host, dest_port)
+        self._chan = None
+        self._writer = None
+        self._pending = bytearray()
+        self._opened = False
+        self._open_task = None
+        self._reader_task = None
+
+    def connection_made(self, chan) -> None:
+        self._chan = chan
+        self.state["live_channels"] = (
+            self.state.get("live_channels", 0) + 1
+        )
+        self.state["max_channels"] = max(
+            self.state.get("max_channels", 0),
+            self.state["live_channels"],
+        )
+        self._open_task = asyncio.create_task(self._connect())
+
+    async def _connect(self) -> None:
+        try:
+            reader, writer = await asyncio.open_connection(*self.dest)
+        except OSError:
+            if self._chan is not None:
+                self._chan.close()
+            return
+        self._writer = writer
+        self._opened = True
+        if self._pending:
+            writer.write(self._pending)
+            self._pending.clear()
+        self._reader_task = asyncio.create_task(self._pump(reader))
+
+    async def _pump(self, reader) -> None:
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                if self._chan is not None:
+                    self._chan.write(data)
+        except Exception:
+            pass
+        finally:
+            if self._chan is not None:
+                with contextlib.suppress(Exception):
+                    self._chan.write_eof()
+
+    def data_received(self, data, datatype) -> None:
+        if self._opened and self._writer is not None:
+            self._writer.write(data)
+        else:
+            self._pending.extend(data)
+
+    def eof_received(self):
+        if self._writer is not None:
+            with contextlib.suppress(Exception):
+                self._writer.write_eof()
+        return False
+
+    def connection_lost(self, exc) -> None:
+        self.state["live_channels"] = max(
+            0, self.state.get("live_channels", 0) - 1
+        )
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            self._reader_task = None
+        if self._open_task is not None and not self._open_task.done():
+            self._open_task.cancel()
+            self._open_task = None
+        if self._writer is not None:
+            with contextlib.suppress(Exception):
+                self._writer.close()
+            self._writer = None
 
 
 class _LoginServer(asyncssh.SSHServer):
@@ -89,8 +214,15 @@ class _LoginServer(asyncssh.SSHServer):
         self.pubkey = pubkey
         self.seen_passwords: list[str] = []
 
+    def connection_made(self, conn) -> None:
+        self.state["connections"] = self.state.get("connections", 0) + 1
+        self.state["conn"] = conn
+
     def begin_auth(self, username: str) -> bool:
         return True
+
+    def auth_completed(self) -> None:
+        self.state["auths"] = self.state.get("auths", 0) + 1
 
     def password_auth_supported(self) -> bool:
         return self.password is not None
@@ -116,10 +248,15 @@ class _LoginServer(asyncssh.SSHServer):
         return self.pubkey
 
     def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
-        # Accept the client's TCP forwarding request and let asyncssh relay it.
-        return True
+        # Enforce the site's one-open-channel limit in the fixture.  A refresh
+        # that leaves an old direct-tcpip channel open cannot open its session.
+        if self.state.get("live_channels", 0) >= 1:
+            return False
+        return _ForwardSession(self.state, dest_host, dest_port)
 
     def session_requested(self):
+        if self.state.get("live_channels", 0) >= 1:
+            return False
         return _LoginSession(self.state)
 
 
@@ -141,11 +278,73 @@ class _Login:
             await self.server.wait_closed()
 
 
+class _ContainerSession(asyncssh.SSHServerSession):
+    """Minimal container sshd session used to prove the forward still works."""
+
+    def __init__(self, state: dict) -> None:
+        self.state = state
+        self._chan = None
+        self._command = ""
+
+    def connection_made(self, chan) -> None:
+        self._chan = chan
+
+    def exec_requested(self, command) -> bool:
+        self._command = command
+        self.state["commands"].append(command)
+        if "provision" in command:
+            self.state["provision_requests"] = (
+                self.state.get("provision_requests", 0) + 1
+            )
+        return True
+
+    def session_started(self) -> None:
+        self._chan.write(f"container:{self._command}\n".encode())
+        self._chan.exit(0)
+
+    def shell_requested(self) -> bool:
+        return False
+
+
+class _ContainerServer(asyncssh.SSHServer):
+    """Key-only container endpoint; accepts any offered public key."""
+
+    def __init__(self, state: dict) -> None:
+        self.state = state
+
+    def auth_completed(self) -> None:
+        # Count authenticated container SSH connections, not readiness probes
+        # (which open a raw TCP socket and never complete SSH auth).
+        self.state["connections"] = self.state.get("connections", 0) + 1
+
+    def begin_auth(self, username: str) -> bool:
+        return True
+
+    def public_key_auth_supported(self) -> bool:
+        return True
+
+    async def validate_public_key(self, username, key) -> bool:
+        return True
+
+    def session_requested(self):
+        return _ContainerSession(self.state)
+
+
 async def _start_login(tmp_path_factory, **auth) -> _Login:
     host_key = asyncssh.generate_private_key("ssh-ed25519")
     host_path = os.path.join(str(tmp_path_factory.mktemp("route")), "host_key")
     host_key.write_private_key(host_path)
-    state: dict = {"commands": [], "dest_port": 0}
+    state: dict = {
+        "commands": [],
+        "dest_port": 0,
+        "connections": 0,
+        "auths": 0,
+        "live_channels": 0,
+        "max_channels": 0,
+        "provision_count": 0,
+        "provision_requests": 0,
+        "close_count": 0,
+    }
     server = await asyncssh.listen(
         "127.0.0.1",
         0,
@@ -643,3 +842,359 @@ async def test_proxyjump_factor_is_used_only_on_the_final_hop(monkeypatch):
     finally:
         await tunnel.stop()
         mgr.release(tunnel)
+
+
+# ---------------------------------------------------------------------------
+# Live target-refresh over the retained login connection
+# ---------------------------------------------------------------------------
+
+@contextlib.asynccontextmanager
+async def _live_refresh_gateway(tmp_path, tmp_path_factory, monkeypatch):
+    """Start the login fixture, two container endpoints and a live gateway."""
+    login = await _start_login(tmp_path_factory, password="SECRET")
+    host_key = asyncssh.generate_private_key("ssh-ed25519")
+    host_key_path = tmp_path / "container_host_key"
+    host_key.write_private_key(str(host_key_path))
+    container_pin = host_key.get_fingerprint("sha256")
+    client_key = asyncssh.generate_private_key("ssh-ed25519")
+    client_key_path = tmp_path / "client_key"
+    client_key.write_private_key(str(client_key_path))
+    container_states = [{"commands": []}, {"commands": []}]
+    containers = []
+    gw = None
+    runtime = None
+    try:
+        for state in container_states:
+            server = await asyncssh.listen(
+                "127.0.0.1",
+                0,
+                server_host_keys=[str(host_key_path)],
+                server_factory=lambda st=state: _ContainerServer(st),
+                encoding=None,
+            )
+            containers.append(server)
+        ports = [server.get_port() for server in containers]
+        login.state["endpoint_ports"] = ports
+        login.state["dest_port"] = ports[0]
+        _route_alias(monkeypatch, login)
+        target = TargetConfig(
+            name="hal",
+            user="agent",
+            container_user="ubuntu",
+            transport=TransportConfig(
+                kind="tunnel",
+                ssh_targets=("login",),
+                remote_host="127.0.0.1",
+                remote_port=ports[0],
+            ),
+            route_host_key_sha256=login.pin,
+            host_key_sha256=container_pin,
+            client_key=str(client_key_path),
+            provision_command=("provision",),
+            close_command=("close",),
+            interactive_auth=True,
+        )
+        cfg = GatewayConfig(
+            server=ServerConfig(),
+            ssh=SSHConfig(),
+            sessions=SessionConfig(),
+            targets={"hal": target},
+            clients={
+                "test": ClientConfig(
+                    client_id="test",
+                    token_sha256=hash_token("test-token"),
+                    allow_all=True,
+                )
+            },
+        )
+        gw = Gateway(cfg)
+        runtime = gw.runtimes["hal"]
+        yield login, containers, container_states, gw, runtime, ports
+    finally:
+        if gw is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(gw.backend.disconnect("hal"), 5)
+            if runtime is not None and runtime.tunnel is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(runtime.tunnel.stop(), 10)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(gw.sessions.stop(), 10)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(login.close(), 5)
+        for server in containers:
+            server.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(server.wait_closed(), 5)
+
+
+async def test_live_refresh_reuses_login_connection_and_one_channel(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A live refresh must not authenticate again or overlap outer channels.
+
+    The login fixture enforces MaxSessions=1 for both session and
+    direct-tcpip channels and counts every channel until connection_lost.  The
+    gateway starts connected with an active container forward, refreshes
+    without --2fa, and then successfully runs a container command against the
+    replacement endpoint.
+    """
+    async with _live_refresh_gateway(
+        tmp_path, tmp_path_factory, monkeypatch
+    ) as (login, _containers, states, gw, runtime, ports):
+        await asyncio.wait_for(
+            gw.connect_target("hal", factor="SECRET"), 20
+        )
+        assert runtime.state == "connected"
+        assert runtime.provisioned_endpoint == f"127.0.0.1:{ports[0]}"
+        assert login.state["auths"] == 1
+        assert login.state["connections"] == 1
+        assert login.state["provision_count"] == 1
+        assert login.state["provision_requests"] == 1
+        old_conn = runtime.tunnel.connection
+
+        _, conn = await asyncio.wait_for(
+            gw._open_container_conn("hal"), 15
+        )
+        result = await asyncio.wait_for(
+            conn.run("before", encoding=None), 10
+        )
+        assert result.stdout == b"container:before\n"
+        assert states[0]["commands"] == ["before"]
+        assert login.state["live_channels"] == 1
+
+        refreshed = await asyncio.wait_for(
+            gw.refresh_target("hal", factor=None), 30
+        )
+        assert refreshed["state"] == "connected"
+        assert login.state["auths"] == 1
+        assert login.state["connections"] == 1
+        assert login.state["close_count"] == 1
+        assert login.state["provision_count"] == 2
+        assert login.state["max_channels"] == 1
+        assert login.state["commands"] == ["provision", "close", "provision"]
+        assert runtime.provisioned_endpoint == f"127.0.0.1:{ports[1]}"
+        # The same outer login connection is retained, not a new login.
+        assert runtime.tunnel.connection is old_conn
+        assert states[0]["commands"] == ["before"]
+
+        _, conn2 = await asyncio.wait_for(
+            gw._open_container_conn("hal"), 15
+        )
+        result = await asyncio.wait_for(
+            conn2.run("after", encoding=None), 10
+        )
+        assert result.stdout == b"container:after\n"
+        assert states[1]["commands"] == ["after"]
+        assert states[0]["commands"] == ["before"]
+        assert login.state["auths"] == 1
+        assert login.state["max_channels"] == 1
+
+
+async def test_container_dial_racing_refresh_uses_the_new_forward(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A dial that passed ensure_connected before refresh must not be used."""
+    async with _live_refresh_gateway(
+        tmp_path, tmp_path_factory, monkeypatch
+    ) as (login, _containers, states, gw, runtime, ports):
+        await asyncio.wait_for(
+            gw.connect_target("hal", factor="SECRET"), 20
+        )
+        original = gw.backend.connection
+        calls = []
+        first_conns = []
+        first_dialed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed(target, host, port, prompter=None):
+            calls.append((host, port))
+            if len(calls) == 1:
+                conn = await original(
+                    target, host, port, prompter=prompter
+                )
+                first_conns.append(conn)
+                first_dialed.set()
+                await release.wait()
+                return conn
+            return await original(target, host, port, prompter=prompter)
+
+        monkeypatch.setattr(gw.backend, "connection", delayed)
+        task = asyncio.create_task(gw._open_container_conn("hal"))
+        await asyncio.wait_for(first_dialed.wait(), 10)
+        # The old forward now has an accepted channel; refresh must tear it
+        # down and still finish while the racing dial is held open.
+        assert login.state["live_channels"] == 1
+        refreshed = await asyncio.wait_for(
+            gw.refresh_target("hal", factor=None), 30
+        )
+        assert refreshed["state"] == "connected"
+        assert login.state["auths"] == 1
+        assert first_conns and first_conns[0].is_closed()
+
+        release.set()
+        _, conn = await asyncio.wait_for(task, 20)
+        assert len(calls) == 2
+        result = await asyncio.wait_for(
+            conn.run("race", encoding=None), 10
+        )
+        assert result.stdout == b"container:race\n"
+        assert states[1]["commands"] == ["race"]
+        assert states[0]["commands"] == []
+        assert states[0].get("connections", 0) == 1
+        assert login.state["auths"] == 1
+        assert login.state["max_channels"] == 1
+
+
+async def test_refresh_route_loss_mid_refresh_reports_stage_without_retry(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """Losing the retained login connection must not start a second allocation."""
+    from compute_mcp.tunnel import TunnelError
+
+    async with _live_refresh_gateway(
+        tmp_path, tmp_path_factory, monkeypatch
+    ) as (login, _containers, _states, gw, runtime, _ports):
+        await asyncio.wait_for(
+            gw.connect_target("hal", factor="SECRET"), 20
+        )
+        login.state["drop_on_close"] = True
+        with pytest.raises(
+            TunnelError, match="refresh provision stage failed"
+        ):
+            await asyncio.wait_for(
+                gw.refresh_target("hal", factor=None), 30
+            )
+        assert runtime.state == "failed"
+        assert "provision" in (runtime.last_error or "")
+        assert runtime.tunnel is None
+        assert runtime.awaiting_factor is True
+        # No OTP replay or second allocation: one login and one provision.
+        assert login.state["auths"] == 1
+        assert login.state["connections"] == 1
+        assert login.state["provision_count"] == 1
+        # A second provision exec attempt on the retained (now dead)
+        # connection would be visible here even if it never reached
+        # session_started.
+        assert login.state["provision_requests"] == 1
+
+
+async def test_refresh_drains_a_raw_forward_channel(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A forwarded channel that is not a cached container SSH conn must close.
+
+    This exercises the private asyncssh channel discovery and drain path: the
+    raw TCP client has no cached container connection for backend.disconnect to
+    close, so only the drain can release the MaxSessions slot before close.
+    """
+    async with _live_refresh_gateway(
+        tmp_path, tmp_path_factory, monkeypatch
+    ) as (login, _containers, states, gw, runtime, ports):
+        await asyncio.wait_for(
+            gw.connect_target("hal", factor="SECRET"), 20
+        )
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", runtime.local_port
+        )
+        try:
+            for _ in range(200):
+                if login.state["live_channels"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert login.state["live_channels"] == 1
+
+            refreshed = await asyncio.wait_for(
+                gw.refresh_target("hal", factor=None), 30
+            )
+            assert refreshed["state"] == "connected"
+            assert login.state["auths"] == 1
+            assert login.state["close_count"] == 1
+            assert login.state["provision_count"] == 2
+            assert login.state["max_channels"] == 1
+
+            async def read_to_eof():
+                try:
+                    while True:
+                        data = await reader.read(4096)
+                        if not data:
+                            return True
+                except (ConnectionError, asyncio.IncompleteReadError):
+                    return True
+
+            assert await asyncio.wait_for(read_to_eof(), 10) is True
+            _, conn = await asyncio.wait_for(
+                gw._open_container_conn("hal"), 15
+            )
+            result = await asyncio.wait_for(
+                conn.run("after-drain", encoding=None), 10
+            )
+            assert result.stdout == b"container:after-drain\n"
+            assert states[1]["commands"] == ["after-drain"]
+            assert login.state["max_channels"] == 1
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+
+async def test_dial_started_during_refresh_teardown_does_not_use_old_forward(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A dial blocked before connect is released only after the old fence.
+
+    It may fail on the closed listener or re-dial the replacement endpoint; it
+    must never run a container command on the old endpoint.
+    """
+    from compute_mcp.ssh_backend import SSHError
+
+    async with _live_refresh_gateway(
+        tmp_path, tmp_path_factory, monkeypatch
+    ) as (login, _containers, states, gw, runtime, ports):
+        await asyncio.wait_for(
+            gw.connect_target("hal", factor="SECRET"), 20
+        )
+        original = gw.backend.connection
+        calls = []
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed(target, host, port, prompter=None):
+            calls.append((host, port))
+            if len(calls) == 1:
+                blocked.set()
+                await release.wait()
+            return await original(target, host, port, prompter=prompter)
+
+        monkeypatch.setattr(gw.backend, "connection", delayed)
+        task = asyncio.create_task(gw._open_container_conn("hal"))
+        await asyncio.wait_for(blocked.wait(), 10)
+
+        refresh_task = asyncio.create_task(
+            gw.refresh_target("hal", factor=None)
+        )
+        for _ in range(500):
+            if "close" in login.state["commands"]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("refresh did not reach the close stage")
+        # The old listener has been fenced and drained; release the dial now.
+        release.set()
+        refreshed = await asyncio.wait_for(refresh_task, 30)
+        assert refreshed["state"] == "connected"
+
+        conn = None
+        try:
+            _, conn = await asyncio.wait_for(task, 20)
+        except (SSHError, OSError):
+            conn = None
+        if conn is not None:
+            result = await asyncio.wait_for(
+                conn.run("race-during-teardown", encoding=None), 10
+            )
+            assert result.stdout == b"container:race-during-teardown\n"
+            assert states[1]["commands"] == ["race-during-teardown"]
+        assert states[0]["commands"] == []
+        assert states[0].get("connections", 0) == 0
+        assert login.state["auths"] == 1
+        assert login.state["max_channels"] == 1
