@@ -38,6 +38,7 @@ from . import bundle as bundle_module
 from .config import SSHConfig, TargetConfig, TransportConfig
 from .ssh_backend import (
     SSHError,
+    FactorPrompter,
     InteractiveSSHClient,
     _empty_known_hosts,
     dial_route,
@@ -543,6 +544,7 @@ class TunnelManager:
         transport: TransportConfig | None = None,
         *,
         factor: str | None = None,
+        prompter: FactorPrompter | None = None,
         provision: bool = True,
         provision_env: dict[str, str] | None = None,
     ) -> RouteTunnel:
@@ -580,7 +582,8 @@ class TunnelManager:
             )
 
         client_keys = _route_client_keys(route_info)
-        prompter = make_factor_prompter(factor) if factor is not None else None
+        if prompter is None and factor is not None:
+            prompter = make_factor_prompter(factor)
         pin = target.route_host_key_sha256 or None
 
         opened: list[asyncssh.SSHClientConnection] = []
@@ -882,10 +885,14 @@ class TunnelManager:
         # Only forward ``provision_env`` when set, so the existing call shape
         # for a target without an allocation/container description is unchanged.
         env_kwargs = {"provision_env": provision_env} if provision_env is not None else {}
+        # One prompter for the whole connect request.  It is shared by every
+        # route in the failover list so a factor consumed on one DNS name can
+        # never be submitted again on the next one.
+        prompter = make_factor_prompter(factor) if factor is not None else None
         if transport.kind == "direct":
             return await self.open_for_route(
                 target, "direct", transport.remote_port, transport,
-                factor=factor, provision=False, **env_kwargs,
+                factor=factor, prompter=prompter, provision=False, **env_kwargs,
             )
 
         last_error: Exception | None = None
@@ -894,7 +901,7 @@ class TunnelManager:
             try:
                 tunnel = await self.open_for_route(
                     target, route, local_port, transport,
-                    factor=factor, provision=not override,
+                    factor=factor, prompter=prompter, provision=not override,
                     **env_kwargs,
                 )
                 log.info("target %s connected via route %s on 127.0.0.1:%d",
@@ -906,6 +913,13 @@ class TunnelManager:
                 log.warning("target %s route %s failed: %s", target.name, route, exc)
                 if on_route is not None:
                     on_route(route, exc)
+                if prompter is not None and prompter.used:
+                    raise TunnelError(
+                        f"2FA factor was already used on route {route!r}; "
+                        f"refusing to replay it on another route. Supply a "
+                        f"fresh factor with 'target-connect --2fa <new secret> "
+                        f"{target.name}'."
+                    ) from exc
         raise TunnelError(
             f"no working route for target {target.name!r}: {last_error}"
         )

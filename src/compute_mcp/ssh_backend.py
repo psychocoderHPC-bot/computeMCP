@@ -196,7 +196,39 @@ PinnedHostKeyClient = InteractiveSSHClient
 FACTOR_MAX_USES = 1
 
 
-def make_factor_prompter(secret: str) -> _Prompter:
+class FactorPrompter:
+    """One-shot prompter for a per-request second factor.
+
+    The secret is cleared as soon as it is submitted.  A second prompt, whether
+    from a retry, a second DNS name in the route list, or another hop, returns
+    ``None`` instead of replaying a single-use code.
+    """
+
+    def __init__(self, secret: str) -> None:
+        self._secret: str | None = secret
+        self._uses = 0
+
+    @property
+    def used(self) -> bool:
+        return self._uses > 0
+
+    @property
+    def exhausted(self) -> bool:
+        return self._uses >= FACTOR_MAX_USES
+
+    async def __call__(self, prompt: str, echo: bool) -> str | None:
+        self._uses += 1
+        if self._uses > FACTOR_MAX_USES or self._secret is None:
+            log.warning(
+                "route authentication: refusing to replay a single-use second "
+                "factor; aborting this attempt"
+            )
+            return None
+        secret, self._secret = self._secret, None
+        return secret
+
+
+def make_factor_prompter(secret: str) -> FactorPrompter:
     """Return a prompter that submits ``secret`` at most once.
 
     Used for a per-request second factor (password / OTP) on the gateway ->
@@ -204,22 +236,10 @@ def make_factor_prompter(secret: str) -> _Prompter:
     prompt is not answered: replaying the same code would only add a failed
     authentication attempt at the site.  The prompter therefore returns ``None``
     after the first use, which stops that auth method instead of retrying with
-    the same secret.  The secret is never logged.
+    the same secret.  The secret is cleared after the first submission and is
+    never logged.
     """
-    uses = 0
-
-    async def prompter(prompt: str, echo: bool) -> str | None:
-        nonlocal uses
-        uses += 1
-        if uses > FACTOR_MAX_USES:
-            log.warning(
-                "route authentication: refusing to replay a single-use second "
-                "factor; aborting this attempt"
-            )
-            return None
-        return secret
-
-    return prompter
+    return FactorPrompter(secret)
 
 
 def _empty_known_hosts(host: str, addr, port) -> tuple:
