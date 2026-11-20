@@ -217,6 +217,12 @@ async def test_factor_prompter_is_single_use_and_clears_the_secret():
     assert prompter.used is True
     assert await prompter("Password:", False) is None
 
+    unused = make_factor_prompter("OTHER")
+    unused.clear()
+    assert unused.used is False
+    assert await unused("Password:", False) is None
+    assert unused.used is True
+
 
 async def test_stop_releases_port(monkeypatch):
     mgr = TunnelManager(SSHConfig(internal_port_min=31330, internal_port_max=31340))

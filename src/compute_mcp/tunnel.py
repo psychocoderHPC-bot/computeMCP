@@ -890,10 +890,13 @@ class TunnelManager:
         # never be submitted again on the next one.
         prompter = make_factor_prompter(factor) if factor is not None else None
         if transport.kind == "direct":
-            return await self.open_for_route(
+            tunnel = await self.open_for_route(
                 target, "direct", transport.remote_port, transport,
                 factor=factor, prompter=prompter, provision=False, **env_kwargs,
             )
+            if prompter is not None:
+                prompter.clear()
+            return tunnel
 
         last_error: Exception | None = None
         for route in target.transport.ssh_targets:
@@ -906,6 +909,8 @@ class TunnelManager:
                 )
                 log.info("target %s connected via route %s on 127.0.0.1:%d",
                          target.name, route, local_port)
+                if prompter is not None:
+                    prompter.clear()
                 return tunnel
             except TunnelError as exc:
                 last_error = exc
@@ -914,12 +919,15 @@ class TunnelManager:
                 if on_route is not None:
                     on_route(route, exc)
                 if prompter is not None and prompter.used:
+                    prompter.clear()
                     raise TunnelError(
                         f"2FA factor was already used on route {route!r}; "
                         f"refusing to replay it on another route. Supply a "
                         f"fresh factor with 'target-connect --2fa <new secret> "
                         f"{target.name}'."
                     ) from exc
+        if prompter is not None:
+            prompter.clear()
         raise TunnelError(
             f"no working route for target {target.name!r}: {last_error}"
         )

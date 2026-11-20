@@ -216,6 +216,15 @@ class FactorPrompter:
     def exhausted(self) -> bool:
         return self._uses >= FACTOR_MAX_USES
 
+    def clear(self) -> None:
+        """Drop the secret when the connect request is over.
+
+        A key-only route can succeed without ever calling the prompter.  Clear
+        it before returning the tunnel so the connection client cannot hold a
+        usable factor for a later authentication request.
+        """
+        self._secret = None
+
     async def __call__(self, prompt: str, echo: bool) -> str | None:
         self._uses += 1
         if self._uses > FACTOR_MAX_USES or self._secret is None:
