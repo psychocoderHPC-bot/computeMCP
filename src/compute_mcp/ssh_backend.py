@@ -428,21 +428,40 @@ class SSHBackend:
                 and not existing[0].is_closed()
             ):
                 return existing[0]
+
             # No cached connection, it is dead, or it was dialed to a different
-            # (stale) endpoint: drop the stale entry and dial the current one.
-            if existing is not None:
-                conn, stale_key = existing
-                if not conn.is_closed():
-                    log.info(
-                        "target %s: dropping container connection to stale "
-                        "endpoint %s; redialing %s",
-                        target.name, stale_key, key,
-                    )
-                self._connections.pop(target.name, None)
-                self._release_sftp_state(conn)
-                await self.close_connection(conn)
-            conn = await self._dial(target, host, port, prompter)
+            # (stale) endpoint.  Keep the old cached connection in place until
+            # the replacement is established: a failed redial must not destroy
+            # a still-usable connection and turn an exec into a 502.
+            old = existing
+            if old is not None and not old[0].is_closed():
+                log.info(
+                    "target %s: redialing container connection from %s to %s; "
+                    "keeping the old connection until the new one is established",
+                    target.name,
+                    old[1],
+                    key,
+                )
+            try:
+                conn = await self._dial(target, host, port, prompter)
+            except Exception:
+                if old is not None:
+                    if not old[0].is_closed():
+                        log.warning(
+                            "target %s: container redial to %s failed; keeping "
+                            "the existing connection to %s",
+                            target.name,
+                            key,
+                            old[1],
+                        )
+                    else:
+                        self._connections.pop(target.name, None)
+                        self._release_sftp_state(old[0])
+                raise
             self._connections[target.name] = (conn, key)
+            if old is not None and old[0] is not conn:
+                self._release_sftp_state(old[0])
+                await self.close_connection(old[0])
             return conn
 
     async def open_connection(
@@ -503,8 +522,8 @@ class SSHBackend:
             # negotiation if set.
             known_hosts = _empty_known_hosts
             log.warning(
-                "target %r has host_key_check='off': accepting any host key "
-                "(not recommended for shared hosts)",
+                "container for target %r has host_key_check='off': accepting "
+                "any host key (not recommended for shared hosts)",
                 target.name,
             )
         else:

@@ -485,6 +485,30 @@ async def test_connection_cache_invalidated_on_endpoint_change(monkeypatch):
     assert len(dialed) == 4
 
 
+async def test_connection_redial_failure_keeps_cached_connection(monkeypatch):
+    """A failed redial must not drop a still-open cached container connection."""
+    from compute_mcp.ssh_backend import SSHBackend
+
+    target = _tunnel_target_for_cache(endpoint=("127.0.0.1", 2222))
+    old = _FakeSessionConn()
+    old_key = SSHBackend._endpoint_key("127.0.0.1", 2222)
+
+    async def fail_dial(self, tgt, host, port, prompter=None, passphrase=None, username=None):
+        raise RuntimeError("dial failed")
+
+    monkeypatch.setattr(SSHBackend, "_dial", fail_dial)
+    backend = SSHBackend()
+    backend._connections[target.name] = (old, old_key)
+
+    with pytest.raises(RuntimeError, match="dial failed"):
+        await backend.connection(target, "127.0.0.1", 3001)
+
+    cached = backend._connections[target.name]
+    assert cached[0] is old
+    assert cached[1] == old_key
+    assert old.is_closed() is False
+
+
 async def test_disconnect_drops_endpoint_keyed_cache(monkeypatch):
     """Even when the endpoint did not change, an explicit `disconnect` from the
     gateway's refresh path must empty the cache so the redial happens."""
