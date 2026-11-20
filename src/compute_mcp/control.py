@@ -37,6 +37,7 @@ from .config import (
     default_config_path,
     load_config,
 )
+from .factor import FactorPromptError, prompt_factor
 
 log = logging.getLogger("compute_mcp.control")
 
@@ -203,9 +204,13 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = sub.add_parser(name, help=help_)
         p.add_argument("target")
-        p.add_argument("--2fa", dest="factor", metavar="SECRET",
-                       help="second factor (password/OTP) for interactive_auth "
-                       "targets")
+        p.add_argument(
+            "--2fa",
+            dest="use_2fa",
+            action="store_true",
+            help="prompt on the terminal for the per-request second factor "
+            "(input is hidden)",
+        )
         p.add_argument(
             "--set", dest="overrides", action="append", default=None,
             metavar="KEY=VALUE",
@@ -280,6 +285,15 @@ async def _run(args: argparse.Namespace) -> int:
     default_timeout = (
         args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
     )
+    try:
+        factor = (
+            prompt_factor()
+            if getattr(args, "use_2fa", False)
+            and not getattr(args, "dry_run", False)
+            else None
+        )
+    except FactorPromptError as exc:
+        raise SystemExit(str(exc)) from None
     async with Control(base, token, default_timeout) as control:
         cmd = args.command
         if cmd == "targets":
@@ -320,7 +334,7 @@ async def _run(args: argparse.Namespace) -> int:
         elif cmd == "target-connect":
             overrides = _parse_overrides(args.overrides)
             if args.dry_run:
-                payload = _target_body(args.factor, overrides)
+                payload = _target_body(factor, overrides)
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/preview",
                     json_body=payload,
@@ -330,14 +344,14 @@ async def _run(args: argparse.Namespace) -> int:
             else:
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/connect",
-                    json_body=_target_body(args.factor, overrides),
+                    json_body=_target_body(factor, overrides),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_target(args, body)
         elif cmd == "target-refresh":
             overrides = _parse_overrides(args.overrides)
             if getattr(args, "dry_run", False):
-                payload = _target_body(args.factor, overrides)
+                payload = _target_body(factor, overrides)
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/preview",
                     json_body=payload,
@@ -347,7 +361,7 @@ async def _run(args: argparse.Namespace) -> int:
             else:
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/refresh",
-                    json_body=_target_body(args.factor, overrides),
+                    json_body=_target_body(factor, overrides),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_target(args, body)

@@ -7,7 +7,7 @@ import socket
 import pytest
 
 from compute_mcp.config import SSHConfig, TargetConfig, TransportConfig
-from compute_mcp.ssh_backend import SSHError
+from compute_mcp.ssh_backend import SSHError, make_factor_prompter
 from compute_mcp.tunnel import (
     TunnelError,
     TunnelManager,
@@ -128,6 +128,100 @@ async def test_all_routes_fail(monkeypatch):
 
     with pytest.raises(TunnelError):
         await mgr.connect(target)
+
+
+async def test_connect_stops_failover_after_factor_used(monkeypatch):
+    """A consumed factor must not be replayed on the next DNS name."""
+    mgr = TunnelManager(SSHConfig(internal_port_min=31350, internal_port_max=31360))
+    target = make_target("hal", ["broken-route", "good-route"])
+    seen = []
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        if kwargs["name"] == "broken-route":
+            assert kwargs["prompter"] is not None
+            assert await kwargs["prompter"]("Password:", False) == "SECRET"
+            raise SSHError("route auth rejected")
+        raise AssertionError("factor replay: the second route must not be dialed")
+
+    async def fake_probe(host, port, timeout=8.0):
+        return True
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    with pytest.raises(TunnelError, match="already used|refusing to replay"):
+        await mgr.connect(
+            target, factor="SECRET", on_route=lambda route, exc: seen.append(route)
+        )
+
+    assert seen == ["broken-route"]
+
+
+async def test_connect_failover_before_factor_used_is_allowed(monkeypatch):
+    """A route failure before the prompt can still fail over.
+
+    The same prompter is shared, so the successful route can submit the secret
+    once and a second prompt is refused.
+    """
+    mgr = TunnelManager(SSHConfig(internal_port_min=31370, internal_port_max=31380))
+    target = make_target("hal", ["broken-route", "good-route"])
+
+    async def fake_resolve(alias, ssh, _seen=None):
+        return {
+            "alias": alias,
+            "hostname": "127.0.0.1",
+            "user": "agent",
+            "port": 22,
+            "identityfiles": (),
+            "jumps": (),
+        }
+
+    async def fake_dial_route(**kwargs):
+        if kwargs["name"] == "broken-route":
+            raise SSHError("route unreachable")
+        assert kwargs["prompter"] is not None
+        assert await kwargs["prompter"]("Password:", False) == "SECRET"
+        assert await kwargs["prompter"]("Password:", False) is None
+        return _FakeConn(("127.0.0.1", kwargs["port"]))
+
+    async def fake_probe(host, port, timeout=8.0):
+        return port == 22 or port in mgr.reserved
+
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fake_resolve)
+    monkeypatch.setattr("compute_mcp.tunnel.dial_route", fake_dial_route)
+    monkeypatch.setattr("compute_mcp.tunnel.probe", fake_probe)
+
+    tunnel = await mgr.connect(target, factor="SECRET")
+    try:
+        assert tunnel.route == "good-route"
+    finally:
+        await tunnel.stop()
+        mgr.release(tunnel)
+
+
+async def test_factor_prompter_is_single_use_and_clears_the_secret():
+    prompter = make_factor_prompter("SECRET")
+    assert prompter.used is False
+    assert await prompter("Password:", False) == "SECRET"
+    assert prompter.used is True
+    assert await prompter("Password:", False) is None
+
+    unused = make_factor_prompter("OTHER")
+    unused.clear()
+    assert unused.used is False
+    assert await unused("Password:", False) is None
+    assert unused.used is True
 
 
 async def test_stop_releases_port(monkeypatch):

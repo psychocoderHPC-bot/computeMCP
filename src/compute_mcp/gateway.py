@@ -51,6 +51,7 @@ from .enrollment import (
     EnrollmentQueueFull,
     PendingEnrollment,
 )
+from .factor import FactorPromptError, prompt_factor
 from .files import chmod as files_chmod
 from .files import list_dir as files_list
 from .files import mkdir as files_mkdir
@@ -205,7 +206,7 @@ class InteractiveAuthRequired(RuntimeError):
     def __init__(self, target: str, detail: str | None = None) -> None:
         message = (
             f"target {target!r} requires interactive authentication (second "
-            f"factor); run target-connect --2fa <secret> {target}"
+            f"factor); run target-connect --2fa {target}"
         )
         # The actionable sentence stays the prefix so existing substring
         # assertions keep matching; the dial detail follows when known so the
@@ -472,7 +473,7 @@ class Gateway:
             runtime.awaiting_factor = True
             runtime.last_error = (
                 "interactive authentication required; run "
-                f"'target-connect --2fa <secret> {target.name}'"
+                f"'target-connect --2fa {target.name}'"
             )
             raise InteractiveAuthRequired(target.name)
         runtime.state = "connecting"
@@ -699,7 +700,7 @@ class Gateway:
         """Refuse a connect/refresh needing a factor without tearing anything down."""
         message = (
             "target requires interactive authentication; run "
-            f"target-connect --2fa <secret> {runtime.name}"
+            f"target-connect --2fa {runtime.name}"
         )
         log.warning("target %s: %s", runtime.name, message)
         runtime.awaiting_factor = True
@@ -1982,27 +1983,16 @@ class Gateway:
             self._interactive = False
 
     @staticmethod
-    def _parse_factor_args(args: list[str]) -> tuple[str | None, list[str]]:
-        """Split ``[--2fa SECRET]`` out of console args, preserving order.
-
-        Supports both ``connect --2fa SECRET <target>`` and
-        ``connect <target> --2fa SECRET``.  Raises :class:`ValueError` when
-        ``--2fa`` has no value.  The secret is returned, never logged.
-        """
-        factor: str | None = None
+    def _parse_2fa_flag(args: list[str]) -> tuple[bool, list[str]]:
+        """Split a value-less ``--2fa`` flag out of console args."""
+        use_2fa = False
         rest: list[str] = []
-        index = 0
-        while index < len(args):
-            token = args[index]
+        for token in args:
             if token == "--2fa":
-                if index + 1 >= len(args) or args[index + 1].startswith("--"):
-                    raise ValueError("--2fa requires a value")
-                factor = args[index + 1]
-                index += 2
-                continue
-            rest.append(token)
-            index += 1
-        return factor, rest
+                use_2fa = True
+            else:
+                rest.append(token)
+        return use_2fa, rest
 
     async def _console_command(self, line: str) -> bool:
         parts = line.split()
@@ -2011,8 +2001,8 @@ class Gateway:
             return False
         if cmd == "help":
             print(
-                "targets | status [target] | connect [--2fa SECRET] <t> | "
-                "refresh [--2fa SECRET] <t> | reconnect <t> | stop <t> | "
+                "targets | status [target] | connect [--2fa] <t> | "
+                "refresh [--2fa] <t> | reconnect <t> | stop <t> | "
                 "connect-all | stop-all | reload |\n"
                 "clients | client <name> | client-refresh <name> | "
                 "client-connect <name> | client-stop <name> | client-kill <name> |\n"
@@ -2028,14 +2018,17 @@ class Gateway:
             else:
                 self._print_status_table()
         elif cmd in ("connect", "refresh"):
-            try:
-                factor, rest = self._parse_factor_args(list(args))
-            except ValueError:
-                print(f"usage: {cmd} <target> [--2fa SECRET]")
-                return True
+            use_2fa, rest = self._parse_2fa_flag(list(args))
             if len(rest) != 1:
-                print(f"usage: {cmd} <target> [--2fa SECRET]")
+                print(f"usage: {cmd} <target> [--2fa]")
                 return True
+            factor = None
+            if use_2fa:
+                try:
+                    factor = prompt_factor()
+                except FactorPromptError as exc:
+                    print(f"error: {exc}")
+                    return True
             if cmd == "connect":
                 print(await self.connect_target(rest[0], factor=factor))
             else:

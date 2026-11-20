@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "computeMCP-gateway"
-version = "0.1.0"
+version = "0.1.1"
 description = "Secure gateway and MCP bridge giving Terok agents access to remote compute containers"
 requires-python = ">=3.11"
 dependencies = [
