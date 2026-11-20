@@ -476,6 +476,11 @@ def _forwarded_tcp_channels(connection) -> list:
     try:
         live = list(channels.values())
     except Exception:  # noqa: BLE001 - private structure changed concurrently
+        log.warning(
+            "asyncssh channel table could not be iterated; cannot discover "
+            "forwarded channels for draining",
+            exc_info=True,
+        )
         return []
     return [channel for channel in live if isinstance(channel, tcp_cls)]
 

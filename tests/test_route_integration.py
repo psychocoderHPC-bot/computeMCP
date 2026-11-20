@@ -312,6 +312,11 @@ class _ContainerServer(asyncssh.SSHServer):
     def __init__(self, state: dict) -> None:
         self.state = state
 
+    def auth_completed(self) -> None:
+        # Count authenticated container SSH connections, not readiness probes
+        # (which open a raw TCP socket and never complete SSH auth).
+        self.state["connections"] = self.state.get("connections", 0) + 1
+
     def begin_auth(self, username: str) -> bool:
         return True
 
@@ -966,6 +971,7 @@ async def test_live_refresh_reuses_login_connection_and_one_channel(
         assert login.state["close_count"] == 1
         assert login.state["provision_count"] == 2
         assert login.state["max_channels"] == 1
+        assert login.state["commands"] == ["provision", "close", "provision"]
         assert runtime.provisioned_endpoint == f"127.0.0.1:{ports[1]}"
         # The same outer login connection is retained, not a new login.
         assert runtime.tunnel.connection is old_conn
@@ -1034,6 +1040,7 @@ async def test_container_dial_racing_refresh_uses_the_new_forward(
         assert result.stdout == b"container:race\n"
         assert states[1]["commands"] == ["race"]
         assert states[0]["commands"] == []
+        assert states[0].get("connections", 0) == 1
         assert login.state["auths"] == 1
         assert login.state["max_channels"] == 1
 
@@ -1065,6 +1072,10 @@ async def test_refresh_route_loss_mid_refresh_reports_stage_without_retry(
         assert login.state["auths"] == 1
         assert login.state["connections"] == 1
         assert login.state["provision_count"] == 1
+        # A second provision exec attempt on the retained (now dead)
+        # connection would be visible here even if it never reached
+        # session_started.
+        assert login.state["provision_requests"] == 1
 
 
 async def test_refresh_drains_a_raw_forward_channel(
@@ -1184,5 +1195,6 @@ async def test_dial_started_during_refresh_teardown_does_not_use_old_forward(
             assert result.stdout == b"container:race-during-teardown\n"
             assert states[1]["commands"] == ["race-during-teardown"]
         assert states[0]["commands"] == []
+        assert states[0].get("connections", 0) == 0
         assert login.state["auths"] == 1
         assert login.state["max_channels"] == 1
