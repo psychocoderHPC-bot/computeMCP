@@ -288,6 +288,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="allocation override (repeatable), e.g. --set gpus-per-node=2",
     )
     p.add_argument(
+        "--root-mode", choices=("fakeroot", "clean"), default=None,
+        help="root filesystem mode for the shared job",
+    )
+    p.add_argument(
+        "--clean-home", default=None, metavar="PATH",
+        help="home subdirectory used as HOME (relative to the client home)",
+    )
+    p.add_argument(
         "--dry-run", action="store_true",
         help="preview the allocation without starting or reusing the shared job",
     )
@@ -536,14 +544,20 @@ async def _run(args: argparse.Namespace) -> int:
                 # shared-job start or reuse happens on a dry-run.
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/preview",
-                    json_body=_target_body(None, overrides),
+                    json_body=_preview_body(
+                        overrides, args.root_mode, args.clean_home
+                    ),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_preview(args, body)
             else:
+                # The shared endpoint accepts the same allocation fields as
+                # target-sbatch; only the submit idempotency id stays private.
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/shared",
-                    json_body=_target_body(factor, overrides),
+                    json_body=_submit_body(
+                        factor, overrides, args.root_mode, args.clean_home, None
+                    ),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_route_job(args, body)
@@ -552,14 +566,16 @@ async def _run(args: argparse.Namespace) -> int:
             if args.dry_run:
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/preview",
-                    json_body=_target_body(None, overrides),
+                    json_body=_preview_body(
+                        overrides, args.root_mode, args.clean_home
+                    ),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_preview(args, body)
             else:
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/sbatch",
-                    json_body=_sbatch_body(
+                    json_body=_submit_body(
                         factor, overrides, args.root_mode, args.clean_home,
                         args.request_id,
                     ),
@@ -652,14 +668,18 @@ def _target_body(factor: str | None, overrides: dict | None) -> dict | None:
     return body or None
 
 
-def _sbatch_body(
+def _submit_body(
     factor: str | None,
     overrides: dict | None,
     root_mode: str | None,
     clean_home: str | None,
     request_id: str | None,
 ) -> dict | None:
-    """Build the private-submit request body, omitting every unset field."""
+    """Build the job-submit request body, omitting every unset field.
+
+    Shared and private submits carry the same allocation-selecting fields; only
+    the private sbatch passes a submit idempotency ``request_id``.
+    """
     body: dict = {}
     if factor is not None:
         body["factor"] = factor
@@ -671,6 +691,25 @@ def _sbatch_body(
         body["clean_home"] = clean_home
     if request_id is not None:
         body["request_id"] = request_id
+    return body or None
+
+
+def _preview_body(
+    overrides: dict | None,
+    root_mode: str | None,
+    clean_home: str | None,
+) -> dict | None:
+    """Build a dry-run preview body without submit-only authentication data.
+
+    The preview mirrors the allocation-selecting submit fields: repeatable
+    overrides plus the requested private root mode and clean home.  A 2FA
+    factor and a submit idempotency id are never part of a preview.
+    """
+    body = _target_body(None, overrides) or {}
+    if root_mode is not None:
+        body["root_mode"] = root_mode
+    if clean_home is not None:
+        body["clean_home"] = clean_home
     return body or None
 
 
