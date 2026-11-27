@@ -10,19 +10,25 @@ import asyncio
 import contextlib
 import dataclasses
 import getpass
+import inspect
+import json
 import logging
+import os
 import posixpath
 import signal
 import sys
+import tempfile
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 import asyncssh
 from aiohttp import web
 
 from . import __version__
+from . import jobs as jobcore
 from .auth import AuthError, Authenticator, Client, ForbiddenTarget
 from .allocation import (
     compute_plan,
@@ -277,6 +283,318 @@ class TargetRuntime:
         }
 
 
+# ---------------------------------------------------------------------------
+# Job provisioning boundary (route state stays in TargetRuntime)
+# ---------------------------------------------------------------------------
+#
+# One public error for "unknown job" and "someone else's job": a caller must
+# not be able to probe another client's job ids.
+JOB_NOT_FOUND_TEXT = "job not found"
+
+#: Owner stored on a shared job record.  Shared jobs belong to the target, not
+#: to the client that happened to start it, so visibility never depends on the
+#: creator.
+SHARED_OWNER = "@shared"
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await ``value`` when it is awaitable, otherwise return it unchanged."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+@runtime_checkable
+class JobProvisioner(Protocol):
+    """Boundary between the gateway scheduler code and the bundle stages.
+
+    T8 supplies the concrete implementation: ``submit`` renders and runs the
+    batch stage, ``observe`` maps a native scheduler id to a Slurm state,
+    ``attach`` publishes the compute-node/relay endpoint once the container is
+    reachable, ``cancel`` is the *only* path that scancels, and ``detach``
+    closes local resources without signalling the scheduler.
+    """
+
+    async def submit(self, record: "jobcore.JobRecord") -> Any: ...
+
+    async def observe(self, job: "jobcore.JobRecord | str") -> str | None: ...
+
+    async def attach(
+        self, record: "jobcore.JobRecord"
+    ) -> Mapping[str, Any] | None: ...
+
+    async def cancel(self, job: "jobcore.JobRecord | str") -> None: ...
+
+    async def detach(self, record: "jobcore.JobRecord") -> None: ...
+
+
+def _slurm_id_of(job: "jobcore.JobRecord | str") -> str | None:
+    if isinstance(job, jobcore.JobRecord):
+        return job.slurm_job_id
+    value = str(job).strip()
+    return value or None
+
+
+class SlurmProvisioner:
+    """Thin :class:`JobProvisioner` adapter over the T8 bundle stages.
+
+    ``stages`` is the T8 injection point: an object exposing
+    ``submit``/``observe``/``attach``/``cancel``/``detach``.  Until those are
+    wired, the same adapter renders the exact scheduler argv and executes it
+    through ``run`` (an async command runner on the route; tests pass a
+    subprocess runner).  This keeps the scheduler calls in one place:
+    ``sbatch --parsable --comment=<token>``, a bounded ``squeue`` query, and
+    ``scancel`` only for an explicit cancel.
+    """
+
+    def __init__(
+        self,
+        *,
+        stages: Any = None,
+        run: Callable[[Sequence[str]], Any] | None = None,
+        sbatch_args: Sequence[str] = (),
+        script: str | None = None,
+    ) -> None:
+        self._stages = stages
+        self._run = run
+        self._sbatch_args = tuple(str(arg) for arg in sbatch_args)
+        self._script = script
+
+    async def _execute(self, argv: Sequence[str]) -> tuple[int, str, str]:
+        if self._run is None:
+            raise jobcore.JobError(
+                "no scheduler command runner or bundle stages are configured"
+            )
+        result = await _maybe_await(self._run(list(argv)))
+        if hasattr(result, "returncode"):
+            return (
+                int(result.returncode),
+                result.stdout or "",
+                result.stderr or "",
+            )
+        if isinstance(result, tuple) and len(result) >= 3:
+            return int(result[0]), str(result[1] or ""), str(result[2] or "")
+        return 0, str(result or ""), ""
+
+    async def _delegate(self, name: str, *args: Any) -> Any:
+        if self._stages is not None:
+            return await _maybe_await(getattr(self._stages, name)(*args))
+        return await getattr(self, f"_default_{name}")(*args)
+
+    async def _default_submit(self, record: "jobcore.JobRecord") -> str:
+        argv = [
+            "sbatch",
+            "--parsable",
+            f"--comment={record.correlation_token}",
+        ]
+        argv.extend(self._sbatch_args)
+        script = record.parameters.get("sbatch_script") or self._script
+        if script:
+            argv.append(str(script))
+        else:
+            argv.extend(["--wrap", str(record.parameters.get("wrap", "true"))])
+        code, out, err = await self._execute(argv)
+        if code != 0:
+            raise jobcore.SchedulerRejected(err.strip() or f"sbatch exited {code}")
+        line = out.strip().splitlines()[-1] if out.strip() else ""
+        if not line:
+            raise RuntimeError("sbatch produced no job id")
+        return line
+
+    async def _default_observe(
+        self, job: "jobcore.JobRecord | str"
+    ) -> str | None:
+        sid = _slurm_id_of(job)
+        if not sid:
+            return None
+        code, out, err = await self._execute(
+            ["squeue", "--noheader", "--format=%T", "--jobs", sid]
+        )
+        if code != 0:
+            raise RuntimeError(err.strip() or f"squeue exited {code}")
+        text = out.strip()
+        return text.splitlines()[0].strip() if text else None
+
+    async def _default_attach(
+        self, record: "jobcore.JobRecord"
+    ) -> Mapping[str, Any] | None:
+        # The T8 bundle stage publishes the ready endpoint; the default adapter
+        # has nothing to attach until it is wired.
+        return None
+
+    async def _default_cancel(self, job: "jobcore.JobRecord | str") -> None:
+        sid = _slurm_id_of(job)
+        if not sid:
+            return
+        code, _out, err = await self._execute(["scancel", sid])
+        if code != 0:
+            raise RuntimeError(err.strip() or f"scancel exited {code}")
+
+    async def _default_detach(self, record: "jobcore.JobRecord") -> None:
+        # Detach never signals the scheduler; nothing to do for the adapter.
+        return None
+
+    async def find_by_token(self, token: str) -> str | None:
+        """Reconcile an accepted-but-unrecorded submission by job comment."""
+        code, out, _err = await self._execute(
+            ["squeue", "--noheader", "--format=%i %k"]
+        )
+        if code != 0:
+            return None
+        for line in out.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and parts[1].strip() == token:
+                return parts[0].strip()
+        return None
+
+    async def submit(self, record: "jobcore.JobRecord") -> Any:
+        return await self._delegate("submit", record)
+
+    async def observe(self, job: "jobcore.JobRecord | str") -> str | None:
+        return await self._delegate("observe", job)
+
+    async def attach(
+        self, record: "jobcore.JobRecord"
+    ) -> Mapping[str, Any] | None:
+        return await self._delegate("attach", record)
+
+    async def cancel(self, job: "jobcore.JobRecord | str") -> None:
+        await self._delegate("cancel", job)
+
+    async def detach(self, record: "jobcore.JobRecord") -> None:
+        await self._delegate("detach", record)
+
+
+class _RouteOnlyTunnel:
+    """A dialed login route with no provisioning and no local forwarding.
+
+    The durable multi-job path opens the route (and, once T8 lands, the mux
+    helper) separately from any job.  This wrapper gives the runtime the small
+    surface it needs (``is_alive``/``stop``/``connection``) without starting a
+    container.
+    """
+
+    def __init__(self, target: TargetConfig, route: str | None, connection: Any):
+        self.target = target
+        self.route = route
+        self.connection = connection
+        self.local_port: int | None = None
+        self.provisioned_endpoint: tuple[str, int] | None = None
+
+    def is_alive(self) -> bool:
+        conn = self.connection
+        if conn is None:
+            return False
+        checker = getattr(conn, "is_closed", None)
+        return not (callable(checker) and checker())
+
+    async def stop(self, *, close_connection: bool = True) -> None:
+        conn = self.connection
+        self.connection = None
+        if conn is not None and close_connection:
+            with contextlib.suppress(Exception):
+                conn.close()
+            with contextlib.suppress(Exception):
+                await conn.wait_closed()
+
+
+class _GatewayScheduler:
+    """Adapt the dynamic :class:`JobProvisioner` to ``jobs.Scheduler``.
+
+    ``jobs.JobManager`` takes one scheduler object; the gateway may resolve a
+    different provisioner per target (or have one injected after construction
+    by a test).  This binding looks the provisioner up lazily, so injection
+    order never matters.
+    """
+
+    def __init__(self, gateway: "Gateway") -> None:
+        self._gateway = gateway
+
+    async def submit(self, record: "jobcore.JobRecord") -> Any:
+        provisioner = self._gateway._provisioner_for_target(record.target)
+        return await _maybe_await(provisioner.submit(record))
+
+    async def query(self, slurm_job_id: str) -> str | None:
+        record = self._gateway._find_record_by_slurm_id(slurm_job_id)
+        if record is None:
+            return None
+        provisioner = self._gateway._provisioner_for_target(record.target)
+        return await _maybe_await(provisioner.observe(slurm_job_id))
+
+    async def cancel(self, slurm_job_id: str) -> None:
+        record = self._gateway._find_record_by_slurm_id(slurm_job_id)
+        if record is None:
+            return
+        provisioner = self._gateway._provisioner_for_target(record.target)
+        await _maybe_await(provisioner.cancel(slurm_job_id))
+
+    async def find_by_token(self, token: str) -> str | None:
+        for name, target in self._gateway.config.targets.items():
+            if not self._gateway._is_multijob(target):
+                continue
+            try:
+                provisioner = self._gateway._provisioner_for_target(name)
+            except jobcore.JobError:
+                continue
+            finder = getattr(provisioner, "find_by_token", None)
+            if finder is None:
+                continue
+            try:
+                found = await _maybe_await(finder(token))
+            except Exception:  # noqa: BLE001 - recovery must continue
+                continue
+            if found:
+                return str(found)
+        return None
+
+
+def _settings_signature(
+    parameters: Mapping[str, Any] | None,
+    root_mode: str | None,
+    home: str | None,
+) -> str:
+    return json.dumps(
+        {
+            "parameters": dict(parameters or {}),
+            "root_mode": root_mode,
+            "home": home,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _public_job(
+    record: "jobcore.JobRecord", *, include_owner: bool = False
+) -> dict[str, Any]:
+    """The caller-facing view of a job; relay ports stay gateway-internal."""
+    data = {
+        "job_id": record.job_id,
+        "target": record.target,
+        "kind": "shared" if record.kind == "shared" else "own",
+        "state": record.state,
+        "slurm_job_id": record.slurm_job_id,
+        "cluster": record.cluster,
+        "scheduler_state": record.scheduler_state,
+        "root_mode": record.root_mode,
+        "base_digest": record.base_digest,
+        "home": record.home,
+        "node": record.node,
+        "container_endpoint": record.container_endpoint,
+        "generation": record.generation,
+        "terminal_reason": record.terminal_reason,
+        "parameters": dict(record.parameters),
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "ready_at": record.ready_at,
+        "terminal_at": record.terminal_at,
+    }
+    if include_owner:
+        data["owner"] = record.owner_client_id
+    return data
+
+
 def validate_config_allocations(config: GatewayConfig) -> None:
     """Cross-check every target's enabled mappings against its manual options.
 
@@ -291,7 +609,16 @@ def validate_config_allocations(config: GatewayConfig) -> None:
 
 
 class Gateway:
-    def __init__(self, config: GatewayConfig, transport_override: str | None = None):
+    def __init__(
+        self,
+        config: GatewayConfig,
+        transport_override: str | None = None,
+        *,
+        state_root: str | os.PathLike[str] | None = None,
+        provisioner: Any = None,
+        provisioner_factory: Callable[[TargetConfig], Any] | None = None,
+        job_poll_interval: float = 2.0,
+    ):
         validate_config_allocations(config)
         self.config = config
         self.transport_override = transport_override
@@ -319,6 +646,21 @@ class Gateway:
             ttl=config.server.enroll_ttl,
             max_pending=config.server.enroll_max_pending,
         )
+        # Per-job state lives outside TargetRuntime (which stays route state).
+        # The store/quota/manager are created lazily so a deployment that never
+        # uses jobs, and the existing single-container tests, touch no disk.
+        self.state_root = Path(state_root) if state_root is not None else None
+        self.job_store: jobcore.JobStore | None = None
+        self.quota: jobcore.QuotaManager | None = None
+        self.jobs: jobcore.JobManager | None = None
+        # Provisioner injection: tests set ``gw.provisioner``; T8 supplies a
+        # factory that builds the per-target bundle-stage adapter.
+        self.provisioner = provisioner
+        self.provisioner_factory = provisioner_factory
+        self.route_opener: Callable[..., Any] | None = None
+        self.job_poll_interval = float(job_poll_interval)
+        self._job_monitor_task: asyncio.Task | None = None
+        self._shared_locks: dict[str, asyncio.Lock] = {}
 
     # -- helpers -----------------------------------------------------------
     def _apply_transport_override(self) -> None:
@@ -342,6 +684,137 @@ class Gateway:
     def _lock(self, name: str) -> asyncio.Lock:
         return self._locks.setdefault(name, asyncio.Lock())
 
+    def _shared_lock(self, name: str) -> asyncio.Lock:
+        return self._shared_locks.setdefault(name, asyncio.Lock())
+
+    # -- job state helpers -------------------------------------------------
+    @staticmethod
+    def _is_multijob(target: TargetConfig) -> bool:
+        """Whether the durable multi-job Slurm path owns this target.
+
+        The split route/job path needs the deployable bundle that carries the
+        T8 stage functions; a target with only a bare ``slurm`` block keeps the
+        legacy single-allocation connect path (and its tests).
+        """
+        return target.slurm is not None and target.bundle is not None
+
+    def _default_state_root(self) -> Path:
+        env = os.environ.get("COMPUTEMCP_STATE_DIR")
+        if env:
+            return Path(env)
+        if self.config.config_path:
+            return Path(self.config.config_path).resolve().parent / "state"
+        return Path(tempfile.mkdtemp(prefix="computemcp-gateway-jobs-"))
+
+    def _ensure_jobs(self) -> jobcore.JobManager:
+        """Create the durable job registry on first use (idempotent)."""
+        if self.jobs is not None:
+            return self.jobs
+        root = self.state_root or self._default_state_root()
+        self.state_root = Path(root)
+        store = jobcore.JobStore(self.state_root)
+        quota = jobcore.QuotaManager(
+            {
+                client_id: dict(cfg.job_limits)
+                for client_id, cfg in self.config.clients.items()
+            },
+            default_limit=jobcore.DEFAULT_JOB_LIMIT,
+            snapshot=store.scan,
+            guard=store.quota_lock,
+        )
+        self.job_store = store
+        self.quota = quota
+        self.jobs = jobcore.JobManager(store, _GatewayScheduler(self), quota)
+        return self.jobs
+
+    def _provisioner_for_target(self, target: str) -> Any:
+        if self.provisioner_factory is not None:
+            return self.provisioner_factory(self._target(target))
+        if self.provisioner is not None:
+            return self.provisioner
+        raise jobcore.JobError("no job provisioner is configured for this gateway")
+
+    def _provisioner_available(self) -> bool:
+        return self.provisioner is not None or self.provisioner_factory is not None
+
+    def _find_record_by_slurm_id(
+        self, slurm_job_id: str
+    ) -> "jobcore.JobRecord | None":
+        if self.job_store is None:
+            return None
+        wanted = str(slurm_job_id)
+        for record in self.job_store.scan():
+            if record.slurm_job_id == wanted:
+                return record
+        return None
+
+    def _active_shared_record(self, name: str) -> "jobcore.JobRecord | None":
+        if self.job_store is None:
+            return None
+        active = [
+            record
+            for record in self.job_store.scan()
+            if record.target == name
+            and record.kind == "shared"
+            and record.state != jobcore.TERMINAL
+        ]
+        if not active:
+            return None
+        return max(active, key=lambda record: record.created_at)
+
+    def _operator_client(self) -> Client:
+        return Client(
+            client_id=SHARED_OWNER,
+            allow_all=True,
+            targets=frozenset(self.config.targets),
+        )
+
+    def _authorized_job(
+        self, client: Client, job_id: str
+    ) -> "jobcore.JobRecord":
+        """Resolve a job for ``client``; foreign and unknown ids look identical."""
+        self._ensure_jobs()
+        record = self.job_store.try_load_record(str(job_id))  # type: ignore[union-attr]
+        if record is None or not client.may_access(record.target):
+            raise web.HTTPNotFound(text=JOB_NOT_FOUND_TEXT)
+        if record.kind == "shared":
+            return record
+        if not client.is_admin and record.owner_client_id != client.client_id:
+            raise web.HTTPNotFound(text=JOB_NOT_FOUND_TEXT)
+        return record
+
+    def resolve_job(
+        self, client: Client, target: str, job_id: str | None = None
+    ) -> "jobcore.JobRecord":
+        """Select the caller's job for a target.
+
+        An omitted ``job_id`` selects the target's shared job only; it never
+        falls back to a caller's private job.  An explicit stale shared id
+        resolves to that (terminal) record, never to its replacement.
+        """
+        client.require_target(target)
+        if job_id:
+            record = self._authorized_job(client, job_id)
+            if record.target != target:
+                raise web.HTTPNotFound(text=JOB_NOT_FOUND_TEXT)
+            return record
+        self._ensure_jobs()
+        shared = self._active_shared_record(target)
+        if shared is None:
+            raise web.HTTPNotFound(text=JOB_NOT_FOUND_TEXT)
+        return shared
+
+    def _resolve_clean_home(self, clean_home: str | None) -> str | None:
+        if clean_home is None:
+            return None
+        if not isinstance(clean_home, str) or not clean_home.strip():
+            raise ConfigError("clean_home must be a non-empty path")
+        relative = clean_home.strip().lstrip("/")
+        parts = Path(relative).parts
+        if not relative or relative in (".", "..") or ".." in parts:
+            raise ConfigError("clean_home must be a relative path inside the home")
+        return relative
+
     def _endpoint(self, runtime: TargetRuntime) -> tuple[str, int]:
         target = self.config.targets[runtime.name]
         if target.transport.kind == "direct":
@@ -362,6 +835,9 @@ class Gateway:
     async def start(self) -> None:
         self.sessions.start()
         self._watch_task = asyncio.create_task(self._watch_tunnels())
+        if any(self._is_multijob(target) for target in self.config.targets.values()):
+            self._ensure_jobs()
+            self._start_job_monitor()
         for name, target in self.config.targets.items():
             if target.auto_connect and not target.interactive_auth:
                 asyncio.create_task(self._safe_connect(name))
@@ -379,15 +855,94 @@ class Gateway:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._watch_task
             self._watch_task = None
+        if self._job_monitor_task is not None:
+            self._job_monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._job_monitor_task
+            self._job_monitor_task = None
         for name in list(self.runtimes):
+            target = self.config.targets.get(name)
+            if target is not None and self._is_multijob(target):
+                # Slurm teardown detaches: no close_command and no scancel.
+                with contextlib.suppress(Exception):
+                    await self._detach_slurm_target(name)
+            else:
+                with contextlib.suppress(Exception):
+                    await self.stop_target(name)
+        if self.jobs is not None:
             with contextlib.suppress(Exception):
-                await self.stop_target(name)
+                await self.jobs.detach_all()
         await self.sessions.stop()
         await self.backend.close_all()
 
     async def _safe_connect(self, name: str) -> None:
-        with contextlib.suppress(TunnelError, SSHError, HostKeyError):
-            await self.ensure_connected(name)
+        target = self.config.targets.get(name)
+        with contextlib.suppress(TunnelError, SSHError, HostKeyError, jobcore.JobError):
+            if target is not None and self._is_multijob(target):
+                # auto_connect opens the route only: no submission, no container.
+                await self.open_target(name)
+            else:
+                await self.ensure_connected(name)
+
+    async def _detach_slurm_target(self, name: str) -> None:
+        """Close the route for a Slurm target without signalling the scheduler."""
+        async with self._lock(name):
+            await self._stop_locked(name)
+        await self.backend.disconnect(name)
+        await self.sessions.close_for_target(name, reason="detached")
+
+    # -- background job monitor -------------------------------------------
+    def _start_job_monitor(self) -> None:
+        if self._job_monitor_task is not None and not self._job_monitor_task.done():
+            return
+        self._job_monitor_task = asyncio.create_task(self._job_monitor_loop())
+
+    async def _job_monitor_loop(self) -> None:
+        try:
+            while not self._stopping:
+                await asyncio.sleep(self.job_poll_interval)
+                with contextlib.suppress(Exception):
+                    await self.poll_jobs_once()
+        except asyncio.CancelledError:
+            raise
+
+    async def poll_jobs_once(self) -> None:
+        """One non-blocking scheduler pass over every non-terminal job.
+
+        There is no computeMCP queue deadline: a job may sit in ``pending`` as
+        long as Slurm keeps it.  A pending -> starting -> ready transition is
+        surfaced here, never by blocking a request.
+        """
+        manager = self._ensure_jobs()
+        for record in manager.store.scan():
+            if record.state == jobcore.TERMINAL or not record.slurm_job_id:
+                continue
+            await self._poll_one(record.job_id)
+
+    async def _poll_one(self, job_id: str) -> "jobcore.JobRecord":
+        manager = self._ensure_jobs()
+        updated = await manager.poll(job_id)
+        if updated.state == jobcore.STARTING and self._provisioner_available():
+            try:
+                payload = await _maybe_await(
+                    self._provisioner_for_target(updated.target).attach(updated)
+                )
+            except Exception as exc:  # noqa: BLE001 - keep polling others
+                log.debug("job %s: attach failed: %s", job_id, exc)
+                return updated
+            if payload:
+                try:
+                    updated = await manager.mark_ready(
+                        job_id,
+                        node=str(payload.get("node") or "unknown"),
+                        container_endpoint=payload.get("container_endpoint"),
+                        relay_endpoint=payload.get("relay_endpoint"),
+                        relay_pid=payload.get("relay_pid"),
+                        generation=payload.get("generation"),
+                    )
+                except jobcore.JobError as exc:
+                    log.debug("job %s: readiness was not applied: %s", job_id, exc)
+        return updated
 
     # -- allocation resolution --------------------------------------------
     @staticmethod
@@ -576,8 +1131,32 @@ class Gateway:
         factor: str | None = None,
         *,
         overrides: dict[str, Any] | None = None,
+        client: Client | None = None,
     ) -> dict:
+        """Connect a target, preserving the legacy non-Slurm behaviour.
+
+        Compatibility change for durable Slurm targets: ``target-connect`` now
+        means "open the route + get-or-create the shared job".  It can return
+        ``pending`` and makes no promise that container SSH is immediately
+        available.  Automatic route opening likewise no longer provisions a
+        shared container; that is what ``target-shared``/``target-connect`` do.
+        """
         target = self._target(name)
+        if self._is_multijob(target):
+            # Slurm: connect == open the route + get-or-create the shared job.
+            # The response may be ``pending``; it does not promise container SSH.
+            result = await self.open_target(name, factor=factor)
+            shared = await self.target_shared(
+                name,
+                client or self._operator_client(),
+                factor=factor,
+                overrides=overrides,
+            )
+            result.update(shared)
+            result["state"] = self.runtimes[name].state
+            result["route_state"] = result["state"]
+            result["job_state"] = result["job"]["state"]
+            return result
         async with self._lock(name):
             runtime = self.runtimes[name]
             if runtime.state == "connected":
@@ -622,6 +1201,23 @@ class Gateway:
         overrides: dict[str, Any] | None = None,
     ) -> dict:
         target = self._target(name)
+        if self._is_multijob(target):
+            # Route-only refresh: close the login transport and reopen it.  It
+            # never scancels, so private and shared jobs survive.  Replacing a
+            # shared job is a separate explicit operator action.
+            async with self._lock(name):
+                runtime = self.runtimes[name]
+                runtime.route_epoch += 1
+                if runtime.tunnel is not None:
+                    with contextlib.suppress(Exception):
+                        await runtime.tunnel.stop()
+                    runtime.tunnel = None
+                runtime.state = "disconnected"
+                await self._open_slurm_route_locked(target, runtime, factor)
+            result = self.public_status(name)
+            shared = self._active_shared_record(name)
+            result["shared_job_id"] = shared.job_id if shared else None
+            return result
         async with self._lock(name):
             runtime = self.runtimes[name]
             # Validate/resolve first.  A bad override must raise for a healthy
@@ -856,7 +1452,14 @@ class Gateway:
         return result
 
     async def stop_target(self, name: str) -> dict:
-        self._target(name)
+        target = self._target(name)
+        if self._is_multijob(target):
+            # Slurm teardown detaches the route; cancellation is a job operation.
+            async with self._lock(name):
+                await self._stop_locked(name)
+            await self.backend.disconnect(name)
+            await self.sessions.close_for_target(name, reason="target stopped")
+            return self.public_status(name)
         async with self._lock(name):
             # Explicit stop and gateway shutdown both go through here; release
             # the remote allocation while the route connection is still alive.
@@ -1364,6 +1967,10 @@ class Gateway:
             status["agent"] = [
                 {"agent": agent, "model": model} for agent, model in target.agent
             ]
+            if self._is_multijob(target):
+                status["job_transport"] = "mux"
+                shared = self._active_shared_record(name)
+                status["shared_job_id"] = shared.job_id if shared else None
         else:
             status["node_info"] = []
             status["agent"] = []
@@ -1407,6 +2014,20 @@ class Gateway:
         else:
             self.config = new_config
         self.auth = Authenticator(self.config.clients)
+        if self.quota is not None:
+            # Lowering a limit preserves existing jobs (the counts come from
+            # durable records) and blocks only new submissions above the limit.
+            self.quota.set_limits(
+                {
+                    client_id: dict(cfg.job_limits)
+                    for client_id, cfg in self.config.clients.items()
+                }
+            )
+        if any(
+            self._is_multijob(target) for target in self.config.targets.values()
+        ):
+            self._ensure_jobs()
+            self._start_job_monitor()
 
         report = {"added": [], "removed": [], "changed": [], "unchanged": []}
 
@@ -1461,6 +2082,227 @@ class Gateway:
             return
         with contextlib.suppress(TunnelError, SSHError, HostKeyError):
             await self.refresh_target(name)
+
+    # -- route/job service (shared by CLI, HTTP and MCP) -------------------
+    async def _open_route_transport(
+        self, target: TargetConfig, route: str, factor: str | None
+    ) -> Any:
+        if self.route_opener is not None:
+            return await _maybe_await(self.route_opener(target, route, factor))
+        connection = await self.tunnels.open_route_connection(
+            target, route, factor=factor
+        )
+        return _RouteOnlyTunnel(target, route, connection)
+
+    async def _open_slurm_route_locked(
+        self,
+        target: TargetConfig,
+        runtime: TargetRuntime,
+        factor: str | None,
+    ) -> None:
+        if runtime.state == "connected" and runtime.tunnel is not None:
+            if runtime.tunnel.is_alive():
+                return
+            self._mark_lost(runtime, "route connection closed")
+        if target.interactive_auth and factor is None:
+            # Fail closed before dialing: a factorless login is a guaranteed
+            # site-side authentication failure.
+            runtime.awaiting_factor = True
+            runtime.last_error = (
+                "interactive authentication required; run "
+                f"'target-connect --2fa {target.name}'"
+            )
+            raise InteractiveAuthRequired(target.name)
+        if target.transport.kind == "direct":
+            # A direct target has no separate login hop; the route is available
+            # before any container exists.
+            runtime.state = "connected"
+            runtime.last_error = None
+            runtime.awaiting_factor = False
+            runtime.connected_since = datetime.now(timezone.utc)
+            return
+        route = runtime.active_route or (
+            target.transport.ssh_targets[0]
+            if target.transport.ssh_targets
+            else target.name
+        )
+        runtime.state = "connecting"
+        runtime.last_error = None
+        try:
+            tunnel = await self._open_route_transport(target, route, factor)
+        except Exception as exc:
+            runtime.state = "failed"
+            runtime.last_error = str(exc)
+            raise
+        runtime.tunnel = tunnel
+        runtime.active_route = getattr(tunnel, "route", route)
+        runtime.local_port = getattr(tunnel, "local_port", None)
+        runtime.provisioned_endpoint = getattr(tunnel, "provisioned_endpoint", None)
+        runtime.connected_since = datetime.now(timezone.utc)
+        runtime.needs_refresh = False
+        runtime.backoff = 0.0
+        runtime.state = "connected"
+        runtime.last_error = None
+        runtime.awaiting_factor = False
+
+    async def open_target(
+        self,
+        name: str,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
+        """Open or reuse the login route and reconcile jobs; never submits.
+
+        For a durable multi-job Slurm target this dials the route only (no
+        ``sbatch``, no container start, no job record).  Re-running it is
+        idempotent and also refreshes the shared-job view from disk.
+        """
+        target = self._target(name)
+        if self._is_multijob(target):
+            async with self._lock(name):
+                await self._open_slurm_route_locked(
+                    target, self.runtimes[name], factor
+                )
+            self._ensure_jobs()
+            with contextlib.suppress(Exception):
+                await self.jobs.ensure_reconciled()  # type: ignore[union-attr]
+        return self.public_status(name)
+
+    async def target_shared(
+        self,
+        name: str,
+        client: Client,
+        factor: str | None = None,
+        *,
+        overrides: dict[str, Any] | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        root_mode: str | None = None,
+        clean_home: str | None = None,
+    ) -> dict:
+        """Get-or-create the target's single shared job (no quota cost)."""
+        target = self._target(name)
+        if not self._is_multijob(target):
+            raise web.HTTPBadRequest(text="target does not use Slurm jobs")
+        await self.open_target(name, factor=factor)
+        manager = self._ensure_jobs()
+        params = dict(parameters or {})
+        if overrides:
+            params["set"] = dict(overrides)
+        requested = _settings_signature(params, root_mode, None)
+
+        async with self._shared_lock(name):
+            existing = self._active_shared_record(name)
+            if existing is not None:
+                result = self.public_status(name)
+                result["job"] = _public_job(existing)
+                result["job_id"] = existing.job_id
+                if _settings_signature(
+                    existing.parameters, existing.root_mode, existing.home
+                ) != requested:
+                    result["settings_conflict"] = True
+                    result["error"] = (
+                        "shared job settings differ from the active shared job; "
+                        "it is not replaced automatically"
+                    )
+                return result
+            request = jobcore.JobRequest(
+                client_id=client.client_id,
+                target=name,
+                request_id=f"shared:{name}:{uuid.uuid4().hex}",
+                kind="shared",
+                parameters=params,
+                root_mode=root_mode,
+                home=None,
+            )
+            record = await manager.submit(request)
+            result = self.public_status(name)
+            result["job"] = _public_job(record)
+            result["job_id"] = record.job_id
+            return result
+
+    async def target_sbatch(
+        self,
+        name: str,
+        client: Client,
+        *,
+        request_id: str | None = None,
+        parameters: Mapping[str, Any] | None = None,
+        overrides: dict[str, Any] | None = None,
+        root_mode: str | None = None,
+        clean_home: str | None = None,
+    ) -> dict:
+        """Reserve a quota slot, submit one private job, return it as pending."""
+        target = self._target(name)
+        if not self._is_multijob(target):
+            raise web.HTTPBadRequest(
+                text="private Slurm jobs are not available on this target"
+            )
+        await self.open_target(name)
+        manager = self._ensure_jobs()
+        params = dict(parameters or {})
+        if overrides:
+            params["set"] = dict(overrides)
+        request = jobcore.JobRequest(
+            client_id=client.client_id,
+            target=name,
+            request_id=request_id or uuid.uuid4().hex,
+            kind="private",
+            parameters=params,
+            root_mode=root_mode or target.root_mode,
+            home=self._resolve_clean_home(clean_home),
+        )
+        record = await manager.submit(request)
+        return _public_job(record)
+
+    def list_jobs(
+        self, client: Client, target: str | None = None
+    ) -> list[dict[str, Any]]:
+        self._ensure_jobs()
+        if target is not None:
+            client.require_target(target)
+            if target not in self.config.targets:
+                raise web.HTTPNotFound(text="unknown target")
+        visible: list[dict[str, Any]] = []
+        for record in self.job_store.scan():  # type: ignore[union-attr]
+            if target is not None and record.target != target:
+                continue
+            if not client.may_access(record.target):
+                continue
+            if record.kind == "shared":
+                visible.append(_public_job(record))
+            elif client.is_admin or record.owner_client_id == client.client_id:
+                visible.append(_public_job(record, include_owner=client.is_admin))
+        visible.sort(key=lambda item: item["created_at"])
+        return visible
+
+    async def wait_job(
+        self, job_id: str, *, timeout: float = 30.0
+    ) -> "jobcore.JobRecord":
+        manager = self._ensure_jobs()
+        record = manager.store.load_record(job_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout))
+        while record.state not in (jobcore.READY, jobcore.TERMINAL):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            record = await self._poll_one(job_id)
+            if record.state in (jobcore.READY, jobcore.TERMINAL):
+                break
+            await asyncio.sleep(min(0.05, max(0.0, remaining)))
+        return record
+
+    async def cancel_job(self, client: Client, job_id: str) -> dict[str, Any]:
+        record = self._authorized_job(client, job_id)
+        if record.kind == "shared" and not client.is_admin:
+            raise web.HTTPForbidden(text="forbidden")
+        manager = self._ensure_jobs()
+        try:
+            updated = await manager.stop(record.job_id)
+        except jobcore.IllegalTransition as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+        return _public_job(updated)
 
     # -- HTTP handlers -----------------------------------------------------
     def _auth(self, request: web.Request) -> Client:
@@ -1522,6 +2364,44 @@ class Gateway:
             raise web.HTTPBadRequest(text="'set' must be an object of override values")
         return {str(k): v for k, v in overrides.items()}
 
+    @staticmethod
+    def _body_parameters(body: dict) -> dict[str, Any] | None:
+        parameters = body.get("parameters")
+        if parameters is None:
+            return None
+        if not isinstance(parameters, dict):
+            raise web.HTTPBadRequest(text="'parameters' must be an object")
+        return {str(k): v for k, v in parameters.items()}
+
+    @staticmethod
+    def _body_request_id(body: dict) -> str | None:
+        value = body.get("request_id")
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise web.HTTPBadRequest(text="'request_id' must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _body_root_mode(body: dict) -> str | None:
+        value = body.get("root_mode")
+        if value is None:
+            return None
+        if not isinstance(value, str) or value not in ("fakeroot", "clean"):
+            raise web.HTTPBadRequest(
+                text="'root_mode' must be 'fakeroot' or 'clean'"
+            )
+        return value
+
+    @staticmethod
+    def _body_clean_home(body: dict) -> str | None:
+        value = body.get("clean_home")
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise web.HTTPBadRequest(text="'clean_home' must be a string")
+        return value
+
     async def h_connect(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
@@ -1530,13 +2410,23 @@ class Gateway:
         factor = self._body_factor(body)
         overrides = self._body_overrides(body)
         return web.json_response(
-            await self.connect_target(name, factor=factor, overrides=overrides)
+            await self.connect_target(
+                name, factor=factor, overrides=overrides, client=client
+            )
         )
 
     async def h_refresh(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
+        if (
+            name in self.config.targets
+            and self._is_multijob(self.config.targets[name])
+            and not client.is_admin
+        ):
+            # A destructive route refresh (and any future shared-job replace)
+            # is operator-only.
+            raise web.HTTPForbidden(text="forbidden")
         body = await self._request_json(request)
         factor = self._body_factor(body)
         overrides = self._body_overrides(body)
@@ -1556,7 +2446,88 @@ class Gateway:
         client = self._auth(request)
         name = request.match_info["target"]
         client.require_target(name)
+        if (
+            name in self.config.targets
+            and self._is_multijob(self.config.targets[name])
+            and not client.is_admin
+        ):
+            raise web.HTTPForbidden(text="forbidden")
         return web.json_response(await self.stop_target(name))
+
+    # -- route/job HTTP endpoints -----------------------------------------
+    async def h_target_open(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        name = request.match_info["target"]
+        client.require_target(name)
+        if name not in self.config.targets:
+            raise web.HTTPNotFound(text="unknown target")
+        body = await self._request_json(request)
+        factor = self._body_factor(body)
+        overrides = self._body_overrides(body)
+        return web.json_response(
+            await self.open_target(name, factor=factor, overrides=overrides)
+        )
+
+    async def h_target_shared(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        name = request.match_info["target"]
+        client.require_target(name)
+        if name not in self.config.targets:
+            raise web.HTTPNotFound(text="unknown target")
+        body = await self._request_json(request)
+        factor = self._body_factor(body)
+        overrides = self._body_overrides(body)
+        return web.json_response(
+            await self.target_shared(
+                name,
+                client,
+                factor=factor,
+                overrides=overrides,
+                parameters=self._body_parameters(body),
+                root_mode=self._body_root_mode(body),
+            )
+        )
+
+    async def h_target_sbatch(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        name = request.match_info["target"]
+        client.require_target(name)
+        if name not in self.config.targets:
+            raise web.HTTPNotFound(text="unknown target")
+        body = await self._request_json(request)
+        return web.json_response(
+            await self.target_sbatch(
+                name,
+                client,
+                request_id=self._body_request_id(body),
+                parameters=self._body_parameters(body),
+                overrides=self._body_overrides(body),
+                root_mode=self._body_root_mode(body),
+                clean_home=self._body_clean_home(body),
+            )
+        )
+
+    async def h_list_jobs(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        target = request.query.get("target")
+        return web.json_response({"jobs": self.list_jobs(client, target)})
+
+    async def h_get_job(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        job_id = request.match_info["job_id"]
+        record = self._authorized_job(client, job_id)
+        if self._query_bool(request, "wait"):
+            try:
+                timeout = float(request.query.get("timeout", "30"))
+            except (TypeError, ValueError):
+                raise web.HTTPBadRequest(text="'timeout' must be a number")
+            record = await self.wait_job(record.job_id, timeout=timeout)
+        return web.json_response(_public_job(record))
+
+    async def h_cancel_job(self, request: web.Request) -> web.Response:
+        client = self._auth(request)
+        job_id = request.match_info["job_id"]
+        return web.json_response(await self.cancel_job(client, job_id))
 
     async def h_exec(self, request: web.Request) -> web.Response:
         client = self._auth(request)
@@ -2129,10 +3100,16 @@ class Gateway:
         router.add_get("/v1/health", self.h_health)
         router.add_get("/v1/targets", self.h_list_targets)
         router.add_get("/v1/targets/{target}", self.h_get_target)
+        router.add_post("/v1/targets/{target}/open", self.h_target_open)
+        router.add_post("/v1/targets/{target}/shared", self.h_target_shared)
+        router.add_post("/v1/targets/{target}/sbatch", self.h_target_sbatch)
         router.add_post("/v1/targets/{target}/connect", self.h_connect)
         router.add_post("/v1/targets/{target}/refresh", self.h_refresh)
         router.add_post("/v1/targets/{target}/preview", self.h_preview)
         router.add_post("/v1/targets/{target}/stop", self.h_stop)
+        router.add_get("/v1/jobs", self.h_list_jobs)
+        router.add_get("/v1/jobs/{job_id}", self.h_get_job)
+        router.add_post("/v1/jobs/{job_id}/cancel", self.h_cancel_job)
         router.add_post("/v1/exec", self.h_exec)
         router.add_post("/v1/sessions", self.h_session_create)
         router.add_get("/v1/sessions", self.h_session_list)
@@ -2254,6 +3231,36 @@ class Gateway:
                 print(await self.connect_target(rest[0], factor=factor))
             else:
                 print(await self.refresh_target(rest[0], factor=factor))
+        elif cmd == "open":
+            if len(args) != 1:
+                print("usage: open <target>")
+                return True
+            print(await self.open_target(args[0]))
+        elif cmd == "shared":
+            if len(args) != 1:
+                print("usage: shared <target>")
+                return True
+            print(await self.target_shared(args[0], self._operator_client()))
+        elif cmd == "sbatch":
+            if len(args) != 1:
+                print("usage: sbatch <target>")
+                return True
+            print(await self.target_sbatch(args[0], self._operator_client()))
+        elif cmd == "jobs":
+            target = args[0] if args else None
+            for job in self.list_jobs(self._operator_client(), target):
+                print(
+                    f"{job['job_id']}  {job['kind']}  {job['target']}  "
+                    f"{job['state']}  slurm={job['slurm_job_id'] or '-'}"
+                )
+        elif cmd in ("job", "job-cancel"):
+            if len(args) != 1:
+                print(f"usage: {cmd} <job-id>")
+                return True
+            if cmd == "job":
+                print(_public_job(self._authorized_job(self._operator_client(), args[0])))
+            else:
+                print(await self.cancel_job(self._operator_client(), args[0]))
         elif cmd in ("reconnect", "stop"):
             if len(args) != 1:
                 print(f"usage: {cmd} <target>")
@@ -2466,6 +3473,20 @@ async def _error_middleware(request: web.Request, handler):
     except SessionForbidden:
         raise web.HTTPForbidden(text="forbidden") from None
     except SessionError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    except jobcore.QuotaExceeded as exc:
+        raise web.HTTPTooManyRequests(text=str(exc)) from exc
+    except (jobcore.JobNotFound, jobcore.InvalidJobId):
+        # Foreign and unknown ids already collapse to the same 404 in the
+        # handler; this is the defence-in-depth mapping.
+        raise web.HTTPNotFound(text=JOB_NOT_FOUND_TEXT) from None
+    except jobcore.RequestIdConflict as exc:
+        raise web.HTTPConflict(text=str(exc)) from exc
+    except jobcore.SubmissionRejected as exc:
+        raise web.HTTPBadGateway(text=str(exc)) from exc
+    except jobcore.SubmissionUncertain as exc:
+        raise web.HTTPServiceUnavailable(text=str(exc)) from exc
+    except jobcore.JobError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     except ConfigError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
