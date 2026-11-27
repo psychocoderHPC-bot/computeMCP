@@ -366,7 +366,15 @@ def test_override_handled_before_mapping():
     plan = compute_plan(target, {"mem-per-node": "1G"})
     assert plan.memory_per_node_mib == 1024
     sbatch, srun = render_args(target, plan)
-    assert sbatch == ("--mem=1024M",)
+    # Memory is explicitly mapped, so it keeps the configured mapping position;
+    # the other fields fall back to their implicit sbatch defaults.
+    assert sbatch == (
+        "--mem=1024M",
+        "--nodes=1",
+        "--gpus-per-node=1",
+        "--ntasks-per-node=1",
+        "--cpus-per-task=6",
+    )
     assert srun == ()
 
 
@@ -436,7 +444,13 @@ def test_cpus_mapping_satisfied_by_ntasks_one():
     validate_conflicts(target)
     plan = compute_plan(target)
     sbatch, _ = render_args(target, plan)
-    assert sbatch == ("--ntasks=1", "--cpus-per-task=6")
+    assert sbatch == (
+        "--ntasks=1",
+        "--cpus-per-task=6",
+        "--nodes=1",
+        "--gpus-per-node=1",
+        "--mem=94500M",
+    )
 
 
 def test_stages_checked_independently():
@@ -482,6 +496,8 @@ def test_render_manual_options_strings_bools_and_arrays():
         "--writable",
         "--exclude=cn1",
         "--exclude=cn2",
+        "--nodes=1",
+        "--gpus-per-node=1",
     )
     assert srun == ("--bind=cores",)
 
@@ -505,6 +521,7 @@ def test_render_account_leads_stage_args_before_manual_options():
         "--partition=gpu",
         "--ntasks-per-node=1",
         "--nodes=1",
+        "--gpus-per-node=1",
     )
     assert srun == ()
 
@@ -519,7 +536,11 @@ def test_render_account_empty_or_none_emits_nothing():
         )
         plan = compute_plan(target)
         sbatch, _ = render_args(target, plan)
-        assert sbatch == ("--partition=gpu",)
+        assert sbatch == (
+            "--partition=gpu",
+            "--nodes=1",
+            "--gpus-per-node=1",
+        )
 
 
 def test_render_account_not_copied_to_other_stage():
@@ -674,8 +695,259 @@ def test_render_duplicate_setting_is_a_bug_not_deduped():
     )
     plan = compute_plan(target)
     sbatch, srun = render_args(target, plan)
-    # No mapping configured here, so no duplicate: a single manual emit.
-    assert sbatch == ("--nodes=1",) and srun == ()
+    # No mapping configured here, so no duplicate: a single manual nodes emit
+    # suppresses the implicit default, while the other defaults still apply.
+    assert sbatch == ("--nodes=1", "--gpus-per-node=1")
+    assert srun == ()
+
+
+# ---------------------------------------------------------------------------
+# Implicit sbatch defaults (design §8)
+# ---------------------------------------------------------------------------
+
+def make_slurm_target(
+    *,
+    node=ROSI_NODE,
+    alloc=None,
+    sbatch_options=None,
+    sbatch_mapping=None,
+    srun_options=None,
+    srun_mapping=None,
+):
+    return make_target(
+        node=node,
+        alloc=alloc,
+        slurm=SlurmConfig(
+            sbatch=SlurmStageConfig(
+                options=sbatch_options or {}, mapping=sbatch_mapping or {}
+            ),
+            srun=SlurmStageConfig(
+                options=srun_options or {}, mapping=srun_mapping or {}
+            ),
+        ),
+    )
+
+
+def test_default_sbatch_emits_all_fields_without_mapping_table():
+    target = make_slurm_target()
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    assert sbatch == (
+        "--nodes=1",
+        "--gpus-per-node=1",
+        "--ntasks-per-node=1",
+        "--cpus-per-task=6",
+        "--mem=94500M",
+    )
+    # srun never inherits the sbatch allocation defaults.
+    assert srun == ()
+
+
+def test_default_nodes_emission():
+    target = make_slurm_target(node=None)
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert "--nodes=1" in sbatch
+
+
+def test_default_gpus_emission():
+    target = make_slurm_target()
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert "--gpus-per-node=1" in sbatch
+
+
+def test_default_cpus_and_task_layout_emission():
+    target = make_slurm_target()
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert "--cpus-per-task=6" in sbatch
+    # Unspecified layout is pinned to one task per node before the CPU request.
+    assert sbatch.index("--ntasks-per-node=1") < sbatch.index("--cpus-per-task=6")
+
+
+def test_default_memory_emission():
+    target = make_slurm_target()
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert "--mem=94500M" in sbatch
+
+
+def test_default_exclusive_emission():
+    target = make_slurm_target(alloc=AllocationConfig(single_node="exclusive"))
+    plan = compute_plan(target)
+    assert plan.exclusive is True
+    sbatch, _ = render_args(target, plan)
+    assert "--exclusive" in sbatch
+
+
+def test_manual_ntasks_one_prevents_extra_task_pin():
+    target = make_slurm_target(sbatch_options={"ntasks-per-node": 1})
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert sbatch.count("--ntasks-per-node=1") == 1
+    assert "--cpus-per-task=6" in sbatch
+
+
+def test_default_cpu_layout_rejects_multi_task_size():
+    target = make_slurm_target(sbatch_options={"ntasks-per-node": 2})
+    plan = compute_plan(target)
+    with pytest.raises(ConfigError, match="multi-task layout"):
+        render_args(target, plan)
+
+
+def test_explicit_gres_mapping_overrides_only_gpu_field():
+    target = make_slurm_target(sbatch_mapping={"gpus-per-node": "gres"})
+    plan = compute_plan(target, {"gpus-per-node": 2})
+    sbatch, _ = render_args(target, plan)
+    assert "--gres=gpu:2" in sbatch
+    assert not any(arg.startswith("--gpus-per-node") for arg in sbatch)
+    # Every other field keeps its implicit default (2 GPUs => 12 CPUs/189000M).
+    assert "--nodes=1" in sbatch
+    assert "--cpus-per-task=12" in sbatch
+    assert "--mem=189000M" in sbatch
+
+
+def test_manual_memory_suppresses_default_and_is_reported():
+    target = make_slurm_target(sbatch_options={"mem": "100G"})
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert "--mem=100G" in sbatch
+    assert "--mem=94500M" not in sbatch
+    summary = plan_summary(target, plan)
+    assert summary["suppressed"]["sbatch"] == {"memory-per-node": "mem"}
+    assert "memory-per-node" not in summary["defaulted"]["sbatch"]
+    assert "memory-per-node" not in summary["emitted"]["sbatch"]
+    assert "memory-per-node" not in summary["not_emitted"]
+
+
+def test_manual_nodes_suppresses_default_and_is_reported():
+    target = make_slurm_target(sbatch_options={"n": 2})
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert "--n=2" in sbatch
+    assert "--nodes=1" not in sbatch
+    summary = plan_summary(target, plan)
+    assert summary["suppressed"]["sbatch"] == {"nodes": "n"}
+
+
+@pytest.mark.parametrize(
+    ("manual_key", "value"),
+    [
+        ("gres", "gpu:1"),
+        ("gpus", 1),
+        ("gpus-per-task", 1),
+        ("gpus-per-node", 1),
+    ],
+)
+def test_manual_gpu_option_suppresses_default(manual_key, value):
+    target = make_slurm_target(sbatch_options={manual_key: value})
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    summary = plan_summary(target, plan)
+    assert summary["suppressed"]["sbatch"] == {"gpus-per-node": manual_key}
+    assert sbatch.count("--gpus-per-node=1") <= 1
+    if manual_key != "gpus-per-node":
+        assert not any(arg.startswith("--gpus-per-node") for arg in sbatch)
+
+
+def test_manual_cpus_suppresses_default_and_is_reported():
+    target = make_slurm_target(sbatch_options={"cpus-per-task": 3})
+    plan = compute_plan(target)
+    sbatch, _ = render_args(target, plan)
+    assert "--cpus-per-task=3" in sbatch
+    assert "--cpus-per-task=6" not in sbatch
+    summary = plan_summary(target, plan)
+    assert summary["suppressed"]["sbatch"] == {"cpus-per-node": "cpus-per-task"}
+
+
+def test_manual_exclusive_false_suppresses_default():
+    target = make_slurm_target(
+        alloc=AllocationConfig(single_node="exclusive"),
+        sbatch_options={"exclusive": False},
+    )
+    plan = compute_plan(target)
+    assert plan.exclusive is True
+    sbatch, _ = render_args(target, plan)
+    assert "--exclusive" not in sbatch
+    summary = plan_summary(target, plan)
+    assert summary["suppressed"]["sbatch"] == {"exclusive": "exclusive"}
+
+
+def test_reject_set_swallowed_by_manual_owner():
+    target = make_slurm_target(sbatch_options={"mem": "100G"})
+    with pytest.raises(ConfigError, match="would be ignored"):
+        compute_plan(target, {"mem-per-node": "1G"})
+    target = make_slurm_target(sbatch_options={"gres": "gpu:1"})
+    with pytest.raises(ConfigError, match="would be ignored"):
+        compute_plan(target, {"gpus-per-node": 2})
+
+
+def test_srun_independent_of_sbatch_defaults():
+    target = make_slurm_target(srun_options={"ntasks-per-node": 1})
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    assert sbatch == (
+        "--nodes=1",
+        "--gpus-per-node=1",
+        "--ntasks-per-node=1",
+        "--cpus-per-task=6",
+        "--mem=94500M",
+    )
+    assert srun == ("--ntasks-per-node=1",)
+
+
+def test_srun_mapping_does_not_mutate_sbatch():
+    target = make_slurm_target(srun_mapping={"gpus-per-node": "gres"})
+    plan = compute_plan(target)
+    sbatch, srun = render_args(target, plan)
+    assert "--gpus-per-node=1" in sbatch
+    assert "--gres=gpu:1" in srun
+    assert render_args(target, plan) == (sbatch, srun)
+
+
+def test_preview_and_execution_argv_parity_matrix():
+    cases = [
+        (make_slurm_target(), None),
+        (
+            make_slurm_target(sbatch_mapping={"gpus-per-node": "gres"}),
+            {"gpus-per-node": 2},
+        ),
+        (
+            make_slurm_target(alloc=AllocationConfig(single_node="exclusive")),
+            None,
+        ),
+        (make_slurm_target(sbatch_options={"mem": "100G"}), None),
+        (
+            make_slurm_target(
+                node=NodeConfig(cpus=32, memory="128G"),
+                alloc=AllocationConfig(single_node="cpu-proportional"),
+            ),
+            {"cpus-per-node": 8},
+        ),
+    ]
+    for target, overrides in cases:
+        plan = compute_plan(target, overrides)
+        preview = plan_summary(target, plan)["args"]
+        executed_sbatch, executed_srun = render_args(target, plan)
+        assert preview["sbatch"] == list(executed_sbatch)
+        assert preview["srun"] == list(executed_srun)
+        # Determinism: a second render is byte-for-byte identical.
+        assert render_args(target, plan) == (executed_sbatch, executed_srun)
+
+
+def test_render_does_not_mutate_stage_inputs():
+    target = make_slurm_target(
+        sbatch_options={"ntasks-per-node": 1, "mem": "100G"},
+        srun_mapping={"gpus-per-node": "gres"},
+    )
+    sbatch_options = dict(target.slurm.sbatch.options)
+    srun_mapping = dict(target.slurm.srun.mapping)
+    plan = compute_plan(target)
+    render_args(target, plan)
+    plan_summary(target, plan)
+    assert target.slurm.sbatch.options == sbatch_options
+    assert target.slurm.srun.mapping == srun_mapping
 
 
 # ---------------------------------------------------------------------------
@@ -705,11 +977,25 @@ def test_plan_summary_is_json_serializable_and_complete():
     assert summary["plan"]["memory_per_node_mib"] == 94500
     assert summary["plan"]["exclusive"] is False
     assert summary["plan"]["mode"] == "gpu-proportional"
-    assert summary["args"]["sbatch"] == ["--ntasks-per-node=1", "--nodes=1", "--gres=gpu:1"]
+    assert summary["args"]["sbatch"] == [
+        "--ntasks-per-node=1",
+        "--nodes=1",
+        "--gres=gpu:1",
+        "--cpus-per-task=6",
+        "--mem=94500M",
+    ]
     assert summary["args"]["srun"] == ["--ntasks=1", "--cpus-per-task=6"]
-    assert summary["emitted"]["sbatch"] == ["nodes", "gpus-per-node"]
-    # memory-per-node was calculated but no stage emitted it.
-    assert summary["not_emitted"] == ["memory-per-node"]
+    assert summary["mapped"]["sbatch"] == ["nodes", "gpus-per-node"]
+    assert summary["defaulted"]["sbatch"] == ["cpus-per-node", "memory-per-node"]
+    assert summary["emitted"]["sbatch"] == [
+        "nodes",
+        "gpus-per-node",
+        "cpus-per-node",
+        "memory-per-node",
+    ]
+    # Every calculated field is now either mapped or defaulted in sbatch.
+    assert summary["not_emitted"] == []
+    assert summary["suppressed"] == {"sbatch": {}, "srun": {}}
     assert json.loads(text)["plan"]["gpus_per_node"] == 1
 
 
