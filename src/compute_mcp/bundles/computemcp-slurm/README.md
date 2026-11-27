@@ -51,10 +51,16 @@ opaque error:
 * **Apptainer 1.x or newer.**  Legacy Singularity (major version `0`) is
   rejected.  An unparseable `apptainer --version` output is only a warning,
   because a site wrapper may hide it.
-* **Working `--fakeroot`.**  The fakeroot sandbox needs either a setuid-root
-  Apptainer install or unprivileged user namespaces
-  (`unshare --user --map-root-user true`).  Running as root also satisfies it.
-  When neither is available the helper names both remedies.
+* **Working `--fakeroot`.**  The probe runs a bounded
+  `apptainer exec --fakeroot ... true` no-op, using the existing sandbox or
+  clean SIF when one is present.  When that fails, a setuid install is accepted
+  if a setuid `starter-suid` (or legacy `starter`) helper is present, and
+  otherwise unprivileged user namespaces are checked with
+  `unshare --user --map-root-user true`.  Running as root also satisfies it.
+  The CLI binary itself is not setuid on a setuid install, so its mode is never
+  used as the test.  When none of these work the helper names the site policy:
+  enable unprivileged user namespaces or install the setuid package
+  (`apptainer-suid`).
 * **A writable sandbox account.**  Some base images ship no `ubuntu` account.
   `%post` creates one when the shadow tools are present, and `configure` creates
   a non-root account with a free UID/GID when the image still has none.
