@@ -24,6 +24,29 @@ from mcp.server.mcpserver import MCPServer
 
 DEFAULT_TIMEOUT = 60.0
 EXEC_TIMEOUT_PADDING = 30.0
+# Extra slack on top of a job-wait deadline so the MCP client does not time out
+# before the gateway's bounded wait returns.
+JOB_WAIT_MARGIN = 15.0
+# One public message for an unknown job and another client's job.
+JOB_NOT_FOUND_TEXT = "job not found"
+
+
+def _split_route_job(result: Any) -> Any:
+    """Expose route state separately from the shared job state.
+
+    ``target_shared`` returns the target route status with a nested ``job``
+    record.  The top-level ``state`` there is the route, not the job; add
+    explicit aliases so a caller cannot confuse the two.
+    """
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    job = out.get("job")
+    if isinstance(job, dict):
+        out["route"] = "open" if out.get("state") == "connected" else "absent"
+        out["route_state"] = out.get("state")
+        out["job_state"] = job.get("state")
+    return out
 
 
 class GatewayClient:
@@ -76,6 +99,29 @@ class GatewayClient:
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"gateway request failed: {exc}") from exc
 
+    async def job_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: dict | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Issue a job-scoped request and hide job-id existence in a 404.
+
+        A foreign job id and an unknown job id produce the same public
+        message.  Quota and authorization failures keep the gateway's text.
+        """
+        try:
+            return await self.request(
+                method, path, json=json, params=params, timeout=timeout
+            )
+        except RuntimeError as exc:
+            if "failed with 404" in str(exc):
+                raise RuntimeError(JOB_NOT_FOUND_TEXT) from None
+            raise
+
     async def upload(
         self,
         target: str,
@@ -85,9 +131,12 @@ class GatewayClient:
         *,
         append: bool = False,
         parents: bool = False,
+        job_id: str | None = None,
     ) -> Any:
         """Stream a local file object to the gateway's upload endpoint."""
         params = {"target": target, "path": remote_path}
+        if job_id:
+            params["job_id"] = job_id
         if append:
             params["append"] = "true"
         if parents:
@@ -115,9 +164,18 @@ class GatewayClient:
                 )
         return _json.loads(text) if text else {}
 
-    async def download(self, target: str, remote_path: str, sink: "IO[bytes]") -> dict:
+    async def download(
+        self,
+        target: str,
+        remote_path: str,
+        sink: "IO[bytes]",
+        *,
+        job_id: str | None = None,
+    ) -> dict:
         """Stream a remote file from the gateway into a local file object."""
         params = {"target": target, "path": remote_path, "encoding": "stream"}
+        if job_id:
+            params["job_id"] = job_id
         session = await self.session()
         async with session.get(
             f"{self.base_url}/v1/files/read", params=params
@@ -143,11 +201,14 @@ def _matches(rel: str, include: list[str], exclude: list[str]) -> bool:
     return True
 
 
-async def _remote_dir_exists(client: GatewayClient, target: str, path: str) -> bool:
+async def _remote_dir_exists(
+    client: GatewayClient, target: str, path: str, job_id: str | None = None
+) -> bool:
+    params = {"target": target, "path": path}
+    if job_id:
+        params["job_id"] = job_id
     try:
-        info = await client.request(
-            "GET", "/v1/files/stat", params={"target": target, "path": path}
-        )
+        info = await client.request("GET", "/v1/files/stat", params=params)
     except RuntimeError:
         return False
     return info.get("type") == "directory"
@@ -166,6 +227,7 @@ async def _upload_tree(
     max_files: int,
     include: list[str],
     exclude: list[str],
+    job_id: str | None = None,
 ) -> dict:
     """Mirror a local directory tree, streaming each file individually.
 
@@ -175,10 +237,15 @@ async def _upload_tree(
     still missing remotely.
     """
     local_root = os.path.abspath(local_root)
-    if parents and not await _remote_dir_exists(client, target, remote_root):
+    mkdir_params = {"target": target}
+    if job_id:
+        mkdir_params["job_id"] = job_id
+    if parents and not await _remote_dir_exists(
+        client, target, remote_root, job_id
+    ):
         await client.request(
             "POST", "/v1/files/mkdir",
-            params={"target": target}, json={"path": remote_root},
+            params=mkdir_params, json={"path": remote_root},
         )
 
     uploaded, skipped, failed = 0, 0, []
@@ -187,10 +254,12 @@ async def _upload_tree(
         remote_dir = remote_root if rel_dir == "." else posixpath.join(
             remote_root, rel_dir.replace(os.sep, "/")
         )
-        if rel_dir != "." and not await _remote_dir_exists(client, target, remote_dir):
+        if rel_dir != "." and not await _remote_dir_exists(
+            client, target, remote_dir, job_id
+        ):
             await client.request(
                 "POST", "/v1/files/mkdir",
-                params={"target": target}, json={"path": remote_dir},
+                params=mkdir_params, json={"path": remote_dir},
             )
         for filename in sorted(filenames):
             rel = filename if rel_dir == "." else posixpath.join(
@@ -205,10 +274,12 @@ async def _upload_tree(
             local_file = os.path.join(dirpath, filename)
             remote_file = posixpath.join(remote_dir, filename)
             if skip_existing:
+                stat_params = {"target": target, "path": remote_file}
+                if job_id:
+                    stat_params["job_id"] = job_id
                 try:
                     await client.request(
-                        "GET", "/v1/files/stat",
-                        params={"target": target, "path": remote_file},
+                        "GET", "/v1/files/stat", params=stat_params
                     )
                     skipped += 1
                     continue
@@ -218,7 +289,8 @@ async def _upload_tree(
                 length = os.path.getsize(local_file)
                 with open(local_file, "rb") as handle:
                     await client.upload(
-                        target, remote_file, handle, length, append=append
+                        target, remote_file, handle, length,
+                        append=append, job_id=job_id,
                     )
                 uploaded += 1
             except (OSError, RuntimeError) as exc:  # keep going, report at end
@@ -237,6 +309,7 @@ async def _download_tree(
     target: str,
     remote_root: str,
     local_root: str,
+    job_id: str | None = None,
 ) -> dict:
     """Recursively download a remote directory, streaming each file to disk.
 
@@ -248,10 +321,12 @@ async def _download_tree(
     os.makedirs(local_root, exist_ok=True)
     while pending:
         rel_dir, remote_dir = pending.pop()
+        list_params = {"target": target, "path": remote_dir}
+        if job_id:
+            list_params["job_id"] = job_id
         try:
             listing = await client.request(
-                "GET", "/v1/files/list",
-                params={"target": target, "path": remote_dir},
+                "GET", "/v1/files/list", params=list_params
             )
         except RuntimeError as exc:
             failed.append({"path": rel_dir or ".", "error": str(exc)})
@@ -267,7 +342,9 @@ async def _download_tree(
                 os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
                 try:
                     with open(local_path, "wb") as handle:
-                        await client.download(target, entry["path"], handle)
+                        await client.download(
+                            target, entry["path"], handle, job_id=job_id
+                        )
                     downloaded += 1
                 except (OSError, RuntimeError) as exc:
                     failed.append({"path": rel, "error": str(exc)})
@@ -397,6 +474,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         timeout: float | None = None,
         env: dict[str, str] | None = None,
         stdin: str | None = None,
+        job_id: str | None = None,
     ) -> dict:
         """Run a non-interactive command inside a remote development container.
 
@@ -408,8 +486,12 @@ def build_server(client: GatewayClient) -> MCPServer:
           container sshd does not accept env (AcceptEnv).
         - `stdin`: text piped to the command's standard input.
         - `timeout`: seconds; use persistent sessions for long-running commands.
+        - `job_id`: select a specific shared or own job; omit it to use the
+          target's current shared job.
         """
         payload = {"target": target, "command": command, "cwd": cwd}
+        if job_id:
+            payload["job_id"] = job_id
         if timeout is not None:
             payload["timeout"] = timeout
         if env:
@@ -424,33 +506,139 @@ def build_server(client: GatewayClient) -> MCPServer:
         )
 
     @mcp.tool()
+    async def computeMCP_job_start(
+        target: str,
+        kind: str = "private",
+        overrides: dict[str, Any] | None = None,
+        root_mode: str | None = None,
+        clean_home: str | None = None,
+        request_id: str | None = None,
+    ) -> dict:
+        """Start or submit a job on a target.
+
+        `kind="shared"` gets or creates the target's single shared job. Any
+        authorized client may start it, concurrent calls converge on one
+        job_id, and a settings conflict returns the existing job instead of
+        replacing it.
+
+        `kind="private"` submits one private Slurm job owned by this client
+        and consumes one quota slot; it is rejected on a non-Slurm target.
+
+        `overrides` maps to the gateway's allocation overrides (`--set`).
+        `root_mode` is `fakeroot` or `clean`. `clean_home` selects a home
+        subdirectory for a private job. `request_id` is an idempotency key.
+
+        The result reports route state separately from job state: for a shared
+        start the response carries `route` (`open`/`absent`), `route_state`,
+        `job` and `job_state`. A successful submit can return a job that is
+        still `pending`; use computeMCP_job_wait instead of resubmitting.
+        """
+        if kind not in ("private", "shared"):
+            raise ValueError("kind must be 'private' or 'shared'")
+        body: dict[str, Any] = {}
+        if overrides:
+            body["set"] = overrides
+        if root_mode:
+            body["root_mode"] = root_mode
+        if kind == "shared":
+            result = await client.request(
+                "POST", f"/v1/targets/{target}/shared", json=body or None
+            )
+            return _split_route_job(result)
+        if clean_home:
+            body["clean_home"] = clean_home
+        if request_id:
+            body["request_id"] = request_id
+        return await client.request(
+            "POST", f"/v1/targets/{target}/sbatch", json=body or None
+        )
+
+    @mcp.tool()
+    async def computeMCP_job_list(target: str | None = None) -> dict:
+        """List jobs visible to this client, optionally filtered by target.
+
+        The result includes only this client's private jobs plus each target's
+        shared job. Admin tokens may also see job owners.
+        """
+        params = {"target": target} if target else None
+        return await client.request("GET", "/v1/jobs", params=params)
+
+    @mcp.tool()
+    async def computeMCP_job_status(job_id: str) -> dict:
+        """Return one job's state, Slurm id and effective container settings.
+
+        A job belonging to another client and an unknown job id return the
+        same `job not found` error.
+        """
+        return await client.job_request("GET", f"/v1/jobs/{job_id}")
+
+    @mcp.tool()
+    async def computeMCP_job_wait(job_id: str, timeout: float = 30.0) -> dict:
+        """Wait until a job is ready or terminal, or the timeout elapses.
+
+        A timeout is not a failure and leaves the Slurm job intact; call this
+        again instead of resubmitting. Prefer this over polling
+        computeMCP_job_status in a loop.
+        """
+        return await client.job_request(
+            "GET",
+            f"/v1/jobs/{job_id}",
+            params={"wait": "true", "timeout": timeout},
+            timeout=timeout + JOB_WAIT_MARGIN,
+        )
+
+    @mcp.tool()
+    async def computeMCP_job_stop(job_id: str) -> dict:
+        """Cancel a job (pending, starting or ready).
+
+        A private job may be stopped by its owner; the shared job only by an
+        operator. Repeated requests are safe. A foreign and an unknown id
+        return the same `job not found` error.
+        """
+        return await client.job_request("POST", f"/v1/jobs/{job_id}/cancel")
+
+    @mcp.tool()
     async def computeMCP_session_create(
         target: str,
         cwd: str | None = None,
         columns: int = 160,
         rows: int = 50,
+        job_id: str | None = None,
     ) -> dict:
         """Create an independent persistent PTY session on a target.
 
         Use for builds, tests, debuggers and interactive programs. Returns a
-        session_id used by the other computeMCP_session_* tools.
+        session_id used by the other computeMCP_session_* tools. `job_id`
+        selects a specific shared or own job; omit it to use the target's
+        current shared job.
         """
-        return await client.request(
-            "POST",
-            "/v1/sessions",
-            json={"target": target, "cwd": cwd, "columns": columns, "rows": rows},
-        )
+        body: dict[str, Any] = {
+            "target": target, "cwd": cwd, "columns": columns, "rows": rows,
+        }
+        if job_id:
+            body["job_id"] = job_id
+        return await client.request("POST", "/v1/sessions", json=body)
 
     @mcp.tool()
-    async def computeMCP_session_write(session_id: str, data: str) -> dict:
-        """Send input (including a trailing newline) to a PTY session."""
+    async def computeMCP_session_write(
+        session_id: str, data: str, job_id: str | None = None
+    ) -> dict:
+        """Send input (including a trailing newline) to a PTY session.
+
+        PTY operations address the session; `job_id` is forwarded for a
+        job-aware gateway and never changes session ownership.
+        """
+        body: dict[str, Any] = {"data": data}
+        if job_id:
+            body["job_id"] = job_id
         return await client.request(
-            "POST", f"/v1/sessions/{session_id}/write", json={"data": data}
+            "POST", f"/v1/sessions/{session_id}/write", json=body
         )
 
     @mcp.tool()
     async def computeMCP_session_read(
-        session_id: str, max_bytes: int = 0, wait: float = 0.0
+        session_id: str, max_bytes: int = 0, wait: float = 0.0,
+        job_id: str | None = None,
     ) -> dict:
         """Read and clear buffered output from a PTY session.
 
@@ -459,104 +647,154 @@ def build_server(client: GatewayClient) -> MCPServer:
 
         Set `wait` > 0 (seconds) to block until there is new output, the
         session closes, or the timeout elapses. Prefer a waiting read when
-        watching a build instead of polling in a loop.
+        watching a build instead of polling in a loop. `job_id` is forwarded
+        for a job-aware gateway.
         """
+        body: dict[str, Any] = {"max_bytes": max_bytes, "wait": wait}
+        if job_id:
+            body["job_id"] = job_id
         return await client.request(
             "POST",
             f"/v1/sessions/{session_id}/read",
-            json={"max_bytes": max_bytes, "wait": wait},
+            json=body,
             # allow the gateway to hold the HTTP request while we wait
             timeout=(wait + 15) if wait else None,
         )
 
     @mcp.tool()
-    async def computeMCP_session_resize(session_id: str, columns: int, rows: int) -> dict:
+    async def computeMCP_session_resize(
+        session_id: str, columns: int, rows: int, job_id: str | None = None
+    ) -> dict:
         """Resize a PTY session's terminal."""
+        body: dict[str, Any] = {"columns": columns, "rows": rows}
+        if job_id:
+            body["job_id"] = job_id
         return await client.request(
-            "POST",
-            f"/v1/sessions/{session_id}/resize",
-            json={"columns": columns, "rows": rows},
+            "POST", f"/v1/sessions/{session_id}/resize", json=body
         )
 
     @mcp.tool()
-    async def computeMCP_session_close(session_id: str) -> dict:
+    async def computeMCP_session_close(
+        session_id: str, job_id: str | None = None
+    ) -> dict:
         """Close a PTY session (terminates the remote process)."""
-        return await client.request("DELETE", f"/v1/sessions/{session_id}")
+        params = {"job_id": job_id} if job_id else None
+        return await client.request(
+            "DELETE", f"/v1/sessions/{session_id}", params=params
+        )
 
     @mcp.tool()
-    async def computeMCP_sessions(target: str | None = None) -> dict:
+    async def computeMCP_sessions(
+        target: str | None = None, job_id: str | None = None
+    ) -> dict:
         """List sessions owned by this client, optionally filtered by target."""
-        params = {"target": target} if target else None
-        return await client.request("GET", "/v1/sessions", params=params)
+        params: dict[str, Any] = {}
+        if target:
+            params["target"] = target
+        if job_id:
+            params["job_id"] = job_id
+        return await client.request(
+            "GET", "/v1/sessions", params=params or None
+        )
 
     @mcp.tool()
-    async def computeMCP_file_read(target: str, path: str) -> dict:
+    async def computeMCP_file_read(
+        target: str, path: str, job_id: str | None = None
+    ) -> dict:
         """Read a file inside a remote development container (UTF-8, lossy).
 
-        Paths are inside the container, never on the gateway host.
+        Paths are inside the container, never on the gateway host. `job_id`
+        selects a specific shared or own job; omit it to use the target's
+        current shared job.
         """
-        return await client.request(
-            "GET", "/v1/files/read", params={"target": target, "path": path}
-        )
+        params = {"target": target, "path": path}
+        if job_id:
+            params["job_id"] = job_id
+        return await client.request("GET", "/v1/files/read", params=params)
 
     @mcp.tool()
-    async def computeMCP_file_read_base64(target: str, path: str) -> dict:
+    async def computeMCP_file_read_base64(
+        target: str, path: str, job_id: str | None = None
+    ) -> dict:
         """Read a binary file inside a remote container as base64."""
-        return await client.request(
-            "GET",
-            "/v1/files/read",
-            params={"target": target, "path": path, "encoding": "base64"},
-        )
+        params = {"target": target, "path": path, "encoding": "base64"}
+        if job_id:
+            params["job_id"] = job_id
+        return await client.request("GET", "/v1/files/read", params=params)
 
     @mcp.tool()
     async def computeMCP_file_write(
-        target: str, path: str, content: str, encoding: str = "utf-8"
+        target: str, path: str, content: str, encoding: str = "utf-8",
+        job_id: str | None = None,
     ) -> dict:
         """Write text (or base64 when encoding='base64') to a file in a container."""
+        params = {"target": target}
+        if job_id:
+            params["job_id"] = job_id
         return await client.request(
             "PUT",
             "/v1/files/write",
-            params={"target": target},
+            params=params,
             json={"path": path, "content": content, "encoding": encoding},
         )
 
     @mcp.tool()
-    async def computeMCP_file_list(target: str, path: str) -> dict:
+    async def computeMCP_file_list(
+        target: str, path: str, job_id: str | None = None
+    ) -> dict:
         """List a directory inside a remote development container."""
-        return await client.request(
-            "GET", "/v1/files/list", params={"target": target, "path": path}
-        )
+        params = {"target": target, "path": path}
+        if job_id:
+            params["job_id"] = job_id
+        return await client.request("GET", "/v1/files/list", params=params)
 
     @mcp.tool()
-    async def computeMCP_file_stat(target: str, path: str) -> dict:
+    async def computeMCP_file_stat(
+        target: str, path: str, job_id: str | None = None
+    ) -> dict:
         """Stat a path inside a remote development container."""
-        return await client.request(
-            "GET", "/v1/files/stat", params={"target": target, "path": path}
-        )
+        params = {"target": target, "path": path}
+        if job_id:
+            params["job_id"] = job_id
+        return await client.request("GET", "/v1/files/stat", params=params)
 
     @mcp.tool()
-    async def computeMCP_file_mkdir(target: str, path: str) -> dict:
+    async def computeMCP_file_mkdir(
+        target: str, path: str, job_id: str | None = None
+    ) -> dict:
         """Create a directory (and parents) inside a remote container."""
+        params = {"target": target}
+        if job_id:
+            params["job_id"] = job_id
         return await client.request(
-            "POST", "/v1/files/mkdir", params={"target": target}, json={"path": path}
+            "POST", "/v1/files/mkdir", params=params, json={"path": path}
         )
 
     @mcp.tool()
-    async def computeMCP_file_remove(target: str, path: str) -> dict:
+    async def computeMCP_file_remove(
+        target: str, path: str, job_id: str | None = None
+    ) -> dict:
         """Remove a file or directory inside a remote container."""
+        params = {"target": target}
+        if job_id:
+            params["job_id"] = job_id
         return await client.request(
-            "POST", "/v1/files/remove", params={"target": target}, json={"path": path}
+            "POST", "/v1/files/remove", params=params, json={"path": path}
         )
 
     @mcp.tool()
     async def computeMCP_file_rename(
-        target: str, source: str, destination: str
+        target: str, source: str, destination: str,
+        job_id: str | None = None,
     ) -> dict:
         """Rename/move a path inside a remote container."""
+        params = {"target": target}
+        if job_id:
+            params["job_id"] = job_id
         return await client.request(
             "POST",
             "/v1/files/rename",
-            params={"target": target},
+            params=params,
             json={"source": source, "destination": destination},
         )
 
@@ -568,6 +806,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         append: bool = False,
         parents: bool = False,
         recursive: bool = False,
+        job_id: str | None = None,
     ) -> dict:
         """Upload a file or directory that exists in this Terok container to a
         path inside a remote development container.
@@ -585,14 +824,15 @@ def build_server(client: GatewayClient) -> MCPServer:
             return await _upload_tree(
                 client, target, local_path, remote_path,
                 append=append, parents=parents, overwrite=False, skip_existing=False,
-                max_files=0, include=[], exclude=[],
+                max_files=0, include=[], exclude=[], job_id=job_id,
             )
         if not os.path.isfile(local_path):
             raise ValueError(f"not a regular file: {local_path}")
         length = os.path.getsize(local_path)
         with open(local_path, "rb") as handle:
             return await client.upload(
-                target, remote_path, handle, length, append=append, parents=parents
+                target, remote_path, handle, length, append=append,
+                parents=parents, job_id=job_id,
             )
 
     @mcp.tool()
@@ -606,6 +846,7 @@ def build_server(client: GatewayClient) -> MCPServer:
         max_files: int = 0,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        job_id: str | None = None,
     ) -> dict:
         """Recursively upload a local directory tree into a remote container.
 
@@ -624,12 +865,13 @@ def build_server(client: GatewayClient) -> MCPServer:
             client, target, local_path, remote_path,
             append=False, parents=parents, overwrite=overwrite,
             skip_existing=skip_existing, max_files=max_files,
-            include=include or [], exclude=exclude or [],
+            include=include or [], exclude=exclude or [], job_id=job_id,
         )
 
     @mcp.tool()
     async def computeMCP_file_download(
-        target: str, remote_path: str, local_path: str, recursive: bool = False
+        target: str, remote_path: str, local_path: str, recursive: bool = False,
+        job_id: str | None = None,
     ) -> dict:
         """Download a file or directory from a remote development container into
         this Terok container, streaming it to `local_path`.
@@ -639,21 +881,30 @@ def build_server(client: GatewayClient) -> MCPServer:
         directory tree under `local_path`.
         """
         if recursive:
-            return await _download_tree(client, target, remote_path, local_path)
+            return await _download_tree(
+                client, target, remote_path, local_path, job_id
+            )
         os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
         with open(local_path, "wb") as handle:
-            return await client.download(target, remote_path, handle)
+            return await client.download(
+                target, remote_path, handle, job_id=job_id
+            )
 
     @mcp.tool()
-    async def computeMCP_file_chmod(target: str, path: str, mode: str) -> dict:
+    async def computeMCP_file_chmod(
+        target: str, path: str, mode: str, job_id: str | None = None
+    ) -> dict:
         """Change permissions of a path inside a remote container.
 
         `mode` is octal, e.g. "644", "755" or "0755".
         """
+        params = {"target": target}
+        if job_id:
+            params["job_id"] = job_id
         return await client.request(
             "POST",
             "/v1/files/chmod",
-            params={"target": target},
+            params=params,
             json={"path": path, "mode": mode},
         )
 
