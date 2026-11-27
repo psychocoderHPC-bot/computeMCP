@@ -289,12 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--root-mode", choices=("fakeroot", "clean"), default=None,
-        help="root filesystem mode to preview for the shared job",
+        help="root filesystem mode for the shared job",
     )
     p.add_argument(
         "--clean-home", default=None, metavar="PATH",
-        help="home subdirectory to preview for the shared job (relative to "
-        "the client home)",
+        help="home subdirectory used as HOME (relative to the client home)",
     )
     p.add_argument(
         "--dry-run", action="store_true",
@@ -552,9 +551,13 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 _emit_preview(args, body)
             else:
+                # The shared endpoint accepts the same allocation fields as
+                # target-sbatch; only the submit idempotency id stays private.
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/shared",
-                    json_body=_target_body(factor, overrides),
+                    json_body=_submit_body(
+                        factor, overrides, args.root_mode, args.clean_home, None
+                    ),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_route_job(args, body)
@@ -572,7 +575,7 @@ async def _run(args: argparse.Namespace) -> int:
             else:
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/sbatch",
-                    json_body=_sbatch_body(
+                    json_body=_submit_body(
                         factor, overrides, args.root_mode, args.clean_home,
                         args.request_id,
                     ),
@@ -665,14 +668,18 @@ def _target_body(factor: str | None, overrides: dict | None) -> dict | None:
     return body or None
 
 
-def _sbatch_body(
+def _submit_body(
     factor: str | None,
     overrides: dict | None,
     root_mode: str | None,
     clean_home: str | None,
     request_id: str | None,
 ) -> dict | None:
-    """Build the private-submit request body, omitting every unset field."""
+    """Build the job-submit request body, omitting every unset field.
+
+    Shared and private submits carry the same allocation-selecting fields; only
+    the private sbatch passes a submit idempotency ``request_id``.
+    """
     body: dict = {}
     if factor is not None:
         body["factor"] = factor

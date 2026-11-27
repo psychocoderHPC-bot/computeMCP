@@ -674,6 +674,38 @@ async def test_control_target_shared_sends_set_and_factor(monkeypatch):
     ]
 
 
+async def test_control_target_shared_body_forwards_root_home_and_set(
+    monkeypatch,
+):
+    calls, _ = await _run_control(
+        monkeypatch,
+        [
+            "target-shared", "hal", "--2fa",
+            "--set", "gpus-per-node=1", "--set", "nodes=2",
+            "--root-mode", "clean", "--clean-home", "/benchmarks/run-42",
+        ],
+        {
+            "name": "hal",
+            "state": "connected",
+            "job": {"job_id": "S1", "state": "pending"},
+        },
+    )
+    # A shared submit carries the same allocation fields as target-sbatch; the
+    # private idempotency id is never sent to the shared endpoint.
+    assert calls == [
+        (
+            "POST",
+            "/v1/targets/hal/shared",
+            {
+                "factor": "SECRET",
+                "set": {"gpus-per-node": 1, "nodes": 2},
+                "root_mode": "clean",
+                "clean_home": "/benchmarks/run-42",
+            },
+        ),
+    ]
+
+
 async def test_control_target_shared_dry_run_uses_preview_without_factor(
     monkeypatch, capsys
 ):
