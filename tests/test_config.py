@@ -1571,3 +1571,129 @@ def test_append_include_ignores_nested_include_like_key(tmp_path):
     with pytest.raises(ConfigError):
         append_include(path, "systems/a.toml")
     assert path.read_text() == before
+
+
+# -- nested slurm mapping spelling -------------------------------------------
+
+def test_slurm_nested_mapping_table_accepted():
+    cfg = parse_config(
+        base_raw(
+            slurm={
+                "sbatch": {
+                    "partition": "gpu",
+                    "ntasks-per-node": 1,
+                    "mapping": {"gpus-per-node": "gres"},
+                },
+                "srun": {"mapping": {"nodes": "nodes"}},
+            }
+        )
+    )
+    slurm = cfg.targets["hal"].slurm
+    # ``mapping`` is reserved inside a stage and never a manual option.
+    assert slurm.sbatch.options == {"partition": "gpu", "ntasks-per-node": 1}
+    assert slurm.sbatch.mapping == {"gpus-per-node": "gres"}
+    assert slurm.srun.mapping == {"nodes": "nodes"}
+
+
+def test_slurm_mapping_spellings_merge_legacy_wins():
+    cfg = parse_config(
+        base_raw(
+            slurm={
+                "sbatch": {
+                    "ntasks-per-node": 1,
+                    "mapping": {"nodes": "nodes", "exclusive": "exclusive"},
+                },
+                "sbatch-map": {"gpus-per-node": "gres"},
+            }
+        )
+    )
+    # Keys from both spellings merge; identical duplicates are accepted and the
+    # legacy value is authoritative.
+    assert cfg.targets["hal"].slurm.sbatch.mapping == {
+        "nodes": "nodes",
+        "exclusive": "exclusive",
+        "gpus-per-node": "gres",
+    }
+
+
+def test_slurm_mapping_spelling_conflict_rejected():
+    with pytest.raises(ConfigError, match="mapping key 'nodes'"):
+        parse_config(
+            base_raw(
+                slurm={
+                    "sbatch": {"mapping": {"nodes": "nodes"}},
+                    "sbatch-map": {"nodes": "exclusive"},
+                }
+            )
+        )
+
+
+def test_slurm_nested_mapping_identical_duplicate_accepted():
+    cfg = parse_config(
+        base_raw(
+            slurm={
+                "sbatch": {"mapping": {"nodes": "nodes"}},
+                "sbatch-map": {"nodes": "nodes"},
+            }
+        )
+    )
+    assert cfg.targets["hal"].slurm.sbatch.mapping == {"nodes": "nodes"}
+
+
+def test_slurm_nested_mapping_must_be_a_table():
+    with pytest.raises(ConfigError, match=r"sbatch\.mapping\] must be a table"):
+        parse_config(base_raw(slurm={"sbatch": {"mapping": "nodes"}}))
+
+
+# -- root mode and home selection --------------------------------------------
+
+def test_root_mode_defaults_to_fakeroot():
+    assert parse_config(base_raw()).targets["hal"].root_mode == "fakeroot"
+
+
+def test_root_mode_values_accepted():
+    for mode in ("fakeroot", "clean"):
+        cfg = parse_config(base_raw(root_mode=mode))
+        assert cfg.targets["hal"].root_mode == mode
+
+
+def test_root_mode_invalid_rejected():
+    with pytest.raises(ConfigError, match="root_mode must be one of"):
+        parse_config(base_raw(root_mode="privileged"))
+
+
+def test_root_mode_hyphen_alias_accepted():
+    cfg = parse_config(base_raw(**{"root-mode": "clean"}))
+    assert cfg.targets["hal"].root_mode == "clean"
+
+
+def test_clean_home_and_home_base_parsed():
+    cfg = parse_config(
+        base_raw(clean_home="/benchmarks/run-42", home_base="/scratch/agent/homes")
+    )
+    target = cfg.targets["hal"]
+    assert target.clean_home == "/benchmarks/run-42"
+    assert target.home_base == "/scratch/agent/homes"
+
+
+def test_clean_home_empty_rejected():
+    with pytest.raises(ConfigError, match="clean_home must be a non-empty string"):
+        parse_config(base_raw(clean_home="  "))
+
+
+def test_home_base_non_string_rejected():
+    with pytest.raises(ConfigError, match="home_base must be a non-empty string"):
+        parse_config(base_raw(home_base=42))
+
+
+# -- shipped example ---------------------------------------------------------
+
+def test_config_example_loads_through_real_loader():
+    example = Path(__file__).resolve().parents[1] / "config.example.toml"
+    cfg = load_config(example)
+    assert "myTargetHost" in cfg.targets
+    assert "alpaka" in cfg.clients
+    # The example exercises the new job_limits spelling and resolves defaults.
+    assert cfg.clients["alpaka"].job_limit("myTargetHost") == 2
+    assert cfg.clients["alpaka"].job_limit("secondTarget") == 0
+    assert cfg.clients["alpaka"].job_limit("not-configured") == 1

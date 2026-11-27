@@ -130,6 +130,16 @@ MAPPING_VOCABULARY: dict[str, frozenset[str]] = {
     "exclusive": frozenset({"exclusive"}),
 }
 
+# Root-mode contract for Slurm/Apptainer jobs.  ``fakeroot`` is the current
+# behaviour and the default; ``clean`` derives a writable root from a known
+# base image.  Non-Slurm Docker targets keep their own behaviour.
+ROOT_MODES = ("fakeroot", "clean")
+
+# Effective private-job limit for a client/target when the client has no
+# ``job_limits`` entry for that target.  A configured ``0`` disables private
+# submissions; shared jobs, PTYs, execs and file operations are never quota'd.
+DEFAULT_JOB_LIMIT = 1
+
 # Bundle identifiers shipped inside the ``compute_mcp.bundles`` package.  The
 # gateway deploys the exact revision it was built from; a target names one of
 # these instead of pointing provision_command at a hand-placed copy.
@@ -482,20 +492,40 @@ def _load_slurm_stage(
     nothing for it.  ``options`` keys are preserved verbatim (e.g.
     ``ntasks-per-node``); each value is a scalar, bool, or array of them.  The
     reserved ``account`` key is pulled out of ``options`` into the first-class
-    ``account`` field and never appears in ``options``.  ``mapping_raw`` is
-    validated against ``MAPPING_VOCABULARY``.
+    ``account`` field and never appears in ``options``.
+
+    ``mapping`` is accepted in **two spellings**: the legacy sibling table
+    ``slurm.<stage>-map`` and the nested table ``slurm.<stage>.mapping``.  Both
+    normalize to the same ``mapping`` dict.  The two are merged per key; the
+    legacy table wins for a key it defines (existing configs keep their exact
+    semantics).  A key defined by both with *different* values is an error, not
+    a silent override.  ``mapping`` is a reserved word inside a stage and is
+    never treated as a manual option.  The merged result is validated against
+    ``MAPPING_VOCABULARY``.
     """
     if options is None and mapping_raw is None:
         return None
     if options is not None and not isinstance(options, dict):
         raise ConfigError(f"[targets.{name}.slurm.{stage}] must be a table")
-    if mapping_raw is not None:
-        if not isinstance(mapping_raw, dict):
-            raise ConfigError(f"[targets.{name}.slurm.{stage}-map] must be a table")
-        mapping = {str(k): v for k, v in mapping_raw.items()}
-    else:
-        mapping = {}
     manual = dict(options or {})
+    nested_raw = manual.pop("mapping", None)
+    if nested_raw is not None and not isinstance(nested_raw, dict):
+        raise ConfigError(
+            f"[targets.{name}.slurm.{stage}.mapping] must be a table"
+        )
+    if mapping_raw is not None and not isinstance(mapping_raw, dict):
+        raise ConfigError(f"[targets.{name}.slurm.{stage}-map] must be a table")
+    legacy = {str(k): v for k, v in (mapping_raw or {}).items()}
+    nested = {str(k): v for k, v in (nested_raw or {}).items()}
+    for key in sorted(set(legacy) & set(nested)):
+        if legacy[key] != nested[key]:
+            raise ConfigError(
+                f"targets.{name}.slurm.{stage}: mapping key {key!r} is defined "
+                f"by both [{stage}-map] ({legacy[key]!r}) and [{stage}.mapping] "
+                f"({nested[key]!r}) with different values"
+            )
+    # Legacy wins on identical keys; the nested table only fills gaps.
+    mapping = {**nested, **legacy}
     account = _parse_account(manual.pop("account", None), name, stage)
     _validate_slurm_mapping(mapping, stage, manual, name)
     return SlurmStageConfig(
@@ -510,15 +540,19 @@ def _load_slurm_config(name: str, value: dict | None) -> SlurmConfig | None:
 
     The accepted TOML uses nested tables::
 
-        [targets.X.slurm.sbatch]   # manual submission options
-        [targets.X.slurm.sbatch-map]  # calculated value -> output representation
-        [targets.X.slurm.srun]     # manual job-step options
-        [targets.X.slurm.srun-map] # calculated value -> output representation
+        [targets.X.slurm.sbatch]          # manual submission options
+        [targets.X.slurm.sbatch.mapping]  # nested calculated-value mapping
+        [targets.X.slurm.sbatch-map]      # legacy mapping spelling (still valid)
+        [targets.X.slurm.srun]            # manual job-step options
+        [targets.X.slurm.srun.mapping]    # nested calculated-value mapping
+        [targets.X.slurm.srun-map]        # legacy mapping spelling (still valid)
 
     After ``tomllib`` the parsed dict has exactly the keys ``sbatch``,
-    ``sbatch-map``, ``srun``, ``srun-map`` (each a dict).  Each stage is
-    independent: nothing is copied between them, so T2/T3 can decide
-    per-stage whether to emit any resource arguments.
+    ``sbatch-map``, ``srun``, ``srun-map`` (each a dict); the nested ``mapping``
+    table lives *inside* ``sbatch``/``srun`` and is recognized as a reserved
+    key.  Both mapping spellings normalize to the same ``SlurmStageConfig``.
+    Each stage is independent: nothing is copied between them, so T2/T3 can
+    decide per-stage whether to emit any resource arguments.
     """
     if value is None:
         return None
@@ -688,6 +722,16 @@ class TargetConfig:
     slurm: SlurmConfig | None = None
     container: ContainerConfig | None = None
     bundle: BundleConfig | None = None
+    # Root-mode contract and home selection for private container jobs.  These
+    # are target-level defaults; a submission may override them.  ``root_mode``
+    # is ``fakeroot`` (the current behaviour) or ``clean``.  ``home_base`` is
+    # the host directory under which per-client homes live; ``clean_home`` is
+    # the default relative path of a private job's clean home.  Unset fields
+    # keep the current behaviour.  Only Slurm/Apptainer targets act on these;
+    # non-Slurm/Docker targets ignore them.
+    root_mode: str = "fakeroot"
+    clean_home: str | None = None
+    home_base: str | None = None
 
     def __post_init__(self) -> None:
         if self.provision_command and self.transport.kind != "tunnel":
@@ -755,6 +799,21 @@ class TargetConfig:
             raise ConfigError(
                 f"target {self.name!r} connect_mode must be 'shared' or 'dedicated'"
             )
+        if self.root_mode not in ROOT_MODES:
+            raise ConfigError(
+                f"target {self.name!r} root_mode must be one of "
+                f"{', '.join(ROOT_MODES)}"
+            )
+        for label, value in (
+            ("clean_home", self.clean_home),
+            ("home_base", self.home_base),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ConfigError(
+                    f"target {self.name!r} {label} must be a non-empty string"
+                )
         if self.sharing not in ("exclusive", "shared", "unknown"):
             raise ConfigError(
                 f"target {self.name!r} sharing must be 'exclusive', 'shared' or 'unknown'"
@@ -863,9 +922,25 @@ class ClientConfig:
     targets: tuple[str, ...] = ()
     allow_all: bool = False
     label: str | None = None
+    # Per-target private-job limits.  An absent key means
+    # ``DEFAULT_JOB_LIMIT`` (one private Slurm job); ``0`` disables private
+    # submissions for that target.  Shared jobs and PTY/exec/file operations
+    # are never quota'd.  Only targets the client may access are accepted by
+    # the loader.
+    job_limits: dict[str, int] = field(default_factory=dict)
 
     def may_access(self, target: str) -> bool:
         return self.allow_all or target in self.targets
+
+    def job_limit(self, target: str) -> int:
+        """Effective private-job limit for ``target``.
+
+        A configured value wins; an absent key resolves to
+        :data:`DEFAULT_JOB_LIMIT` (1).  Quota code applies the target-kind rule
+        (Slurm private jobs consume a slot; shared and non-Slurm/Docker jobs do
+        not).  ``0`` disables private submissions.
+        """
+        return self.job_limits.get(target, DEFAULT_JOB_LIMIT)
 
 
 @dataclass(frozen=True)
@@ -978,7 +1053,81 @@ def _load_target(name: str, value: dict, ssh: SSHConfig) -> TargetConfig:
         slurm=_load_slurm_config(name, value.get("slurm")),
         container=_load_container_config(name, value.get("container")),
         bundle=_load_bundle_config(name, value.get("bundle")),
+        root_mode=value.get("root_mode", value.get("root-mode", "fakeroot")),
+        clean_home=value.get("clean_home", value.get("clean-home")),
+        home_base=value.get("home_base", value.get("home-base")),
     )
+
+
+def _coerce_job_limit(value: object, where: str) -> int:
+    """Validate one ``job_limits`` value: a non-negative integer, not a bool."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ConfigError(f"{where} must be a non-negative integer")
+    return value
+
+
+def _load_job_limits(
+    client_id: str,
+    raw: object,
+    targets: dict[str, TargetConfig],
+    allow_all: bool,
+    allowed: tuple[str, ...],
+) -> dict[str, int]:
+    """Parse and validate ``[clients.<id>.job_limits]``.
+
+    Every key must be a configured target the client may access (``allow_all``
+    lifts the second check).  Values are non-negative integers; booleans,
+    floats and strings are rejected.  An empty/absent table yields ``{}`` so
+    the default resolution in :meth:`ClientConfig.job_limit` applies.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"[clients.{client_id}].job_limits must be a table")
+    limits: dict[str, int] = {}
+    for key, value in raw.items():
+        target = str(key)
+        where = f"[clients.{client_id}].job_limits[{target!r}]"
+        if target not in targets:
+            raise ConfigError(f"{where} references unknown target {target!r}")
+        if not allow_all and target not in allowed:
+            raise ConfigError(
+                f"{where} target {target!r} is not in the client's targets list"
+            )
+        limits[target] = _coerce_job_limit(value, where)
+    return limits
+
+
+def parse_job_limits(
+    entries: list[str] | tuple[str, ...] | None,
+) -> dict[str, int]:
+    """Parse repeatable ``--job-limit TARGET=N`` approval entries.
+
+    This validates syntax only (``TARGET`` name shape and a non-negative
+    integer ``N``); target existence and client authorization are checked when
+    the limits are written by :func:`append_client` and reloaded.  A repeated
+    target keeps the last value.
+    """
+    limits: dict[str, int] = {}
+    for entry in entries or ():
+        if not isinstance(entry, str):
+            raise ConfigError(f"invalid job limit {entry!r}; expected TARGET=N")
+        target, sep, raw = entry.partition("=")
+        target = target.strip()
+        raw = raw.strip()
+        if not sep or not target or not raw:
+            raise ConfigError(f"invalid job limit {entry!r}; expected TARGET=N")
+        try:
+            value = int(raw, 10)
+        except ValueError as exc:
+            raise ConfigError(
+                f"invalid job limit {entry!r}; N must be an integer"
+            ) from exc
+        if value < 0:
+            raise ConfigError(f"invalid job limit {entry!r}; N must be >= 0")
+        validate_target_name(target)
+        limits[target] = value
+    return limits
 
 
 def _load_clients(
@@ -1019,6 +1168,10 @@ def _load_clients(
                 raise ConfigError(
                     f"[clients.{client_id}] references unknown target {target!r}"
                 )
+        allow_all = "*" in allowed
+        job_limits = _load_job_limits(
+            client_id, value.get("job_limits"), targets, allow_all, allowed
+        )
         label = value.get("label")
         previous = seen_hashes.get(token_hash)
         if previous is not None:
@@ -1031,8 +1184,9 @@ def _load_clients(
             client_id=client_id,
             token_sha256=token_hash,
             targets=tuple(t for t in allowed if t != "*"),
-            allow_all="*" in allowed,
+            allow_all=allow_all,
             label=str(label) if label is not None else None,
+            job_limits=job_limits,
         )
     return clients
 
@@ -1416,6 +1570,7 @@ def append_client(
     client_id: str,
     targets: tuple[str, ...],
     label: str | None = None,
+    job_limits: dict[str, int] | None = None,
 ) -> None:
     """Append a ``[clients.<id>]`` block to the config, then re-validate it.
 
@@ -1423,6 +1578,14 @@ def append_client(
     comments) is preserved.  The whole file (merged across its include chain)
     is re-parsed afterwards, and the caller should only rely on it once that
     validation passes.  A duplicate client id is refused.
+
+    ``job_limits`` is the optional per-target private-job limit map set by an
+    operator on approval.  Keys must be configured targets the new client may
+    access (``targets`` contains ``"*"`` lifts the second check) and values are
+    non-negative integers.  The limits are written as one inline table so a
+    target name containing a dot stays a quoted key::
+
+        job_limits = { "frontier" = 2, "juwels" = 0 }
 
     Duplicate and target checks consult the merged include graph, not only the
     entry file: after targets moved into included files, an entry file with
@@ -1443,6 +1606,27 @@ def append_client(
                 f"known targets: {', '.join(sorted(known)) or '(none)'}"
             )
 
+    allow_all = "*" in targets
+    if job_limits is not None and not isinstance(job_limits, dict):
+        raise ConfigError("job_limits must be a mapping of target -> int")
+    normalized_limits: dict[str, int] = {}
+    for target, value in (job_limits or {}).items():
+        target = str(target)
+        if target not in known:
+            raise ConfigError(
+                f"unknown target {target!r} in job_limits for client "
+                f"{client_id!r}; known targets: "
+                f"{', '.join(sorted(known)) or '(none)'}"
+            )
+        if not allow_all and target not in targets:
+            raise ConfigError(
+                f"target {target!r} in job_limits is not in client "
+                f"{client_id!r}'s targets list"
+            )
+        normalized_limits[target] = _coerce_job_limit(
+            value, f"job_limits[{target!r}] for client {client_id!r}"
+        )
+
     lines = [
         "",
         f"[clients.{client_id}]",
@@ -1450,6 +1634,12 @@ def append_client(
     ]
     if label:
         lines.append(f"label = {_toml_quote(label)}")
+    if normalized_limits:
+        rendered = ", ".join(
+            f"{_toml_quote(target)} = {value}"
+            for target, value in sorted(normalized_limits.items())
+        )
+        lines.append(f"job_limits = {{ {rendered} }}")
     block = "\n".join(lines) + "\n"
 
     existing = path.read_text()

@@ -69,6 +69,12 @@ class TargetAnswers:
     proxy_jump: str | None = None
     interactive_auth: bool = False
     auto_connect: bool = True
+    # Root-mode contract and per-client home selection defaults for private
+    # Slurm/Apptainer jobs (see config.py).  Left at their defaults for every
+    # existing target.
+    root_mode: str = "fakeroot"
+    clean_home: str | None = None
+    home_base: str | None = None
     container_runtime: str | None = None
     container_storage_root: str | None = None
     container_image: str | None = None
@@ -375,6 +381,12 @@ def render_target_block(answers: TargetAnswers) -> str:
     # false) would fall back to the loader default and never auto-connect.
     if answers.auto_connect:
         lines.append("auto_connect = true")
+    if answers.root_mode != "fakeroot":
+        lines.append(f"root_mode = {_toml_str(answers.root_mode)}")
+    if answers.home_base:
+        lines.append(f"home_base = {_toml_str(answers.home_base)}")
+    if answers.clean_home:
+        lines.append(f"clean_home = {_toml_str(answers.clean_home)}")
     # Discovery defaults for every root scalar the loader knows but the wizard
     # did not ask about (or that stays at its default).  ``proxy_jump`` is only
     # meaningful for tunnel transport; deriving it from an empty user for a
@@ -395,12 +407,20 @@ def render_target_block(answers: TargetAnswers) -> str:
             ("proxy_jump", bool(answers.proxy_jump)),
             ("interactive_auth", answers.interactive_auth),
             ("auto_connect", answers.auto_connect),
+            ("root_mode", answers.root_mode != "fakeroot"),
+            ("home_base", bool(answers.home_base)),
+            ("clean_home", bool(answers.clean_home)),
         )
         if present
     }
     # container_user = "ubuntu" mirrors the dial-time resolution
     # (TargetConfig.container_user unset -> "ubuntu").
-    root_entries: list[tuple[str, object]] = [("container_user", "ubuntu")]
+    root_entries: list[tuple[str, object]] = [
+        ("container_user", "ubuntu"),
+        ("root_mode", "fakeroot"),
+        ("home_base", "$HOME/computemcp/home"),
+        ("clean_home", "benchmarks/run-42"),
+    ]
     if not answers.host_key_sha256:
         root_entries.append(("known_hosts", ""))
     # A format-complete placeholder that passes the loader's route host-key

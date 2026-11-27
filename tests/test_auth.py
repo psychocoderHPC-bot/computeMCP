@@ -113,3 +113,45 @@ def test_lookup_single_match_ok():
     auth = make_auth()
     client = auth.authenticate_bearer("Bearer alpaka-token")
     assert client.client_id == "alpaka"
+
+
+def test_client_job_limit_defaults_to_one():
+    auth = make_auth()
+    client = auth.authenticate_bearer("Bearer alpaka-token")
+    assert client.job_limit("hal") == 1
+    assert client.job_limit("unknown-target") == 1
+
+
+def test_client_job_limit_uses_configured_values():
+    auth = Authenticator(
+        {
+            "alpaka": ClientConfig(
+                client_id="alpaka",
+                token_sha256=hash_token("alpaka-token"),
+                targets=("hal", "fwk394"),
+                job_limits={"hal": 0, "fwk394": 3},
+            )
+        }
+    )
+    client = auth.authenticate_bearer("Bearer alpaka-token")
+    assert client.job_limit("hal") == 0
+    assert client.job_limit("fwk394") == 3
+    # An absent key still resolves to the default of one.
+    assert client.job_limit("other") == 1
+
+
+def test_known_client_carries_job_limits():
+    auth = Authenticator(
+        {
+            "admin": ClientConfig(
+                client_id="admin",
+                token_sha256=hash_token("admin-token"),
+                allow_all=True,
+                job_limits={"hal": 2},
+            )
+        }
+    )
+    client = auth.known_client("admin-token")
+    assert client is not None
+    assert client.job_limit("hal") == 2
+    assert client.job_limit("elsewhere") == 1
