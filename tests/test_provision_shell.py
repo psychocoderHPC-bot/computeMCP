@@ -44,6 +44,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -3458,6 +3459,154 @@ def test_detach_and_teardown_never_cancel_and_cancel_is_explicit(
     assert scancel_after[0].get("cancelled") == [int(slurm_id)]
     # Repeated cancel is safe and does not scancel a terminal job again.
     assert _run_provision(env, workdir, "cancel", "creq").returncode == 0
+
+
+def _install_sacct_stub(
+    fake_slurm_env,
+    env: dict,
+    *,
+    job_id: str | None = None,
+    state: str = "",
+    comment: str = "",
+) -> None:
+    """Put a deterministic ``sacct`` on the fake cluster PATH.
+
+    The shipped code only shells out to ``sacct`` as a fallback, so the fake
+    Slurm harness does not model it.  With ``job_id=None`` the stub prints
+    nothing (a purged job); otherwise it prints one allocation row
+    ``JobID|State|Comment`` in the format the helper requests.
+    """
+    stub = fake_slurm_env.bin_dir / "sacct"
+    _write_stub(
+        stub,
+        "#!/usr/bin/env bash\n"
+        'if [ -n "${FAKE_SACCT_JOB_ID:-}" ]; then\n'
+        "  printf '%s|%s|%s\\n' "
+        '"$FAKE_SACCT_JOB_ID" "$FAKE_SACCT_STATE" "$FAKE_SACCT_COMMENT"\n'
+        "fi\n"
+        "exit 0\n",
+    )
+    if job_id is not None:
+        env["FAKE_SACCT_JOB_ID"] = str(job_id)
+        env["FAKE_SACCT_STATE"] = state
+        env["FAKE_SACCT_COMMENT"] = comment
+    else:
+        env.pop("FAKE_SACCT_JOB_ID", None)
+
+
+def test_submit_emits_correlation_comment_and_recovers_lost_id(
+    tmp_path, stubs, fake_slurm_env
+):
+    """submit persists and emits a --comment token; observe recovers a lost id.
+
+    The audit's crash window is between sbatch acceptance and
+    ``state/jobid`` persistence.  The token is written before sbatch, so
+    removing the id file (the crash) still lets observe find the job through
+    the scheduler comment.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "corrflow", job_id="corr"
+    )
+    jobdir = _job_dir(storage, "corrflow", "corr")
+
+    submit = _run_provision(env, workdir, "submit", "corr")
+    assert submit.returncode == 0, submit.stderr
+    token = (jobdir / "correlation_token").read_text().strip()
+    assert re.fullmatch(r"[A-Za-z0-9._:-]+", token), token
+    assert f"CORRELATION_TOKEN {token}" in submit.stdout, submit.stdout
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    sbatch_records = [
+        record for record in _fake_records(fake_slurm_env)
+        if record["command"] == "sbatch"
+    ]
+    assert len(sbatch_records) == 1, sbatch_records
+    assert sbatch_records[0]["comment"] == token, sbatch_records[0]
+    assert f"--comment={token}" in sbatch_records[0]["argv"], sbatch_records[0]
+
+    assert fake_slurm_env.run("slurmctl", "start-job", slurm_id).returncode == 0
+    # Simulate the crash: the numeric id was never persisted.
+    (jobdir / "jobid").unlink()
+    _install_sacct_stub(
+        fake_slurm_env, env, job_id=slurm_id, state="RUNNING", comment=token
+    )
+
+    recovered = _run_provision(env, workdir, "observe", "corr")
+    assert recovered.returncode == 0, recovered.stderr
+    assert f"SLURM_JOB_ID {slurm_id}" in recovered.stdout, recovered.stdout
+    assert "STATE starting" in recovered.stdout, recovered.stdout
+    # Recovery must re-persist the id for the next call.
+    assert (jobdir / "jobid").read_text().strip() == slurm_id
+
+
+def test_attach_recovers_lost_id_then_reports_terminal(
+    tmp_path, stubs, fake_slurm_env
+):
+    """attach also recovers by token and never starts a relay for a dead job."""
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "attachrec", job_id="arec"
+    )
+    jobdir = _job_dir(storage, "attachrec", "arec")
+    submit = _run_provision(env, workdir, "submit", "arec")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+    token = (jobdir / "correlation_token").read_text().strip()
+    assert fake_slurm_env.run(
+        "slurmctl", "set-state", slurm_id, "COMPLETED"
+    ).returncode == 0
+    (jobdir / "jobid").unlink()
+    _install_sacct_stub(
+        fake_slurm_env, env, job_id=slurm_id, state="COMPLETED", comment=token
+    )
+
+    attach = _run_provision(env, workdir, "attach", "arec")
+    assert attach.returncode != 0, attach.stdout
+    assert "terminal" in attach.stderr.lower(), attach.stderr
+    assert (jobdir / "jobid").read_text().strip() == slurm_id
+    assert not (jobdir / "relay.ready").exists()
+    assert not (jobdir / "relay.pid").exists()
+
+
+def test_observe_maps_every_terminal_state_and_purged_id(
+    tmp_path, stubs, fake_slurm_env
+):
+    """Every real terminal state, plus a purged id, reports terminal.
+
+    A terminal mapping that misses a state (PREEMPTED, a timeout) leaves the
+    gateway quota slot stuck, so all of them are asserted explicitly.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "termflow", job_id="term"
+    )
+    jobdir = _job_dir(storage, "termflow", "term")
+    submit = _run_provision(env, workdir, "submit", "term")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    for native in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL"):
+        assert fake_slurm_env.run(
+            "slurmctl", "set-state", slurm_id, native
+        ).returncode == 0, native
+        observed = _run_provision(env, workdir, "observe", "term")
+        assert observed.returncode == 0, (native, observed.stderr)
+        assert "STATE terminal" in observed.stdout, (native, observed.stdout)
+
+    # PREEMPTED is a real Slurm state the fake controller does not model, so
+    # inject it into the queue directly.
+    queue = json.loads(fake_slurm_env.queue_path.read_text(encoding="utf-8"))
+    queue["jobs"][slurm_id]["state"] = "PREEMPTED"
+    fake_slurm_env.queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    observed = _run_provision(env, workdir, "observe", "term")
+    assert "STATE terminal" in observed.stdout, observed.stdout
+
+    # Purged: neither squeue nor sacct knows the id any more.
+    queue = json.loads(fake_slurm_env.queue_path.read_text(encoding="utf-8"))
+    del queue["jobs"][slurm_id]
+    fake_slurm_env.queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    _install_sacct_stub(fake_slurm_env, env)
+    observed = _run_provision(env, workdir, "observe", "term")
+    assert observed.returncode == 0, observed.stderr
+    assert "STATE terminal" in observed.stdout, observed.stdout
 
 
 def _apptainer_stub(bin_dir: Path, log: Path, banner: Path) -> None:

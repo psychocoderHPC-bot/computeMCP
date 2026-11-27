@@ -16,6 +16,7 @@ and starts the container directly on the route node.
 | `computemcp-container.sh` | Runtime dispatcher for `apptainer` and `docker` |
 | `computemcp-job.sh` | Batch script that runs on the compute node and keeps the allocation alive |
 | `computemcp-relay.py` | Loopback relay that carries SSH over `srun` steps |
+| `computemcp-mux.py` | Login-node multiplexer for the single-channel proxy; dials the relay registered for a `job_id` |
 
 The gateway ships this bundle as package data and can deploy it for you: a
 `[targets.X.bundle]` block in the gateway config makes the gateway upload the
@@ -28,7 +29,7 @@ Set `auto-deploy = false` to pin the copy already on the login node.
 `deploy-dir` is optional and defaults to `<container.storage-root>/bundle`.  It
 must be on storage visible to the login node and to the compute nodes: the batch
 step runs `computemcp-job.sh` and `computemcp-container.sh` there, so a per-node
-`/tmp` breaks multi-node and most batch setups.  Place the four code files side
+`/tmp` breaks multi-node and most batch setups.  Place the five code files side
 by side only when you manage deployment by hand (the manual
 `provision_command`/`close_command` path).  No site name, account, partition,
 image, or path is hardcoded either way.
@@ -182,12 +183,19 @@ the shared home, so `COMPUTEMCP_CLEAN_HOME` on a shared job is rejected.
 
 * `submit` builds/configures the container when needed, calls
   `sbatch --parsable`, persists the numeric id and cluster immediately, and
-  returns.  It never waits in the queue and never starts a relay.
+  returns.  It never waits in the queue and never starts a relay.  Before
+  `sbatch` it persists a correlation token (from `COMPUTEMCP_CORRELATION_TOKEN`
+  or generated) and passes it as `--comment=<token>`, so a crash between
+  acceptance and id persistence is recoverable.
 * `observe` reads `squeue` and the job's readiness file and prints
-  `STATE pending|starting|ready|terminal` without blocking.
+  `STATE pending|starting|ready|terminal` without blocking.  It falls back to
+  `sacct` when `squeue` no longer shows the id; a purged or unknown id is
+  `terminal` so a quota slot cannot stick.
 * `attach` polls until the job publishes readiness, starts (or reuses) this
   job's login-node relay, verifies the endpoint and prints
-  `ENDPOINT 127.0.0.1:<port>`.
+  `ENDPOINT 127.0.0.1:<port>`.  If the persisted id was lost, `observe`,
+  `attach` and `cancel` recover it from the token via `squeue`/`sacct`
+  comments before doing anything else.
 * `cancel` runs an explicit `scancel` for the tracked job and stops its relay.
 * `detach` / `teardown` stop only the relay.  They never call `scancel`; the
   Slurm job and its durable files keep running.
@@ -225,8 +233,8 @@ writes are preserved from the reference scripts.
 ## SBATCH and SRUN argument transport
 
 The helper parses `COMPUTEMCP_SBATCH_ARGS` into `SBATCH_ARGS` and appends only
-protocol options it owns (`--parsable`, `--job-name`, and output/error when the
-deck has none).  It submits with:
+protocol options it owns (`--parsable`, `--job-name`, `--comment=<correlation
+token>`, and output/error when the deck has none).  It submits with:
 
 ```bash
 sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS"

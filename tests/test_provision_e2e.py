@@ -318,6 +318,15 @@ def test_submit_observe_and_cancel_stages(tmp_path, stubs, fake_slurm_env):
     assert submit.returncode == 0, (submit.returncode, submit.stderr)
     assert "STATE pending" in submit.stdout, submit.stdout
     slurm_id = (jobdir / "jobid").read_text().strip()
+    # The submit must carry the persisted correlation comment so a lost id is
+    # recoverable from the scheduler record.
+    token = (jobdir / "correlation_token").read_text().strip()
+    sbatch_records = [
+        record for record in _fake_records(fake_slurm_env)
+        if record["command"] == "sbatch"
+    ]
+    assert sbatch_records and sbatch_records[-1]["comment"] == token, sbatch_records
+    assert f"--comment={token}" in sbatch_records[-1]["argv"], sbatch_records[-1]
 
     observe = _run_provision(env, workdir, "observe", "e2e")
     assert observe.returncode == 0, observe.stderr
