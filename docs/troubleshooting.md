@@ -46,6 +46,29 @@ Before changing anything, read the state:
 | MCP tools fail with `COMPUTEMCP_GATEWAY is not set` / `COMPUTEMCP_TOKEN is not set` / `invalid token` | `COMPUTEMCP_GATEWAY`/`COMPUTEMCP_TOKEN` are missing from the MCP process environment, or a stale/rotated token | Re-run the handshake (or set the token per project); after a rotation, `reload` the gateway. A running agent does not see later `export`s, so paste the `environment` block into the MCP entry or start the agent from a fresh shell; see operations.md, "MCP bridge setup in the agent container" |
 | `pipx install .` fails with a permission error in a fresh Terok container | `~/.local` is owned by root in Terok containers | `sudo chown -R dev:dev ~/.local` once |
 
+## Multi-job Slurm targets
+
+These symptoms apply to a target with both `[targets.X.slurm]` and
+`[targets.X.bundle]`, where the route and the jobs are separate.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `target-open` succeeds but an exec or file call returns `job not found` or `job ... is not ready` | The route is open. `job not found` means no shared job exists. `is not ready` means the shared job is pending, starting, stopping, or terminal. Route state and job state are independent | Start or reuse the shared job with `target-shared <t>`, or submit a private job and address it by `job_id`. Then `job-list` and `job-wait` |
+| `target-connect` returns `pending` and container SSH is not yet available | On a multi-job Slurm target, connect means open the route and get or create the shared job. A queued Slurm job can stay pending for hours | Keep the `job_id` and call `job-wait <job_id>`. Do not submit again or repeat connect in a loop |
+| `job-wait` times out | The timeout is a wait bound, not a job failure. The Slurm job stays intact | Call `job-wait` again, or `job-status`, with the same `job_id` |
+| `target-stop` or `target-refresh` did not cancel a job | Both detach the route on a multi-job target. Cancellation is a separate job operation | Call `job-stop <job_id>` |
+| A private submit is rejected with a quota error | The client reached its per-target private-job limit. Pending and uncertain jobs count | Wait for a job to finish, stop one with `job-stop`, or ask the operator to raise `job_limits`. The shared job consumes no slot |
+| `target-shared` returns the existing `job_id` with `settings_conflict` | The active shared job has different settings. The gateway never replaces it automatically | Use the existing shared job, or ask an operator to stop it and start a new one |
+| A job stays `submission_unknown` | `sbatch` may have been accepted, but the gateway lost the acknowledgement. The record keeps its quota slot | Run `target-open <t>` to reconcile by correlation token and persisted scheduler id. Do not resubmit the same request. If `squeue` still shows nothing, the operator must decide |
+| A stale shared `job_id` reports `terminal` or `job not found` | The shared job terminated, and a replacement has a new `job_id`. A stale id never selects the replacement | Re-run `target-shared <t>` (or `job-list`) and use the current shared id |
+| A private job belongs to another client | Job ids are owner-scoped. A foreign id and an unknown id return the same error | Use your own `job_id`, or the shared job. An operator token can see owners |
+| The dry-run prints `-` for `root_mode`, `home`, `shared_reuse`, `settings_conflict`, or `quota_available` | The gateway preview route does not return these fields yet | Use the input flags you intend to submit, and check quota or the shared job with `job-list` and `job-status` |
+| `multi-node not yet supported` | The shipped helper still rejects `nodes > 1` before `sbatch` | Keep `nodes = 1` for a single job. Independent private jobs are separate submissions, not a multi-node container |
+
+`target-open` and `target-connect` may require `--2fa` on an
+`interactive_auth` target. A dry-run never prompts. A refresh reuses a live
+login connection without a new factor.
+
 ## HPC / dynamic nodes
 
 On an HPC system the login node is fixed, but the development container runs in
@@ -65,9 +88,11 @@ Troubleshooting a dynamic target:
   fine) is the only contract.
 - **Stale endpoint after a node recycle**: the allocation was recycled or lost
   a node, or a Docker daemon restart re-published the container on a new
-  ephemeral host port. `target-refresh <t>` re-runs provisioning, follows the
-  new node/port, and refreshes the recorded endpoint. On a recreate, also fix
-  the stale `host_key_sha256`.
+  ephemeral host port. On the legacy single-allocation path, `target-refresh
+  <t>` re-runs provisioning, follows the new node/port, and refreshes the
+  recorded endpoint. On a multi-job target, refresh reopens the route and
+  leaves jobs alone; use `job-status` and `job-stop`, then submit again if the
+  job itself is gone. On a recreate, also fix the stale `host_key_sha256`.
 - **Relayed port moved**: the shipped bundle persists the concrete relay port;
   a reconnect against the same state directory reuses it while the tracked
   relay is still running. A `stop`/`close` removes the relay state, so a fresh

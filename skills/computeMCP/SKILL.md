@@ -1,6 +1,6 @@
 ---
 name: computeMCP
-description: Use the Terok `compute` MCP to work on remote development/compute containers. Covers discovering available systems, running commands, persistent parallel PTY sessions, and transferring files. Trigger on remote compute, remote build/test/debug, run on another machine, GPU job, parallel remote sessions, copy files to/from a remote system, offline install without internet, computeMCP_targets, computeMCP_exec, computeMCP_session_*, computeMCP_file_*.
+description: Use the Terok `compute` MCP to work on remote development/compute containers. Covers discovering available systems, running commands, persistent parallel PTY sessions, durable shared and private Slurm jobs, and transferring files. Trigger on remote compute, remote build/test/debug, run on another machine, GPU job, Slurm job list/wait/stop, multiple jobs, parallel remote sessions, copy files to/from a remote system, offline install without internet, computeMCP_targets, computeMCP_exec, computeMCP_job_*, computeMCP_session_*, computeMCP_file_*.
 ---
 
 # computeMCP
@@ -151,6 +151,67 @@ On approval the token is written to `~/.bashrc`, but the running agent will not
 see it until restarted (tmux keeps its old environment) — the command prints an
 `environment` block to paste into the MCP config. Never attempt to bypass the
 gateway while waiting.
+
+## 1.1 Choose the job
+
+Some Slurm targets expose jobs instead of one fixed container. The gateway
+reports route state and job state separately. A `computeMCP_job_start` result
+for `kind="shared"` carries `route`, `route_state`, `job`, and `job_state`. A
+route can be `connected` while the shared job is `pending`, and `RUNNING` from
+the scheduler does not prove that the container sshd answers. A job becomes
+`ready` only after the gateway verifies its endpoint.
+
+Job states: `submitting`, `pending`, `starting`, `ready`, `stopping`,
+`terminal`, `submission_unknown`.
+
+Tools:
+
+```
+computeMCP_job_start(target, kind="private"|"shared", overrides?, root_mode?, clean_home?, request_id?)
+computeMCP_job_list(target?)                  # own private jobs + each shared job
+computeMCP_job_status(job_id)                 # state, slurm_job_id, root_mode, home, base_digest, node
+computeMCP_job_wait(job_id, timeout=30.0)     # wait for ready or terminal
+computeMCP_job_stop(job_id)                   # cancel, safe to repeat
+```
+
+Rules:
+
+- `kind="shared"` gets or creates the target's one shared job. Any authorized
+  client may start it. If the active shared job has different settings, the
+  result carries `settings_conflict` and the existing `job_id`; the gateway
+  does not replace it.
+- `kind="private"` submits a private Slurm job owned by your client and
+  consumes one quota slot. It is rejected on a non-Slurm Docker target.
+- A successful submit can return `pending`. Keep the `job_id` and call
+  `computeMCP_job_wait` with the same id. Do not submit again because the job
+  is queued.
+- A `job_wait` timeout is not a failure. The Slurm job stays intact; wait
+  again.
+- Omit `job_id` on `computeMCP_exec`, `computeMCP_session_*`, and every
+  `computeMCP_file_*` call to use the target's **current shared job only**.
+  With no shared job, the call fails with `job not found`. With a shared job
+  that is still pending, it fails with `job ... is not ready`.
+- Pass `job_id` explicitly for a private job or for a specific shared job.
+  Omitting it never selects your only private job.
+- `computeMCP_job_list` and `computeMCP_job_status` show your private jobs and
+  the shared job. A foreign job id and an unknown id return the same
+  `job not found` error.
+- Only an operator may stop the shared job. You can stop your own private
+  jobs.
+- There is no MCP dry-run at this revision. Inspect quota with
+  `computeMCP_job_list`/`computeMCP_job_status` before submitting. The
+  operator CLI has `--dry-run`.
+
+On a non-Slurm Docker target there are no jobs. The shared container stays the
+default, so plain calls work without a `job_id`:
+
+```
+computeMCP_exec(target="hal", command="nvidia-smi")
+computeMCP_file_upload(target="hal", local_path="/tmp/run.sh", remote_path="/work/run.sh")
+```
+
+`computeMCP_job_start(target="hal", kind="shared")` returns
+`target does not use Slurm jobs`.
 
 ## 2. Run a command
 
@@ -328,25 +389,30 @@ target `pip install --no-index --find-links DIR --target pylibs tabulate` and
 | --- | --- |
 | `computeMCP_targets()` | List available systems + `sharing`/`node_info`/`agent` (do this first) |
 | `computeMCP_status(target)` | State/route/clients/`sharing`/`node_info`/`agent`/errors for one system |
-| `computeMCP_exec(target, command, cwd?, timeout?, env?, stdin?)` | Short non-interactive command |
-| `computeMCP_session_create(target, cwd?, columns?, rows?)` | New PTY session |
-| `computeMCP_session_write(session_id, data)` | Send input to a session |
-| `computeMCP_session_read(session_id, max_bytes?, wait?)` | Read+clear output; `wait` blocks for new output |
-| `computeMCP_session_resize(session_id, columns, rows)` | Resize terminal |
-| `computeMCP_session_close(session_id)` | Close session (kills remote process) |
-| `computeMCP_sessions(target?)` | List your sessions |
-| `computeMCP_file_read(target, path)` | Read text file |
-| `computeMCP_file_read_base64(target, path)` | Read binary file |
-| `computeMCP_file_write(target, path, content, encoding?)` | Write text/base64 |
-| `computeMCP_file_upload(target, local_path, remote_path, append?, parents?, recursive?)` | Stream upload (file or dir) |
-| `computeMCP_file_upload_tree(target, local_path, remote_path, skip_existing?, include?, exclude?)` | Recursive incremental upload |
-| `computeMCP_file_download(target, remote_path, local_path, recursive?)` | Stream download (file or dir) |
-| `computeMCP_file_chmod(target, path, mode)` | Change permissions |
-| `computeMCP_file_list(target, path)` | List directory |
-| `computeMCP_file_stat(target, path)` | Stat a path |
-| `computeMCP_file_mkdir(target, path)` | Create directory (+parents) |
-| `computeMCP_file_remove(target, path)` | Remove file/dir |
-| `computeMCP_file_rename(target, source, destination)` | Rename/move |
+| `computeMCP_exec(target, command, cwd?, timeout?, env?, stdin?, job_id?)` | Short non-interactive command |
+| `computeMCP_job_start(target, kind?, overrides?, root_mode?, clean_home?, request_id?)` | Start the shared job or submit a private Slurm job |
+| `computeMCP_job_list(target?)` | List your private jobs plus shared jobs |
+| `computeMCP_job_status(job_id)` | One job's state and effective settings |
+| `computeMCP_job_wait(job_id, timeout?)` | Wait for ready or terminal; leaves the job intact |
+| `computeMCP_job_stop(job_id)` | Cancel one job (operator-only for the shared job) |
+| `computeMCP_session_create(target, cwd?, columns?, rows?, job_id?)` | New PTY session |
+| `computeMCP_session_write(session_id, data, job_id?)` | Send input to a session |
+| `computeMCP_session_read(session_id, max_bytes?, wait?, job_id?)` | Read+clear output; `wait` blocks for new output |
+| `computeMCP_session_resize(session_id, columns, rows, job_id?)` | Resize terminal |
+| `computeMCP_session_close(session_id, job_id?)` | Close session (kills remote process) |
+| `computeMCP_sessions(target?, job_id?)` | List your sessions |
+| `computeMCP_file_read(target, path, job_id?)` | Read text file |
+| `computeMCP_file_read_base64(target, path, job_id?)` | Read binary file |
+| `computeMCP_file_write(target, path, content, encoding?, job_id?)` | Write text/base64 |
+| `computeMCP_file_upload(target, local_path, remote_path, append?, parents?, recursive?, job_id?)` | Stream upload (file or dir) |
+| `computeMCP_file_upload_tree(target, local_path, remote_path, skip_existing?, include?, exclude?, job_id?)` | Recursive incremental upload |
+| `computeMCP_file_download(target, remote_path, local_path, recursive?, job_id?)` | Stream download (file or dir) |
+| `computeMCP_file_chmod(target, path, mode, job_id?)` | Change permissions |
+| `computeMCP_file_list(target, path, job_id?)` | List directory |
+| `computeMCP_file_stat(target, path, job_id?)` | Stat a path |
+| `computeMCP_file_mkdir(target, path, job_id?)` | Create directory (+parents) |
+| `computeMCP_file_remove(target, path, job_id?)` | Remove file/dir |
+| `computeMCP_file_rename(target, source, destination, job_id?)` | Rename/move |
 
 ## 6. Workflow example (remote build + test on a GPU system)
 
@@ -372,6 +438,56 @@ computeMCP_file_download(target="myTargetHost", remote_path="/work/alpaka/build/
 computeMCP_session_close(sid)
 ```
 
+## 6.1 Two-job Slurm example
+
+Run two independent benchmarks side by side and keep their job ids apart:
+
+```
+# 1. Inspect the target. The route may be open before any job is ready.
+computeMCP_status("frontier")
+
+# 2. Submit two private jobs with different clean homes. Both may stay pending.
+a = computeMCP_job_start(
+    target="frontier", kind="private",
+    overrides={"gpus-per-node": 1},
+    root_mode="clean", clean_home="/benchmarks/run-42",
+)
+b = computeMCP_job_start(
+    target="frontier", kind="private",
+    overrides={"gpus-per-node": 1},
+    root_mode="clean", clean_home="/benchmarks/run-43",
+)
+a_id, b_id = a["job_id"], b["job_id"]
+
+# 3. Wait without resubmitting. A timeout leaves both jobs intact.
+computeMCP_job_wait(a_id, timeout=3600)
+computeMCP_job_wait(b_id, timeout=3600)
+computeMCP_job_list(target="frontier")
+
+# 4. Address each job explicitly on exec, sessions, and transfers.
+computeMCP_exec(target="frontier", job_id=a_id, command="nvidia-smi")
+computeMCP_file_upload(
+    target="frontier", job_id=b_id,
+    local_path="/tmp/bench.tar.gz", remote_path="/bench/bench.tar.gz",
+)
+
+# 5. Stop your own job. The other job keeps running.
+computeMCP_job_stop(a_id)
+```
+
+An unqualified call such as `computeMCP_exec(target="frontier", command="hostname")`
+would address the target's shared job, not `a_id` or `b_id`. That is why the
+`job_id` is passed on every call that must reach a private job.
+
+To reuse one environment across two jobs, start the shared job once and omit
+`job_id`:
+
+```
+shared = computeMCP_job_start(target="frontier", kind="shared")
+computeMCP_exec(target="frontier", command="hostname")
+computeMCP_exec(target="frontier", job_id=shared["job_id"], command="nvidia-smi")
+```
+
 ## 7. Rules
 
 - Read this skill before the first `computeMCP_*` call; loading is mandatory
@@ -381,6 +497,13 @@ computeMCP_session_close(sid)
   not on the host and not on the gateway.
 - Use `computeMCP_exec` for short commands; sessions for anything long-running.
 - Use multiple sessions on the same target for parallelism.
+- On a job-enabled Slurm target, keep every `job_id`. Omit `job_id` only for
+  the current shared job.
+- A pending job is not a failure. Wait with `computeMCP_job_wait`; never
+  resubmit to make a queued job start sooner.
+- Stop only your own private jobs. Only an operator may stop the shared job.
+- Check route state and job state separately. A connected route can still have
+  no ready job.
 - Use `computeMCP_file_upload`/`computeMCP_file_download` for large or binary files.
 - Check egress before installing. If the target has internet, install there
   directly. Only when it does not, download the dependencies in this container,

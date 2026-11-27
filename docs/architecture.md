@@ -70,7 +70,9 @@ name a configured target, and an arbitrary SSH hostname is never accepted.
 | `src/compute_mcp/ssh_backend.py` | AsyncSSH: exec, PTY sessions, SFTP, and host-key pinning |
 | `src/compute_mcp/sessions.py` | Persistent PTY session manager (bounded buffers, quotas) |
 | `src/compute_mcp/files.py` | SFTP file operations |
-| `src/compute_mcp/gateway.py` | State machine, HTTP API, interactive console, and the provisioner environment contract |
+| `src/compute_mcp/gateway.py` | Route state machine, HTTP API, interactive console, job wiring, and the provisioner environment contract |
+| `src/compute_mcp/jobs.py` | Durable job registry, quota reservations, state graph, and crash reconciliation |
+| `src/compute_mcp/mux.py` | Gateway-side frame codec and stream multiplexer for the single outer channel |
 | `src/compute_mcp/enrollment.py` | Unauthenticated request queue and operator approval |
 | `src/compute_mcp/setup.py` | Interactive `--bootstrap` / `--add-target` configuration wizard |
 | `src/compute_mcp/handshake.py` | `computeMCP-handshake`: request access from inside a container |
@@ -126,6 +128,127 @@ in which case the SSH config decides). `container_user` (default `ubuntu`) is
 the account the gateway logs into **inside the development container**; a
 mismatch is the usual cause of a target that connects but fails every
 `exec`/file call with `502`.
+
+## Route state and job state
+
+A durable multi-job target separates two state machines that the legacy
+single-container path merged.
+
+- **Route state** belongs to the target runtime. It records whether the
+  gateway has an authenticated SSH connection to the configured login host,
+  which alias answered, the route epoch, and the last route error. Opening the
+  route never submits a Slurm job and never starts a container.
+- **Job state** belongs to one durable job record. It records the computeMCP
+  `job_id`, the native `slurm_job_id`, the owner client, the kind (shared or
+  private), the requested settings, the scheduler state, and the endpoint once
+  the container reports ready.
+
+The gateway treats these independently. A lost route changes route state and
+leaves job records intact. A scheduler state of `RUNNING` proves the allocation
+exists; it does not prove that the container sshd answers. A job becomes `ready`
+only after the helper publishes a verified endpoint.
+
+At this revision the durable multi-job path applies to a target that has both
+a `[targets.X.slurm]` block and a `[targets.X.bundle]` block. A target without
+the bundle keeps the legacy single-allocation connect path. Non-Slurm Docker
+targets keep their existing shared-container transport.
+
+Job states are `submitting`, `pending`, `starting`, `ready`, `stopping`,
+`terminal`, and `submission_unknown`. The native Slurm state is kept in
+`scheduler_state`. A job that Slurm queues for hours stays `pending`; computeMCP
+imposes no queue deadline.
+
+## One outer channel and the mux
+
+Multi-job Slurm targets run over one authenticated SSH route connection per
+target and at most one persistent outer session channel. The gateway starts the
+shipped `computemcp-mux.py` helper as a user process on the login node over that
+channel, with binary stdin and stdout, no PTY, and separately drained stderr.
+
+The gateway and helper speak one bounded length-prefixed protocol. Each frame
+has a 12-byte header: version, type, flags, stream id, and payload length.
+Stream zero carries control messages as small JSON payloads. Non-zero streams
+carry raw `DATA` frames. Flow control is credit based per stream, and `EOF` is
+ordered after queued data.
+
+For each `OPEN(job_id)`, the helper reads its loopback relay registry, dials the
+relay registered for that job, and pumps opaque container SSH bytes. The gateway
+keeps the container SSH key and host-key verification. A slow job stream cannot
+stall control messages or another job because the mux schedules streams and
+bounds every buffer.
+
+The gateway keys its inner SSH cache, locks, and cleanup by job identity and
+endpoint generation. Stopping job B never detaches job A's cached connection.
+The registry maps a `job_id` to a loopback relay endpoint and is rewritten when
+a job becomes ready or is cancelled. Relay ports stay internal to the gateway
+and helper.
+
+## Shared and private jobs
+
+A target has at most one active shared job. Any authorized client may start it
+with `target-shared`; concurrent calls converge on the same `job_id`, including
+while the job is pending. The shared job belongs to the target, consumes no
+client quota, and always uses the shared home. Only an operator may stop or
+replace it. A request whose settings differ from the active shared job returns
+the existing `job_id` with a settings conflict; the gateway never replaces the
+job as a side effect.
+
+A private job belongs to the authenticated client that submitted it. It
+consumes one quota slot from the moment the gateway reserves the slot, before
+`sbatch`, until a definitive submission failure or a scheduler-confirmed
+terminal state. A client sees its own private jobs and each target's shared
+job. A foreign job id and an unknown job id return the same public error.
+
+Exec, PTY, and file operations with no `job_id` address the target's current
+shared job only. They never fall back to the caller's single private job. An
+explicit `job_id` addresses that job after target and ownership checks.
+
+## Durable job state
+
+Job records live under the gateway state root, normally
+`$COMPUTEMCP_STATE_DIR` or `<config-dir>/state`, in `jobs/<job_id>/`. Each
+record holds the job identity, owner, request id and effective parameters, the
+scheduler id and cluster, the resolved root mode and home, the ready node and
+endpoint generation, and the terminal or uncertain reason.
+
+Writes are atomic: a temp file, `fsync`, `os.replace`, and a directory `fsync`.
+A crash leaves the previous or the next complete record. Shared-job creation
+serializes get-or-create under a target-level lock. Quota reservations take a
+client/target transaction and re-read durable records under a cross-process
+lock, so concurrent reservations cannot both consume the last slot.
+
+## Detach versus cancel
+
+Gateway shutdown, route loss, a target stop, and a route refresh detach a Slurm
+target. Detach closes the route, the job-keyed SSH connections, and the PTY
+sessions, and it never sends `scancel`. The jobs keep running or stay queued.
+
+On the multi-job path, only an explicit `job-stop` (or the admin `job-cancel`
+console verb) calls `scancel`. Cancellation accepts pending, starting, and
+ready jobs, and repeated requests are safe. Stopping one job closes only that
+job's PTY, SFTP, and cached SSH resources.
+
+The non-Slurm path keeps its older behavior: an explicit target stop runs
+`close_command` and releases the remote allocation.
+
+## Gateway restart and reconciliation
+
+A gateway restart rebuilds the job manager from disk and reconciles before it
+accepts new submissions. Reconciliation never calls `sbatch`.
+
+- A record that already has a scheduler id is queried with `squeue`.
+- A record without a scheduler id is looked up by its persisted correlation
+  token, which the gateway passes to `sbatch` as a job comment.
+- A recovered scheduler id moves `submitting` or `submission_unknown` to
+  `pending` and keeps the quota slot.
+- An ambiguous submission stays `submission_unknown` and keeps its slot. The
+  gateway never resubmits it automatically.
+- A missing `squeue` entry alone does not prove that a submission failed.
+
+After the restart, `target-open` restores the shared-job view and `job-list`
+returns the surviving private jobs under their original computeMCP ids. The
+job record keeps its scheduler id and endpoint generation, so a connection
+built on one route is not handed out for another.
 
 ## The gateway to provisioner contract (summary)
 

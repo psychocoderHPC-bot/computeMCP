@@ -233,6 +233,61 @@ See [docs/operations.md](docs/operations.md) for the `target-connect` /
 precedence, the enrollment lifecycle, and the MCP bridge setup inside an
 agent container.
 
+## Multi-job Slurm targets
+
+A target with both a `[targets.X.slurm]` block and a `[targets.X.bundle]` block
+runs the durable multi-job path. The gateway keeps the login route separate
+from the jobs. Opening the route never submits a Slurm job and never starts a
+container.
+
+```bash
+computeMCP-gatewayctl target-open frontier --2fa     # route only, reconcile jobs
+computeMCP-gatewayctl target-shared frontier         # target-wide shared job
+computeMCP-gatewayctl target-sbatch frontier \
+    --root-mode clean --clean-home /benchmarks/run-42   # private job
+computeMCP-gatewayctl job-list --target frontier
+computeMCP-gatewayctl job-wait job-<id> --timeout 3600
+computeMCP-gatewayctl job-stop job-<id>              # explicit cancel
+```
+
+- `target-connect` composes `target-open` and `target-shared`. On a multi-job
+  Slurm target it can return `pending`; it does not promise container SSH is
+  ready.
+- `target-stop`, `target-refresh`, gateway shutdown, and route loss detach the
+  route and leave Slurm jobs alone. Only `job-stop` calls `scancel`.
+- A private job consumes one per-client, per-target quota slot. The default is
+  one. `job_limits = { frontier = 2, juwels = 0 }` raises or disables it. The
+  shared job consumes no slot.
+- Jobs survive a gateway restart. `target-open` reconciles them, and
+  `job-list` shows the survivors under their original computeMCP ids. A job
+  whose submission acknowledgement was lost stays `submission_unknown` and is
+  never resubmitted automatically.
+- Slurm jobs travel over one authenticated route connection and one mux stream
+  per job. A slow or pending job cannot stall control messages or another job.
+
+Agent tools: `computeMCP_job_start`, `computeMCP_job_list`,
+`computeMCP_job_status`, `computeMCP_job_wait`, and `computeMCP_job_stop`.
+Exec, PTY, and file tools accept an optional `job_id`. With no `job_id` they
+address the target's current shared job only.
+
+See [docs/architecture.md](docs/architecture.md) for the route/job state split
+and the mux, [docs/operations.md](docs/operations.md) for the operator
+workflow, quotas, and reconciliation, and
+[docs/configuration.md](docs/configuration.md) for `job_limits`, `root_mode`,
+`home_base`, `clean_home`, and the mapping precedence.
+
+### Compatibility changes
+
+- On a durable multi-job Slurm target, `auto_connect = true` opens the route
+  only. It never starts a shared container or submits a job.
+- On a durable multi-job Slurm target, a successful `target-connect` may return
+  `pending`. It no longer promises that container SSH is immediately
+  available.
+- On a durable multi-job Slurm target, gateway shutdown, `target-stop`, and
+  `target-refresh` detach jobs instead of cancelling them.
+- The `sbatch` stage emits implicit defaults for calculated fields when no
+  mapping names them.
+
 ## Host-key verification
 
 The wizard above starts the container with `host_key_check = "off"`, the
