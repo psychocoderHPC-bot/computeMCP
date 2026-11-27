@@ -514,3 +514,173 @@ async def test_shutdown_never_scancels(tmp_path):
         record["slurm_job_id"]
     )
     assert any(r.kind == "shared" for r in gw.job_store.scan())
+
+
+# ---------------------------------------------------------------------------
+# K. token-based reconciliation of an accepted-but-unrecorded submission
+# ---------------------------------------------------------------------------
+class TokenRunner:
+    """Stage runner whose observe-with-token result is programmable."""
+
+    def __init__(self, observe):
+        self.observe = observe
+        self.calls = []
+
+    async def __call__(self, connection, command, *, env=None, timeout=None):
+        action = command.rsplit(" ", 1)[-1]
+        self.calls.append(
+            {
+                "action": action,
+                "command": command,
+                "env": dict(env or {}),
+                "timeout": timeout,
+            }
+        )
+        if action != "observe":
+            return (0, "", "")
+        result = self.observe
+        if isinstance(result, BaseException):
+            raise result
+        if callable(result):
+            return result(dict(env or {}))
+        return (0, result, "")
+
+
+class TokenCrashProvisioner(FakeProvisioner):
+    """Accepts the allocation, then loses the reply before the id is persisted."""
+
+    def __init__(self, *, recovered="55555", miss_times=0):
+        super().__init__()
+        self.recovered = recovered
+        self.miss_times = miss_times
+        self.token_calls = 0
+        self.submitted_tokens = []
+
+    async def submit(self, record):
+        self.submit_calls += 1
+        self.submitted_tokens.append(record.correlation_token)
+        raise RuntimeError("connection reset after sbatch accepted")
+
+    async def observe(self, job):
+        return "PENDING"
+
+    async def find_by_token(self, token):
+        self.token_calls += 1
+        if self.token_calls <= self.miss_times:
+            return None
+        if token in self.submitted_tokens:
+            return self.recovered
+        return None
+
+
+class CountingProvisioner(FakeProvisioner):
+    def __init__(self):
+        super().__init__()
+        self.token_calls = 0
+
+    async def find_by_token(self, token):
+        self.token_calls += 1
+        return None
+
+
+async def test_bundle_find_by_token_observe_contract(tmp_path):
+    target = _target()
+    gw = Gateway(
+        _config({"frontier": target}),
+        state_root=tmp_path / "state",
+        provisioner=FakeProvisioner(),
+    )
+    runner = TokenRunner("SLURM_JOB_ID 4242\nSTATE pending\n")
+    adapter = BundleStageProvisioner(
+        gw,
+        target,
+        run=runner,
+        deploy_dir="/tmp/cmcp",
+        connection=object(),
+    )
+
+    assert await adapter.find_by_token("cmcp-token-1") == "4242"
+    call = runner.calls[-1]
+    assert call["command"] == "bash /tmp/cmcp/computemcp-provision.sh observe"
+    assert call["env"]["COMPUTEMCP_CORRELATION_TOKEN"] == "cmcp-token-1"
+    # The lookup is keyed by token, not by a job/slurm id.
+    assert "COMPUTEMCP_JOB_ID" not in call["env"]
+    assert call["timeout"] is not None and call["timeout"] <= 30
+
+    runner.observe = ""
+    assert await adapter.find_by_token("cmcp-token-1") is None
+
+    runner.observe = "SLURM_JOB_ID not-a-number\n"
+    assert await adapter.find_by_token("cmcp-token-1") is None
+
+    runner.observe = RuntimeError("route closed")
+    assert await adapter.find_by_token("cmcp-token-1") is None
+    assert await adapter.find_by_token("   ") is None
+
+
+async def test_ambiguous_submit_adopts_token_id_once(tmp_path):
+    provisioner = TokenCrashProvisioner(recovered="55555")
+    gw = make_gateway(tmp_path, provisioner=provisioner)
+
+    record = await gw.target_sbatch("frontier", agent(gw))
+
+    assert provisioner.submit_calls == 1
+    assert provisioner.token_calls == 1
+    assert record["slurm_job_id"] == "55555"
+    assert record["state"] == jobs.PENDING
+    stored = gw.job_store.load_record(record["job_id"])
+    assert stored.slurm_job_id == "55555"
+    assert stored.state == jobs.PENDING
+    assert gw.job_store.load_submission(record["job_id"])["status"] == "accepted"
+    assert gw.quota.counted("agent", "frontier") == 1
+
+
+async def test_missing_token_keeps_submission_unknown_and_quota(tmp_path):
+    provisioner = TokenCrashProvisioner(miss_times=10)
+    gw = make_gateway(tmp_path, provisioner=provisioner)
+
+    with pytest.raises(jobs.SubmissionUncertain):
+        await gw.target_sbatch("frontier", agent(gw))
+
+    assert provisioner.submit_calls == 1
+    assert provisioner.token_calls == 1
+    records = gw.job_store.scan()
+    assert len(records) == 1
+    record = records[0]
+    assert record.state == jobs.SUBMISSION_UNKNOWN
+    assert record.slurm_job_id is None
+    assert gw.job_store.load_submission(record.job_id)["status"] == "unknown"
+    # The reserved slot is held: nothing was released and nothing resubmitted.
+    assert gw.quota.counted("agent", "frontier") == 1
+
+
+async def test_reconcile_adopts_token_after_submission_unknown(tmp_path):
+    provisioner = TokenCrashProvisioner(recovered="66666", miss_times=1)
+    gw = make_gateway(tmp_path, provisioner=provisioner)
+
+    with pytest.raises(jobs.SubmissionUncertain):
+        await gw.target_sbatch("frontier", agent(gw))
+
+    assert gw.job_store.scan()[0].state == jobs.SUBMISSION_UNKNOWN
+    assert provisioner.submit_calls == 1
+
+    report = await gw.jobs.reconcile_all()
+
+    recovered = gw.job_store.scan()[0]
+    assert recovered.slurm_job_id == "66666"
+    assert recovered.state == jobs.PENDING
+    assert report.recovered == 1
+    assert provisioner.submit_calls == 1  # never a second sbatch
+    assert gw.quota.counted("agent", "frontier") == 1
+
+
+async def test_regular_submit_never_consults_token(tmp_path):
+    provisioner = CountingProvisioner()
+    gw = make_gateway(tmp_path, provisioner=provisioner)
+
+    record = await gw.target_sbatch("frontier", agent(gw))
+
+    assert record["state"] == jobs.PENDING
+    assert record["slurm_job_id"] is not None
+    assert provisioner.submit_calls == 1
+    assert provisioner.token_calls == 0

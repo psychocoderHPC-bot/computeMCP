@@ -353,6 +353,11 @@ class JobProvisioner(Protocol):
     ``attach`` publishes the compute-node/relay endpoint once the container is
     reachable, ``cancel`` is the *only* path that scancels, and ``detach``
     closes local resources without signalling the scheduler.
+
+    ``find_by_token(token)`` is optional: when a provisioner implements it, an
+    ambiguous submit and restart reconciliation can recover an accepted-but-
+    unrecorded Slurm id from the correlation token instead of leaking the
+    allocation.
     """
 
     async def submit(self, record: "jobcore.JobRecord") -> Any: ...
@@ -579,26 +584,7 @@ class BundleStageProvisioner:
         return connection
 
     def _stage_env(self, record: "jobcore.JobRecord") -> dict[str, str]:
-        target = self.target
-        env: dict[str, str] = {
-            "COMPUTEMCP_SBATCH_ARGS": "",
-            "COMPUTEMCP_SRUN_ARGS": "",
-            "COMPUTEMCP_SYSTEM": target.name,
-        }
-        env.update(_container_env_fields(target))
-        overrides = record.parameters.get("set")
-        if overrides is not None and not isinstance(overrides, dict):
-            overrides = None
-        try:
-            plan, _provision_env = self.gateway._resolve_allocation(
-                target, overrides
-            )
-            sbatch, srun = render_args(target, plan)
-            env.update(build_provision_env(target, plan, sbatch, srun))
-        except (ConfigError, ValueError):
-            # A target without a full allocation block still gets a complete
-            # stage contract; the helper reports the missing field itself.
-            pass
+        env = self._common_stage_env(record.parameters.get("set"))
         private = record.kind == "private"
         env.update(
             {
@@ -608,21 +594,55 @@ class BundleStageProvisioner:
                     record.owner_client_id if private else ""
                 ),
                 "COMPUTEMCP_ROOT_MODE": (
-                    record.root_mode or target.root_mode
+                    record.root_mode or self.target.root_mode
                 ),
                 "COMPUTEMCP_CLEAN_HOME": (
                     (record.home or "") if private else ""
                 ),
-                "COMPUTEMCP_HOME_BASE": target.home_base or "",
+                "COMPUTEMCP_HOME_BASE": self.target.home_base or "",
                 "COMPUTEMCP_CORRELATION_TOKEN": record.correlation_token,
                 "COMPUTEMCP_STATE_DIR": str(
-                    Path(self.gateway.state_root or self.gateway._default_state_root())
-                    / "jobs"
-                    / record.job_id
+                    self._job_state_dir(record.job_id)
                 ),
             }
         )
         return env
+
+    def _common_stage_env(
+        self, overrides: Any = None
+    ) -> dict[str, str]:
+        """Target-level ``COMPUTEMCP_*`` contract shared by every stage.
+
+        ``overrides`` are the per-request allocation settings; ``None`` uses
+        the target's own allocation.  A target without a complete allocation
+        block still gets a complete stage contract, and the helper reports the
+        missing field itself.
+        """
+        target = self.target
+        env: dict[str, str] = {
+            "COMPUTEMCP_SBATCH_ARGS": "",
+            "COMPUTEMCP_SRUN_ARGS": "",
+            "COMPUTEMCP_SYSTEM": target.name,
+        }
+        env.update(_container_env_fields(target))
+        if overrides is not None and not isinstance(overrides, dict):
+            overrides = None
+        try:
+            plan, _provision_env = self.gateway._resolve_allocation(
+                target, overrides
+            )
+            sbatch, srun = render_args(target, plan)
+            env.update(build_provision_env(target, plan, sbatch, srun))
+        except (ConfigError, ValueError):
+            pass
+        return env
+
+    def _job_state_dir(self, job_id: str) -> Path:
+        return (
+            Path(self.gateway.state_root or self.gateway._default_state_root())
+            / "jobs"
+            / job_id
+        )
 
     async def _stage_argv(self, action: str) -> list[str]:
         connection = self._route_connection()
@@ -638,13 +658,23 @@ class BundleStageProvisioner:
     async def _execute(
         self, action: str, record: "jobcore.JobRecord"
     ) -> dict[str, str]:
+        return await self._execute_with_env(action, self._stage_env(record))
+
+    async def _execute_with_env(
+        self, action: str, env: Mapping[str, str], *, timeout: float | None = None
+    ) -> dict[str, str]:
         argv = await self._stage_argv(action)
-        env = self._stage_env(record)
         command = " ".join(shlex.quote(part) for part in argv)
         runner = self._run or self.gateway.backend.run
         result = await _maybe_await(
-            runner(self._route_connection(), command, env=env,
-                   timeout=self.target.provision_timeout)
+            runner(
+                self._route_connection(),
+                command,
+                env=dict(env),
+                timeout=(
+                    self.target.provision_timeout if timeout is None else timeout
+                ),
+            )
         )
         if hasattr(result, "exit_status"):
             code = int(getattr(result, "exit_status", 0) or 0)
@@ -703,6 +733,50 @@ class BundleStageProvisioner:
         state = (parsed.get("STATE") or "").upper()
         return _STAGE_STATE_TO_SCHEDULER.get(state, state or None)
 
+    async def find_by_token(self, token: str) -> str | None:
+        """Recover a lost Slurm id from the submit stage's correlation token.
+
+        The submit stage persists the token before ``sbatch`` and passes it as
+        ``--comment``; the helper's observe/recover path compares it against
+        ``squeue %k`` and ``sacct`` ``Comment``.  This method runs that path
+        keyed by ``COMPUTEMCP_CORRELATION_TOKEN`` (never by a Slurm id) and
+        with a bounded timeout.  When the intent record is known locally its
+        state directory is passed so the helper can read the token it wrote
+        before ``sbatch``.  It never submits and never cancels.  A missing or
+        non-numeric id, a non-zero stage, or a transport error all report
+        ``None`` so reconciliation can keep the record ``submission_unknown``.
+        """
+        token = (token or "").strip()
+        if not token:
+            return None
+        env = self._common_stage_env()
+        env["COMPUTEMCP_CORRELATION_TOKEN"] = token
+        record = self._record_for_token(token)
+        if record is not None:
+            # The shipped helper reads the token it persisted next to the job
+            # state; point it at that directory.  The token stays the key and
+            # no Slurm id is queried.
+            env["COMPUTEMCP_STATE_DIR"] = str(self._job_state_dir(record.job_id))
+        try:
+            parsed = await self._execute_with_env(
+                "observe", env, timeout=self._recover_timeout()
+            )
+        except Exception:  # noqa: BLE001 - recovery must never crash reconcile
+            return None
+        for key in ("RECOVERED_JOB_ID", "SLURM_JOB_ID", "JOB_ID"):
+            value = (parsed.get(key) or "").strip()
+            if value.isdigit():
+                return value
+        return None
+
+    def _recover_timeout(self) -> float:
+        """Bound a token lookup so reconciliation cannot block for long."""
+        try:
+            configured = float(self.target.provision_timeout)
+        except (TypeError, ValueError):
+            configured = 30.0
+        return min(configured, 30.0) if configured > 0 else 30.0
+
     async def attach(
         self, record: "jobcore.JobRecord"
     ) -> Mapping[str, Any] | None:
@@ -738,6 +812,24 @@ class BundleStageProvisioner:
             if record is not None:
                 return record
         raise jobcore.JobError(f"no job record for Slurm id {job!r}")
+
+    def _record_for_token(
+        self, token: str
+    ) -> "jobcore.JobRecord | None":
+        """Local intent record carrying ``token``; used to locate its state dir."""
+        store = getattr(self.gateway, "job_store", None)
+        if store is None:
+            return None
+        try:
+            for record in store.scan():
+                if (
+                    record.correlation_token == token
+                    and record.target == self.target.name
+                ):
+                    return record
+        except Exception:  # noqa: BLE001 - lookup is best-effort
+            return None
+        return None
 
     @staticmethod
     def _find_by_slurm_id(
@@ -810,7 +902,41 @@ class _GatewayScheduler:
 
     async def submit(self, record: "jobcore.JobRecord") -> Any:
         provisioner = self._gateway._provisioner_for_target(record.target)
-        return await _maybe_await(provisioner.submit(record))
+        try:
+            return await _maybe_await(provisioner.submit(record))
+        except jobcore.SchedulerRejected:
+            # A definite refusal: the scheduler never queued the job, so a
+            # token lookup could only match an unrelated allocation.
+            raise
+        except Exception:
+            # The transport may have failed after ``sbatch`` accepted the
+            # allocation.  Never resubmit; recover the lost Slurm id by the
+            # correlation token the submit stage passed as ``--comment``.  If
+            # the lookup misses, re-raise so JobManager keeps the record
+            # ``submission_unknown`` and its quota slot reserved.
+            recovered = await self._recover_by_token(
+                provisioner, record.correlation_token
+            )
+            if recovered is not None:
+                return recovered
+            raise
+
+    async def _recover_by_token(
+        self, provisioner: Any, token: str
+    ) -> str | None:
+        if not token:
+            return None
+        finder = getattr(provisioner, "find_by_token", None)
+        if finder is None:
+            return None
+        try:
+            found = await _maybe_await(finder(token))
+        except Exception:  # noqa: BLE001 - recovery must not mask the cause
+            return None
+        if not found:
+            return None
+        value = str(found).strip()
+        return value or None
 
     async def query(self, slurm_job_id: str) -> str | None:
         record = self._gateway._find_record_by_slurm_id(slurm_job_id)
