@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import getpass
 import inspect
@@ -36,7 +37,7 @@ from .allocation import (
     render_args,
     validate_conflicts,
 )
-from .bundle import BundleError, public_key_for
+from .bundle import BundleError, public_key_for, resolve_deploy_dir
 from .config import (
     ConfigError,
     GatewayConfig,
@@ -58,6 +59,7 @@ from .enrollment import (
     PendingEnrollment,
 )
 from .factor import FactorPromptError, prompt_factor
+from .files import JOB_ACCESS_DENIED_MESSAGE, FileService, JobAccessError
 from .files import chmod as files_chmod
 from .files import list_dir as files_list
 from .files import mkdir as files_mkdir
@@ -81,6 +83,7 @@ from .tunnel import (
     Tunnel,
     TunnelError,
     TunnelManager,
+    mux_helper_argv,
 )
 
 log = logging.getLogger("compute_mcp.gateway")
@@ -295,6 +298,21 @@ JOB_NOT_FOUND_TEXT = "job not found"
 #: to the client that happened to start it, so visibility never depends on the
 #: creator.
 SHARED_OWNER = "@shared"
+
+
+class JobNotReady(RuntimeError):
+    """A job has no usable endpoint yet (queued, starting or terminal).
+
+    Kept distinct from :class:`JobAccessError` so an authorized caller learns
+    that their own job is not ready instead of the indistinguishable
+    not-found/forbidden answer reserved for an unknown or foreign id.
+    """
+
+    def __init__(self, job_id: str, state: str | None = None) -> None:
+        detail = f" (state {state})" if state else ""
+        super().__init__(f"job {job_id!r} is not ready{detail}")
+        self.job_id = job_id
+        self.state = state
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -626,12 +644,40 @@ class Gateway:
         self.auth = Authenticator(config.clients)
         self.backend = SSHBackend()
         self.tunnels = TunnelManager(config.ssh)
+        # Request-scoped caller identity for the job-scoped services.  The
+        # FileService/SessionManager callbacks only receive a job id, so the
+        # authenticated client is bound per request and consulted before any
+        # connection or network work.  A context variable is correct under
+        # concurrency: two clients operating on different jobs never share it.
+        self._file_client: contextvars.ContextVar[Client | None] = (
+            contextvars.ContextVar("compute_mcp_file_client", default=None)
+        )
+        self._session_client: contextvars.ContextVar[Client | None] = (
+            contextvars.ContextVar("compute_mcp_session_client", default=None)
+        )
         self.sessions = SessionManager(
             self.backend,
             self._connection_provider,
             config.sessions,
             dedicated_provider=self._dedicated_connection_provider,
+            job_provider=self._job_connection_provider,
+            job_authorizer=self._session_job_authorizer,
         )
+        # Job-scoped SFTP: every operation carries an explicit job id, resolves
+        # through the job connection cache (never the target-keyed legacy cache)
+        # and shares the backend's channel budgeting/retry behaviour.
+        self.files = FileService(
+            self._file_resolve_job,
+            self._file_authorize_job,
+            sftp_session=self.backend.sftp_client,
+        )
+        # Per-route job_id -> relay endpoint registry handed to the mux helper.
+        # The helper reloads it on every OPEN, so a job that becomes ready after
+        # the helper started is still routable.
+        self._mux_registries: dict[str, dict[str, str]] = {}
+        # Test/integration hook: receives (target, mapping) after every registry
+        # write so an in-process helper can observe it without a real file.
+        self.route_registry_sink: Callable[[str, dict[str, str]], None] | None = None
         self.runtimes: dict[str, TargetRuntime] = {
             name: TargetRuntime(name=name) for name in config.targets
         }
@@ -804,6 +850,226 @@ class Gateway:
             raise web.HTTPNotFound(text=JOB_NOT_FOUND_TEXT)
         return shared
 
+    # -- job-scoped transport wiring --------------------------------------
+    @staticmethod
+    def _split_endpoint(endpoint: str) -> tuple[str, int]:
+        host, sep, port = endpoint.rpartition(":")
+        if not sep or not host:
+            raise SSHError(f"malformed job endpoint: {endpoint!r}")
+        try:
+            return host, int(port)
+        except ValueError as exc:
+            raise SSHError(f"malformed job endpoint: {endpoint!r}") from exc
+
+    def _job_endpoint(
+        self, record: "jobcore.JobRecord", *, over_mux: bool
+    ) -> tuple[str, int]:
+        """The address a job connection is keyed/dialed on.
+
+        Over the mux the helper already resolves the loopback relay, so the
+        relay endpoint is authoritative; on a direct per-job endpoint the
+        container endpoint is.  Either way the value is stable per generation,
+        which is what the backend cache uses to fence a stale endpoint.
+        """
+        if over_mux:
+            endpoint = record.relay_endpoint or record.container_endpoint
+        else:
+            endpoint = record.container_endpoint or record.relay_endpoint
+        if not endpoint:
+            raise JobNotReady(record.job_id, record.state)
+        return self._split_endpoint(endpoint)
+
+    async def _job_mux(self, target_name: str):
+        """Ensure the route is open and return its mux transport.
+
+        ``None`` means the target has no outer route to multiplex over (a direct
+        transport or a test-injected route opener); the caller then dials the
+        job endpoint directly.
+        """
+        target = self._target(target_name)
+        runtime = self.runtimes.get(target_name)
+        if runtime is None or not self._target_connected_live(target, runtime):
+            await self.open_target(target_name)
+            runtime = self.runtimes.get(target_name)
+        if runtime is None:
+            raise JobNotReady(target_name)
+        tunnel = runtime.tunnel
+        if tunnel is None:
+            return None
+        mux = getattr(tunnel, "mux", None)
+        if mux is None:
+            # A test-injected route opener (or a direct transport) has no mux.
+            return None
+        if not tunnel.is_alive():
+            raise TunnelError(f"target {target_name!r} route is not alive")
+        return mux
+
+    async def _job_connection(self, record: "jobcore.JobRecord"):
+        """Return the connection for exactly this job/generation.
+
+        Slurm jobs are never served from the target-keyed legacy cache: the
+        backend cache key is ``(job_id, generation)`` so a redial or stop of one
+        job cannot invalidate another.  With a mux route the container SSH bytes
+        travel over the job's stream on the one outer channel.
+        """
+        target = self._target(record.target)
+        if record.state != jobcore.READY:
+            # Only a job with a published, verified endpoint has a container to
+            # dial; a queued or stopping job must not fall through to a stale
+            # endpoint.
+            raise JobNotReady(record.job_id, record.state)
+        mux = await self._job_mux(record.target)
+        host, port = self._job_endpoint(record, over_mux=mux is not None)
+        if mux is not None:
+            # Publish the endpoint before the helper is asked to OPEN it.
+            self._write_route_registry(record.target)
+        return await self.backend.job_connection(
+            target,
+            record.job_id,
+            host,
+            port,
+            generation=record.generation,
+            transport=mux,
+        )
+
+    def _job_record(self, target_name: str, job_id: str) -> "jobcore.JobRecord":
+        self._ensure_jobs()
+        record = self.job_store.try_load_record(str(job_id))  # type: ignore[union-attr]
+        if record is None or record.target != target_name:
+            raise JobAccessError()
+        return record
+
+    async def _job_connection_provider(self, name: str, job_id: str):
+        """SessionManager job provider: (target, job-scoped connection)."""
+        record = self._job_record(name, job_id)
+        return self._target(name), await self._job_connection(record)
+
+    async def _session_job_authorizer(self, target: str, job_id: str) -> bool:
+        client = self._session_client.get()
+        if client is None:
+            return False
+        try:
+            record = self._authorized_job(client, job_id)
+        except web.HTTPNotFound:
+            return False
+        return record.target == target
+
+    async def _file_authorize_job(self, job_id: str) -> bool:
+        client = self._file_client.get()
+        if client is None:
+            return False
+        try:
+            self._authorized_job(client, job_id)
+        except web.HTTPNotFound:
+            return False
+        return True
+
+    async def _file_resolve_job(self, job_id: str):
+        client = self._file_client.get()
+        if client is None:
+            raise JobAccessError()
+        record = self._authorized_job(client, job_id)
+        return await self._job_connection(record)
+
+    @staticmethod
+    def _job_id_from_body(body: Mapping[str, Any] | None) -> str | None:
+        if not body:
+            return None
+        value = body.get("job_id")
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise web.HTTPBadRequest(text="'job_id' must be a non-empty string")
+        return value
+
+    def _file_is_job_scoped(self, target_name: str | None) -> bool:
+        target = self.config.targets.get(target_name) if target_name else None
+        return target is not None and self._is_multijob(target)
+
+    def _resolve_file_job_id(
+        self, client: Client, target_name: str, raw_job_id: str | None
+    ) -> str:
+        """Resolve the id before the FileService sees it.
+
+        An omitted id selects the target's shared job only.  Unknown and foreign
+        ids collapse to one public answer; the FileService repeats the same
+        check and this message, so no handler path can leak a difference.
+        """
+        try:
+            record = self.resolve_job(client, target_name, raw_job_id or None)
+        except web.HTTPNotFound:
+            raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+        return record.job_id
+
+    async def _run_file_op(self, client: Client, job_id: str, op):
+        token = self._file_client.set(client)
+        try:
+            return await op(job_id)
+        except JobAccessError:
+            raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+        finally:
+            self._file_client.reset(token)
+
+    @contextlib.asynccontextmanager
+    async def _file_client_context(self, client: Client):
+        token = self._file_client.set(client)
+        try:
+            yield
+        finally:
+            self._file_client.reset(token)
+
+    def _file_job_id(self, client: Client, request: web.Request, body=None) -> str | None:
+        """Resolve the per-request job id, or ``None`` for a legacy target."""
+        target_name = request.query.get("target")
+        if not target_name:
+            raise web.HTTPBadRequest(text="'target' query parameter is required")
+        client.require_target(target_name)
+        if not self._file_is_job_scoped(target_name):
+            return None
+        raw_job_id = request.query.get("job_id") or self._job_id_from_body(body)
+        return self._resolve_file_job_id(client, target_name, raw_job_id)
+
+    # -- mux relay registry -----------------------------------------------
+    def _registry_path(self, target_name: str) -> Path:
+        self._ensure_jobs()
+        directory = self.state_root / "mux"  # type: ignore[operator]
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{target_name}.json"
+
+    def _route_registry(self, target_name: str) -> dict[str, str]:
+        """Every non-terminal endpoint currently usable for this target."""
+        mapping: dict[str, str] = {}
+        if self.job_store is None:
+            return mapping
+        for record in self.job_store.scan():
+            if record.target != target_name:
+                continue
+            if record.state == jobcore.TERMINAL:
+                continue
+            endpoint = record.relay_endpoint or record.container_endpoint
+            if endpoint:
+                mapping[record.job_id] = endpoint
+        return mapping
+
+    def _write_route_registry(self, target_name: str) -> Path:
+        path = self._registry_path(target_name)
+        mapping = self._route_registry(target_name)
+        # A unique temp name lets concurrent readiness/exec updates publish
+        # atomically without one replace invalidating another's temp file.
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(mapping, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+        self._mux_registries[target_name] = mapping
+        if self.route_registry_sink is not None:
+            with contextlib.suppress(Exception):
+                self.route_registry_sink(target_name, dict(mapping))
+        return path
+
+    def _mux_helper_argv(self, target: TargetConfig, route: str) -> tuple[str, ...]:
+        path = self._write_route_registry(target.name)
+        deploy_dir = resolve_deploy_dir(target)
+        return mux_helper_argv(target, deploy_dir, str(path))
+
     def _resolve_clean_home(self, clean_home: str | None) -> str | None:
         if clean_home is None:
             return None
@@ -872,6 +1138,8 @@ class Gateway:
         if self.jobs is not None:
             with contextlib.suppress(Exception):
                 await self.jobs.detach_all()
+        with contextlib.suppress(Exception):
+            await self.files.close_all()
         await self.sessions.stop()
         await self.backend.close_all()
 
@@ -889,7 +1157,21 @@ class Gateway:
         async with self._lock(name):
             await self._stop_locked(name)
         await self.backend.disconnect(name)
+        await self._disconnect_jobs_for_target(name)
         await self.sessions.close_for_target(name, reason="detached")
+
+    async def _disconnect_jobs_for_target(self, name: str) -> None:
+        """Drop job-keyed connections for one target; never touches another."""
+        if self.job_store is None:
+            return
+        try:
+            records = list(self.job_store.scan())
+        except Exception:  # noqa: BLE001 - teardown must not be blocked by disk
+            return
+        for record in records:
+            if record.target == name:
+                with contextlib.suppress(Exception):
+                    await self.backend.disconnect_job(record.job_id)
 
     # -- background job monitor -------------------------------------------
     def _start_job_monitor(self) -> None:
@@ -940,8 +1222,14 @@ class Gateway:
                         relay_pid=payload.get("relay_pid"),
                         generation=payload.get("generation"),
                     )
+                    # Publish the freshly usable endpoint to the mux registry
+                    # so the helper can OPEN this job without waiting for the
+                    # next request.
+                    self._write_route_registry(updated.target)
                 except jobcore.JobError as exc:
                     log.debug("job %s: readiness was not applied: %s", job_id, exc)
+        if updated.state == jobcore.TERMINAL:
+            await self._cleanup_job_resources(job_id, reason="job terminal")
         return updated
 
     # -- allocation resolution --------------------------------------------
@@ -1109,11 +1397,20 @@ class Gateway:
         runtime.awaiting_factor = False
         return runtime
 
+    def _release_tunnel(self, tunnel: Any) -> None:
+        """Release a reserved loopback port for a legacy forwarding tunnel.
+
+        A :class:`~compute_mcp.tunnel.JobRouteTunnel` owns no local forward, so
+        there is no port to release; only a ``RouteTunnel`` does.
+        """
+        if hasattr(tunnel, "local_port"):
+            self.tunnels.release(tunnel)
+
     def _mark_lost(self, runtime: TargetRuntime, reason: str) -> None:
         # Invalidate any container dial that captured the lost route.
         runtime.route_epoch += 1
         if runtime.tunnel is not None:
-            self.tunnels.release(runtime.tunnel)
+            self._release_tunnel(runtime.tunnel)
             runtime.tunnel = None
         runtime.state = "disconnected"
         runtime.active_route = None
@@ -1458,6 +1755,7 @@ class Gateway:
             async with self._lock(name):
                 await self._stop_locked(name)
             await self.backend.disconnect(name)
+            await self._disconnect_jobs_for_target(name)
             await self.sessions.close_for_target(name, reason="target stopped")
             return self.public_status(name)
         async with self._lock(name):
@@ -1583,7 +1881,7 @@ class Gateway:
             runtime.recovery_task = None
         if runtime.tunnel is not None:
             await runtime.tunnel.stop()
-            self.tunnels.release(runtime.tunnel)
+            self._release_tunnel(runtime.tunnel)
         runtime.tunnel = None
         runtime.state = "disconnected"
         runtime.active_route = None
@@ -1655,6 +1953,9 @@ class Gateway:
                 runtime.needs_refresh = True
                 reconnect = True
         await self.backend.disconnect(name)
+        target = self.config.targets.get(name)
+        if target is not None and self._is_multijob(target):
+            await self._disconnect_jobs_for_target(name)
         await self.sessions.close_for_target(name, reason="tunnel lost")
         if reconnect:
             self._schedule_recovery(name, runtime)
@@ -2085,14 +2386,28 @@ class Gateway:
 
     # -- route/job service (shared by CLI, HTTP and MCP) -------------------
     async def _open_route_transport(
-        self, target: TargetConfig, route: str, factor: str | None
+        self,
+        target: TargetConfig,
+        route: str,
+        factor: str | None,
+        generation: int = 0,
     ) -> Any:
         if self.route_opener is not None:
             return await _maybe_await(self.route_opener(target, route, factor))
-        connection = await self.tunnels.open_route_connection(
-            target, route, factor=factor
+        # The durable multi-job path is the single-channel mux transport: one
+        # authenticated route connection and exactly one persistent helper
+        # channel.  Provisioning stays off the route here; per-job relays are
+        # opened as mux streams addressed by job id, so route opening never
+        # submits a job or starts a container.
+        helper_argv = self._mux_helper_argv(target, route)
+        return await self.tunnels.open_job_route(
+            target,
+            route,
+            helper_argv=helper_argv,
+            generation=generation,
+            provision=False,
+            factor=factor,
         )
-        return _RouteOnlyTunnel(target, route, connection)
 
     async def _open_slurm_route_locked(
         self,
@@ -2128,8 +2443,11 @@ class Gateway:
         )
         runtime.state = "connecting"
         runtime.last_error = None
+        runtime.route_epoch += 1
         try:
-            tunnel = await self._open_route_transport(target, route, factor)
+            tunnel = await self._open_route_transport(
+                target, route, factor, generation=runtime.route_epoch
+            )
         except Exception as exc:
             runtime.state = "failed"
             runtime.last_error = str(exc)
@@ -2293,6 +2611,20 @@ class Gateway:
             await asyncio.sleep(min(0.05, max(0.0, remaining)))
         return record
 
+    async def _cleanup_job_resources(self, job_id: str, reason: str) -> None:
+        """Close only one job's PTY/SFTP/SSH resources.
+
+        A stop or terminal transition of job B must never invalidate job A:
+        sessions are filtered by ``job_id``, the file service retires only that
+        job's state and the backend drops only that job's cached generation.
+        """
+        with contextlib.suppress(Exception):
+            await self.sessions.close_for_job(job_id, reason=reason)
+        with contextlib.suppress(Exception):
+            await self.files.close_job(job_id)
+        with contextlib.suppress(Exception):
+            await self.backend.disconnect_job(job_id)
+
     async def cancel_job(self, client: Client, job_id: str) -> dict[str, Any]:
         record = self._authorized_job(client, job_id)
         if record.kind == "shared" and not client.is_admin:
@@ -2302,6 +2634,11 @@ class Gateway:
             updated = await manager.stop(record.job_id)
         except jobcore.IllegalTransition as exc:
             raise web.HTTPConflict(text=str(exc)) from exc
+        # The cancellation is authoritative: this job's sessions, SFTP state
+        # and cached connection go away; other jobs are untouched.
+        await self._cleanup_job_resources(updated.job_id, reason="job stopped")
+        with contextlib.suppress(Exception):
+            self._write_route_registry(updated.target)
         return _public_job(updated)
 
     # -- HTTP handlers -----------------------------------------------------
@@ -2537,7 +2874,28 @@ class Gateway:
         if not name or not isinstance(command, str):
             raise web.HTTPBadRequest(text="'target' and 'command' are required")
         client.require_target(name)
-        target, conn = await self._connection_provider(name)
+        target = self.config.targets.get(name)
+        if target is not None and self._is_multijob(target):
+            # Slurm jobs are addressed explicitly (or the target's shared job
+            # when omitted); exec never falls back to the target-keyed legacy
+            # container cache.
+            raw_job_id = self._job_id_from_body(body) or request.query.get("job_id")
+            try:
+                record = self.resolve_job(client, name, raw_job_id or None)
+            except web.HTTPNotFound:
+                raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+            try:
+                target, conn = await self._job_connection_provider(
+                    name, record.job_id
+                )
+            except JobAccessError:
+                raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+            except JobNotReady as exc:
+                raise web.HTTPConflict(text=str(exc)) from exc
+            job_scoped = True
+        else:
+            target, conn = await self._connection_provider(name)
+            job_scoped = False
         timeout = body.get("timeout")
         if timeout is None:
             timeout = self.config.server.exec_timeout
@@ -2555,7 +2913,10 @@ class Gateway:
                 stdin=body.get("stdin"),
             )
         finally:
-            if target.connect_mode == "dedicated":
+            # A job connection is cached per (job, generation) and shared by
+            # that job's exec/SFTP/PTY; only the legacy dedicated mode is
+            # one-shot.
+            if not job_scoped and target.connect_mode == "dedicated":
                 await self.backend.close_connection(conn)
         return web.json_response(
             {
@@ -2575,15 +2936,46 @@ class Gateway:
             raise web.HTTPBadRequest(text="'target' is required")
         client.require_target(name)
         target = self._target(name)
-        session = await self.sessions.create(
-            client.client_id,
-            target,
-            cwd=body.get("cwd"),
-            columns=int(body.get("columns", 160)),
-            rows=int(body.get("rows", 50)),
-        )
+        raw_job_id = self._job_id_from_body(body) or request.query.get("job_id")
+        if self._is_multijob(target):
+            # An omitted id selects the shared job only; an explicit id is
+            # resolved (and authorized) before any PTY work starts.
+            try:
+                record = self.resolve_job(client, name, raw_job_id or None)
+            except web.HTTPNotFound:
+                raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+            job_id: str | None = record.job_id
+            token = self._session_client.set(client)
+        else:
+            if raw_job_id:
+                raise web.HTTPBadRequest(
+                    text="'job_id' is only valid on a Slurm job target"
+                )
+            job_id = None
+            token = None
+        try:
+            session = await self.sessions.create(
+                client.client_id,
+                target,
+                cwd=body.get("cwd"),
+                columns=int(body.get("columns", 160)),
+                rows=int(body.get("rows", 50)),
+                job_id=job_id,
+            )
+        except JobAccessError:
+            raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+        except JobNotReady as exc:
+            raise web.HTTPConflict(text=str(exc)) from exc
+        finally:
+            if token is not None:
+                self._session_client.reset(token)
         return web.json_response(
-            {"session_id": session.id, "target": session.target, "created": True}
+            {
+                "session_id": session.id,
+                "target": session.target,
+                "job_id": session.job_id,
+                "created": True,
+            }
         )
 
     async def h_session_list(self, request: web.Request) -> web.Response:
@@ -2611,6 +3003,7 @@ class Gateway:
                 "session_id": session.id,
                 "client": session.client_id,
                 "target": session.target,
+                "job_id": session.job_id,
                 "closed": session.closed,
                 "exit_status": session.exit_status,
                 "buffered_bytes": len(session.output_buffer),
@@ -2940,12 +3333,27 @@ class Gateway:
     async def h_file_stat(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         path = request.query["path"]
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request)
+            return web.json_response(
+                await self._run_file_op(
+                    client, job_id, lambda j: self.files.stat(j, path)
+                )
+            )
         async with self._sftp_session(client, request) as sftp:
             return web.json_response(await files_stat(sftp, path))
 
     async def h_file_list(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         path = request.query["path"]
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request)
+            entries = await self._run_file_op(
+                client, job_id, lambda j: self.files.list_dir(j, path)
+            )
+            return web.json_response({"path": path, "entries": entries})
         async with self._sftp_session(client, request) as sftp:
             return web.json_response({"path": path, "entries": await files_list(sftp, path)})
 
@@ -2953,9 +3361,16 @@ class Gateway:
         client = self._auth(request)
         path = request.query["path"]
         encoding = request.query.get("encoding")
+        target_name = request.query.get("target")
+        job_id = (
+            self._file_job_id(client, request)
+            if self._file_is_job_scoped(target_name)
+            else None
+        )
         if encoding == "stream":
             # Stream raw bytes without buffering or round-tripping through JSON.
-            target_name = request.query.get("target")
+            if job_id is not None:
+                return await self._stream_job_file(client, request, job_id, path)
             client.require_target(target_name)
             target, conn = await self._connection_provider(target_name)
             owned = target.connect_mode == "dedicated"
@@ -3000,8 +3415,13 @@ class Gateway:
             finally:
                 if owned:
                     await self.backend.close_connection(conn)
-        async with self._sftp_session(client, request) as sftp:
-            data, info = await files_read(sftp, path)
+        if job_id is not None:
+            data, info = await self._run_file_op(
+                client, job_id, lambda j: self.files.read(j, path)
+            )
+        else:
+            async with self._sftp_session(client, request) as sftp:
+                data, info = await files_read(sftp, path)
         if encoding == "base64":
             import base64
 
@@ -3014,6 +3434,40 @@ class Gateway:
              "content": data.decode("utf-8", errors="replace"), "stat": info}
         )
 
+    async def _stream_job_file(
+        self, client: Client, request: web.Request, job_id: str, path: str
+    ) -> web.Response:
+        async with self._file_client_context(client):
+            try:
+                info = await self.files.stat(job_id, path)
+                if info["type"] != "file":
+                    raise web.HTTPBadRequest(text="not a regular file")
+                resp = web.StreamResponse(
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Disposition": f'attachment; filename="{posixpath.basename(path)}"',
+                    }
+                )
+                if info.get("size") is not None:
+                    resp.content_length = info["size"]
+                try:
+                    await resp.prepare(request)
+                    async for chunk in self.files.download(job_id, path):
+                        await resp.write(chunk)
+                    await resp.write_eof()
+                except (ConnectionResetError, BrokenPipeError) as exc:
+                    log.debug(
+                        "file read aborted: client disconnected mid-stream "
+                        "target=%s job=%s path=%s (%s)",
+                        request.query.get("target"),
+                        job_id,
+                        path,
+                        type(exc).__name__,
+                    )
+                return resp
+            except JobAccessError:
+                raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+
     async def h_file_write(self, request: web.Request) -> web.Response:
         import base64
 
@@ -3024,6 +3478,14 @@ class Gateway:
             content = base64.b64decode(body.get("content", ""))
         else:
             content = body.get("content", "").encode("utf-8")
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request, body)
+            return web.json_response(
+                await self._run_file_op(
+                    client, job_id, lambda j: self.files.write(j, path, content)
+                )
+            )
         async with self._sftp_session(client, request) as sftp:
             return web.json_response(await files_write(sftp, path, content))
 
@@ -3036,9 +3498,30 @@ class Gateway:
         client = self._auth(request)
         path = request.query["path"]
         append = request.query.get("append", "false").lower() in ("1", "true", "yes")
+        parents = request.query.get("parents", "false").lower() in ("1", "true", "yes")
         content_length = request.content_length
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request)
+            result = await self._run_file_op(
+                client,
+                job_id,
+                lambda j: self.files.upload(
+                    j, path, request.content, append=append, parents=parents
+                ),
+            )
+            written = result["written"]
+            return web.json_response(
+                {
+                    "path": path,
+                    "written": written,
+                    "content_length": content_length,
+                    "complete": content_length is None or written == content_length,
+                    "stat": result["stat"],
+                }
+            )
         async with self._sftp_session(client, request) as sftp:
-            if request.query.get("parents", "false").lower() in ("1", "true", "yes"):
+            if parents:
                 parent = posixpath.dirname(path)
                 if parent:
                     with contextlib.suppress(Exception):
@@ -3064,19 +3547,49 @@ class Gateway:
 
     async def h_file_mkdir(self, request: web.Request) -> web.Response:
         client = self._auth(request)
-        path = (await request.json())["path"]
+        body = await request.json()
+        path = body["path"]
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request, body)
+            return web.json_response(
+                await self._run_file_op(
+                    client, job_id, lambda j: self.files.mkdir(j, path)
+                )
+            )
         async with self._sftp_session(client, request) as sftp:
             return web.json_response(await files_mkdir(sftp, path))
 
     async def h_file_remove(self, request: web.Request) -> web.Response:
         client = self._auth(request)
-        path = (await request.json())["path"]
+        body = await request.json()
+        path = body["path"]
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request, body)
+            return web.json_response(
+                await self._run_file_op(
+                    client, job_id, lambda j: self.files.remove(j, path)
+                )
+            )
         async with self._sftp_session(client, request) as sftp:
             return web.json_response(await files_remove(sftp, path))
 
     async def h_file_rename(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         body = await request.json()
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request, body)
+            return web.json_response(
+                await self._run_file_op(
+                    client,
+                    job_id,
+                    lambda j: self.files.rename(
+                        j, body["source"], body["destination"]
+                    ),
+                )
+            )
         async with self._sftp_session(client, request) as sftp:
             return web.json_response(
                 await files_rename(sftp, body["source"], body["destination"])
@@ -3086,6 +3599,14 @@ class Gateway:
         client = self._auth(request)
         body = await request.json()
         mode = files_parse_mode(body["mode"])
+        target_name = request.query.get("target")
+        if self._file_is_job_scoped(target_name):
+            job_id = self._file_job_id(client, request, body)
+            return web.json_response(
+                await self._run_file_op(
+                    client, job_id, lambda j: self.files.chmod(j, body["path"], mode)
+                )
+            )
         async with self._sftp_session(client, request) as sftp:
             return web.json_response(await files_chmod(sftp, body["path"], mode))
 
@@ -3474,6 +3995,12 @@ async def _error_middleware(request: web.Request, handler):
         raise web.HTTPForbidden(text="forbidden") from None
     except SessionError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
+    except JobAccessError:
+        # One public answer for an unknown or foreign job id on any job-scoped
+        # file/exec path; never distinguish the two.
+        raise web.HTTPNotFound(text=JOB_ACCESS_DENIED_MESSAGE) from None
+    except JobNotReady as exc:
+        raise web.HTTPConflict(text=str(exc)) from exc
     except jobcore.QuotaExceeded as exc:
         raise web.HTTPTooManyRequests(text=str(exc)) from exc
     except (jobcore.JobNotFound, jobcore.InvalidJobId):
