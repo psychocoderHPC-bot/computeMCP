@@ -190,10 +190,33 @@ COMPUTEMCP_SBATCH_ARGS:
   private jobs. Before the job registry exists, the configured limit answers
   this field.
 
-`target-sbatch --dry-run` previews the target-level `root_mode` and
-`clean_home`. The CLI does not forward the submit-only `--root-mode` and
-`--clean-home` flags into the preview body, so a preview that must show those
-request values has to come from the HTTP preview endpoint.
+`target-shared --dry-run` and `target-sbatch --dry-run` forward their
+`--root-mode` and `--clean-home` values into the preview body through
+`_preview_body`, so the preview shows the requested values. Only the 2FA factor
+and the submit `--request-id` are omitted from a preview.
+
+### State root
+
+A multi-job target needs a durable state root. The gateway resolves it from
+`--state-dir`, then `COMPUTEMCP_STATE_DIR`, then `<config-dir>/state`. There is
+no temporary fallback; without one of the three, startup fails with
+`no durable job state root`.
+
+```bash
+computeMCP-gateway --state-dir /scratch/agent/computemcp/state
+# or
+export COMPUTEMCP_STATE_DIR=/scratch/agent/computemcp/state
+```
+
+For a Slurm target the state root MUST be on storage that the gateway and the
+login and compute nodes see at the same absolute path. The gateway writes
+`<state_root>/mux/<target>.json`; the login-node mux helper reads that exact
+path. A gateway-local or per-node `/tmp` breaks every job open.
+
+If the helper cannot read the registry it rejects the stream with
+`registry_unreadable: cannot read <path> ...`. The gateway returns that as HTTP
+502. The fix is to put the state root on shared storage at the same path on
+both hosts. Retrying the request does not fix it.
 
 ### Quotas
 
@@ -225,15 +248,34 @@ the same single-use factor rules as the other connect commands.
 
 ### Submission uncertainty and reconciliation
 
-The gateway persists a correlation token before `sbatch` and passes it as a
-scheduler job comment. If the acknowledgement is lost, the job becomes
+The bundle persists a correlation token before `sbatch` and passes it as
+`--comment=<token>`. If the acknowledgement is lost, the job becomes
 `submission_unknown` and keeps its quota slot. The gateway never resubmits it
-automatically. `target-open` reconciles durable records with `squeue`: a record
-with a persisted scheduler id is queried directly. When the bundle adapter
-supports comment lookup, a record without an id is recovered by its `--comment`
-token. Without that lookup the job stays `submission_unknown` and holds its
-slot until operator reconciliation. A missing `squeue` entry alone does not
-prove that the submission failed.
+automatically.
+
+`target-open` runs reconciliation. A record with a persisted scheduler id is
+queried directly. A record without an id is passed to the bundle adapter's
+`find_by_token`, which runs the helper recovery path: it compares the token
+against `squeue %k` and, when the job has left the active view, `sacct`
+`Comment` over the last 30 days, with a bounded timeout. A found id moves the
+record to `pending` and keeps the slot.
+
+Operator action when a job stays uncertain:
+
+1. Run `computeMCP-gatewayctl target-open <target>` to trigger reconciliation.
+   It runs once per gateway process. If that process already reconciled,
+   restart the gateway so it runs again.
+2. If recovery still finds nothing, read the token from
+   `<state_root>/jobs/<job_id>/correlation_token`, then check the scheduler:
+   `squeue --format '%i %T %k'` and
+   `sacct -o JobID,State,Comment -S now-30days`.
+3. If the job exists, restart the gateway so the next reconciliation pass
+   adopts it. If it is definitely gone, do not resubmit the same request. The
+   record stays `submission_unknown`, holds its slot, and there is no automatic
+   release at this revision. Escalate with the target, `job_id`, token, and
+   scheduler evidence.
+
+A missing `squeue` entry alone does not prove that the submission failed.
 
 ### Detach and cancel
 

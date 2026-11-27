@@ -264,6 +264,11 @@ computeMCP-gatewayctl job-stop job-<id>              # explicit cancel
   never resubmitted automatically.
 - Slurm jobs travel over one authenticated route connection and one mux stream
   per job. A slow or pending job cannot stall control messages or another job.
+- Set a durable state root with `--state-dir` or `COMPUTEMCP_STATE_DIR` on
+  storage shared with the login and compute nodes at the same absolute path.
+  The mux registry is `<state_root>/mux/<target>.json`. A gateway-local path
+  fails with `registry_unreadable` and HTTP 502. There is no temporary
+  fallback.
 
 Agent tools: `computeMCP_job_start`, `computeMCP_job_list`,
 `computeMCP_job_status`, `computeMCP_job_wait`, and `computeMCP_job_stop`.
