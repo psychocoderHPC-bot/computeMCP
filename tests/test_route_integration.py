@@ -34,11 +34,14 @@ from compute_mcp.config import (
     TransportConfig,
 )
 from compute_mcp.gateway import Gateway
-from compute_mcp.ssh_backend import SSHError
+from compute_mcp.sessions import SessionManager
+from compute_mcp.mux import Multiplexer
+from compute_mcp.ssh_backend import SSHError, SSHBackend
 from compute_mcp.tunnel import (
     TunnelError,
     TunnelManager,
     allocate_loopback_port,
+    mux_helper_argv,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -55,6 +58,172 @@ RUN_TIMEOUT = 5.0
 # In-process login/route server
 # ---------------------------------------------------------------------------
 
+class _ChannelReader:
+    """``read``-only adapter over an asyncssh server session channel."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._eof = False
+        self._wake = asyncio.Event()
+
+    def feed(self, data: bytes) -> None:
+        self._buffer.extend(data)
+        self._wake.set()
+
+    def feed_eof(self) -> None:
+        self._eof = True
+        self._wake.set()
+
+    async def read(self, n: int = -1) -> bytes:
+        while True:
+            if self._buffer:
+                if n is None or n < 0:
+                    data = bytes(self._buffer)
+                    self._buffer.clear()
+                else:
+                    data = bytes(self._buffer[:n])
+                    del self._buffer[:n]
+                return data
+            if self._eof:
+                return b""
+            self._wake.clear()
+            if self._buffer or self._eof:
+                continue
+            await self._wake.wait()
+
+
+class _ChannelWriter:
+    """``write``/``drain`` adapter over an asyncssh server session channel."""
+
+    def __init__(self, chan) -> None:
+        self._chan = chan
+
+    def write(self, data: bytes) -> None:
+        self._chan.write(data)
+
+    async def drain(self) -> None:
+        await asyncio.sleep(0)
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._chan.close()
+
+    async def wait_closed(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._chan.wait_closed()
+
+
+class _MuxHelperPeer:
+    """In-process stand-in for ``computemcp-mux.py`` on the login node.
+
+    It speaks the real gateway wire protocol with ``initiator=False`` and
+    forwards each ``OPEN(job_id)`` to the loopback endpoint in the test
+    registry.  Using the real :class:`Multiplexer` keeps the wire format and
+    flow control under test; the stdlib helper itself is covered by
+    ``test_mux_helper.py``.
+    """
+
+    def __init__(self, session: "_LoginSession") -> None:
+        self.session = session
+        self.state = session.state
+        self.reader = session._mux_reader
+        self.writer = _ChannelWriter(session._chan)
+        self.mux = None
+        self._tasks: set[asyncio.Task] = set()
+        self._serving: set[asyncio.Task] = set()
+
+    def _track(self, task: asyncio.Task) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def run(self) -> None:
+        self.mux = Multiplexer(self.reader, self.writer, initiator=False)
+        await self.mux.start()
+        self.state["mux_starts"] = self.state.get("mux_starts", 0) + 1
+        try:
+            while True:
+                stream = await self.mux.accept()
+                self.state["mux_streams"] = (
+                    self.state.get("mux_streams", 0) + 1
+                )
+                task = asyncio.create_task(self._serve(stream))
+                self._serving.add(task)
+                task.add_done_callback(self._serving.discard)
+        except Exception:
+            return
+        finally:
+            if self.mux is not None and not self.mux.closed:
+                with contextlib.suppress(Exception):
+                    await self.mux.close()
+            for task in list(self._serving):
+                task.cancel()
+            if self._serving:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *self._serving, return_exceptions=True
+                        ),
+                        2.0,
+                    )
+
+    async def _serve(self, stream) -> None:
+        registry = self.state.get("relay_registry") or {}
+        endpoint = registry.get(stream.job_id)
+        if endpoint is None:
+            await stream.reset(f"job {stream.job_id!r} not registered")
+            return
+        writer = None
+        relay_reader = None
+        try:
+            relay_reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(*endpoint), 5.0
+            )
+        except Exception:
+            await stream.reset("relay unavailable")
+            return
+
+        async def relay_to_stream():
+            while True:
+                data = await relay_reader.read(65536)
+                if not data:
+                    await stream.close()
+                    return
+                await stream.write(data)
+
+        async def stream_to_relay():
+            while True:
+                try:
+                    data = await stream.read(65536)
+                except Exception:
+                    return
+                if not data:
+                    return
+                writer.write(data)
+                await writer.drain()
+
+        tasks = [
+            asyncio.create_task(relay_to_stream()),
+            asyncio.create_task(stream_to_relay()),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            with contextlib.suppress(Exception):
+                writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), 2.0
+                )
+
+    async def close(self) -> None:
+        if self.mux is not None and not self.mux.closed:
+            with contextlib.suppress(Exception):
+                await self.mux.close()
+
+
 class _LoginSession(asyncssh.SSHServerSession):
     """Accepts an exec and answers provisioning / records the command."""
 
@@ -62,6 +231,10 @@ class _LoginSession(asyncssh.SSHServerSession):
         self._chan = None
         self.state = state
         self._command = ""
+        self._is_mux = False
+        self._mux_task: asyncio.Task | None = None
+        self._mux_reader: _ChannelReader | None = None
+        self._mux_helper: _MuxHelperPeer | None = None
 
     def connection_made(self, chan) -> None:
         self._chan = chan
@@ -77,6 +250,11 @@ class _LoginSession(asyncssh.SSHServerSession):
         self.state["live_channels"] = max(
             0, self.state.get("live_channels", 0) - 1
         )
+        if self._mux_reader is not None:
+            self._mux_reader.feed_eof()
+        if self._mux_task is not None and not self._mux_task.done():
+            self._mux_task.cancel()
+            self._mux_task = None
 
     def exec_requested(self, command) -> bool:
         self.state["commands"].append(command)
@@ -85,9 +263,17 @@ class _LoginSession(asyncssh.SSHServerSession):
             self.state["provision_requests"] = (
                 self.state.get("provision_requests", 0) + 1
             )
+        if "computemcp-mux" in command:
+            self._is_mux = True
+            self.state["mux_execs"] = self.state.get("mux_execs", 0) + 1
         return True
 
     def session_started(self) -> None:
+        if self._is_mux:
+            self._mux_reader = _ChannelReader()
+            self._mux_helper = _MuxHelperPeer(self)
+            self._mux_task = asyncio.create_task(self._mux_helper.run())
+            return
         out = ""
         if "provision" in self._command:
             self.state["provision_count"] = (
@@ -111,6 +297,15 @@ class _LoginSession(asyncssh.SSHServerSession):
                     conn.close()
         self._chan.write(out.encode())
         self._chan.exit(0)
+
+    def data_received(self, data, datatype) -> None:
+        if self._mux_reader is not None:
+            self._mux_reader.feed(data)
+
+    def eof_received(self):
+        if self._mux_reader is not None:
+            self._mux_reader.feed_eof()
+        return False
 
     def shell_requested(self) -> bool:
         return False
@@ -328,6 +523,57 @@ class _ContainerServer(asyncssh.SSHServer):
 
     def session_requested(self):
         return _ContainerSession(self.state)
+
+
+class _BulkSession(asyncssh.SSHServerSession):
+    """Container session that identifies its job and can emit a large blob."""
+
+    def __init__(self, state: dict) -> None:
+        self.state = state
+        self._chan = None
+        self._command = ""
+
+    def connection_made(self, chan) -> None:
+        self._chan = chan
+
+    def exec_requested(self, command) -> bool:
+        self._command = command
+        self.state["commands"].append(command)
+        return True
+
+    def session_started(self) -> None:
+        label = self.state.get("label", "job").encode()
+        if self._command == "bulk":
+            size = int(self.state.get("bulk_bytes", 300 * 1024))
+            self._chan.write(label + b":" + b"Z" * size)
+        else:
+            self._chan.write(label + b":" + self._command.encode() + b"\n")
+        self._chan.exit(0)
+
+    def shell_requested(self) -> bool:
+        return False
+
+
+class _BulkContainerServer(asyncssh.SSHServer):
+    """Key-only container endpoint whose sessions identify their job."""
+
+    def __init__(self, state: dict) -> None:
+        self.state = state
+
+    def auth_completed(self) -> None:
+        self.state["connections"] = self.state.get("connections", 0) + 1
+
+    def begin_auth(self, username: str) -> bool:
+        return True
+
+    def public_key_auth_supported(self) -> bool:
+        return True
+
+    async def validate_public_key(self, username, key) -> bool:
+        return True
+
+    def session_requested(self):
+        return _BulkSession(self.state)
 
 
 async def _start_login(tmp_path_factory, **auth) -> _Login:
@@ -1198,3 +1444,421 @@ async def test_dial_started_during_refresh_teardown_does_not_use_old_forward(
         assert states[0].get("connections", 0) == 0
         assert login.state["auths"] == 1
         assert login.state["max_channels"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Single-channel mux transport: job-keyed cache, generation fencing, isolation
+# ---------------------------------------------------------------------------
+
+async def _start_bulk_containers(tmp_path, jobs):
+    host_key = asyncssh.generate_private_key("ssh-ed25519")
+    host_key_path = tmp_path / "bulk_container_host_key"
+    host_key.write_private_key(str(host_key_path))
+    client_key = asyncssh.generate_private_key("ssh-ed25519")
+    client_key_path = tmp_path / "bulk_client_key"
+    client_key.write_private_key(str(client_key_path))
+    states: dict[str, dict] = {}
+    servers = []
+    registry: dict[str, tuple[str, int]] = {}
+    for job in jobs:
+        state = {"commands": [], "label": job, "bulk_bytes": 300 * 1024}
+        server = await asyncssh.listen(
+            "127.0.0.1",
+            0,
+            server_host_keys=[str(host_key_path)],
+            server_factory=lambda st=state: _BulkContainerServer(st),
+            encoding=None,
+        )
+        servers.append(server)
+        states[job] = state
+        registry[job] = ("127.0.0.1", server.get_port())
+    return (
+        servers,
+        states,
+        registry,
+        host_key.get_fingerprint("sha256"),
+        str(client_key_path),
+    )
+
+
+@contextlib.asynccontextmanager
+async def _mux_route(
+    tmp_path,
+    tmp_path_factory,
+    monkeypatch,
+    jobs,
+    *,
+    provision=False,
+):
+    """Start a login fixture, per-job container endpoints and a mux route."""
+    login = await _start_login(tmp_path_factory, password="SECRET")
+    servers, states, registry, container_pin, client_key = (
+        await _start_bulk_containers(tmp_path, jobs)
+    )
+    route_tunnel = None
+    backend = None
+    login.state["relay_registry"] = registry
+    login.state["dest_port"] = next(iter(registry.values()))[1]
+    _route_alias(monkeypatch, login)
+    try:
+        target = TargetConfig(
+            name="slurm",
+            user="agent",
+            container_user="ubuntu",
+            transport=TransportConfig(
+                kind="tunnel",
+                ssh_targets=("login",),
+                remote_host="127.0.0.1",
+                remote_port=login.state["dest_port"],
+            ),
+            route_host_key_sha256=login.pin,
+            host_key_sha256=container_pin,
+            client_key=client_key,
+            provision_command=("provision",) if provision else (),
+            interactive_auth=True,
+        )
+        mgr = TunnelManager(SSHConfig())
+        route_tunnel = await asyncio.wait_for(
+            mgr.open_job_route(
+                target,
+                "login",
+                helper_argv=("python3", "/remote/computemcp-mux.py"),
+                factor="SECRET",
+                provision=provision,
+            ),
+            CONNECT_TIMEOUT,
+        )
+        backend = SSHBackend()
+        yield login, target, mgr, route_tunnel, backend, states, registry
+    finally:
+        if backend is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(backend.close_all(), 10)
+        if route_tunnel is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(route_tunnel.stop(), 10)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(login.close(), 5)
+        for server in servers:
+            server.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(server.wait_closed(), 5)
+
+
+async def _wait_for(predicate, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+async def test_mux_route_bootstraps_then_one_channel_two_jobs(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """Provision then helper: one live outer channel and one authentication.
+
+    Two job streams transfer concurrently.  The login fixture counts live
+    session channels and auth completions; both must stay at one.
+    """
+    async with _mux_route(
+        tmp_path, tmp_path_factory, monkeypatch, ("A", "B"), provision=True
+    ) as (login, target, _mgr, route, backend, states, registry):
+        assert route.is_alive()
+        assert login.state["provision_count"] == 1
+        assert login.state["mux_execs"] == 1
+        assert login.state["auths"] == 1
+        assert login.state["connections"] == 1
+        assert login.state["max_channels"] == 1
+
+        host, port = registry["A"]
+        conn_a = await asyncio.wait_for(
+            backend.job_connection(
+                target, "A", host, port, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        host_b, port_b = registry["B"]
+        conn_b = await asyncio.wait_for(
+            backend.job_connection(
+                target, "B", host_b, port_b, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        assert conn_a is not conn_b
+        assert login.state["mux_streams"] == 2
+
+        result_a, result_b = await asyncio.wait_for(
+            asyncio.gather(
+                conn_a.run("bulk", encoding=None),
+                conn_b.run("bulk", encoding=None),
+            ),
+            20,
+        )
+        assert result_a.stdout.startswith(b"A:")
+        assert result_b.stdout.startswith(b"B:")
+        assert len(result_a.stdout) > 200 * 1024
+        assert len(result_b.stdout) > 200 * 1024
+        assert states["A"]["commands"] == ["bulk"]
+        assert states["B"]["commands"] == ["bulk"]
+        assert login.state["max_channels"] == 1
+        assert login.state["auths"] == 1
+        assert backend.known_targets() == []
+        assert sorted(backend.known_jobs()) == [("A", 1), ("B", 1)]
+
+
+async def test_mux_job_cache_and_stop_b_keeps_a(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """Cache is per job/generation; stopping B leaves A's conn/SFTP/streams."""
+    async with _mux_route(
+        tmp_path, tmp_path_factory, monkeypatch, ("A", "B")
+    ) as (_login, target, _mgr, route, backend, states, registry):
+        host, port = registry["A"]
+        conn_a = await asyncio.wait_for(
+            backend.job_connection(
+                target, "A", host, port, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        again = await asyncio.wait_for(
+            backend.job_connection(
+                target, "A", host, port, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        assert again is conn_a
+
+        host_b, port_b = registry["B"]
+        conn_b = await asyncio.wait_for(
+            backend.job_connection(
+                target, "B", host_b, port_b, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        assert (await conn_a.run("a1", encoding=None)).stdout == b"A:a1\n"
+
+        # SFTP state is keyed by the job key while the connection is cached.
+        backend._sftp_sem(conn_a, 4)
+        backend._sftp_sem(conn_b, 4)
+        backend._sftp_open_lock(conn_a)
+        backend._sftp_open_lock(conn_b)
+        assert ("A", 1) in backend._sftp_locks
+        assert ("B", 1) in backend._sftp_locks
+
+        await asyncio.wait_for(backend.disconnect_job("B"), 10)
+        assert conn_b.is_closed()
+        assert conn_a.is_closed() is False
+        assert ("B", 1) not in backend._sftp_locks
+        assert ("B", 1) not in backend._sftp_sems
+        assert ("A", 1) in backend._sftp_locks
+
+        # A still uses the same cached connection and stream.
+        assert (await conn_a.run("a2", encoding=None)).stdout == b"A:a2\n"
+        assert backend.known_jobs() == [("A", 1)]
+        assert states["B"]["commands"] == []
+        assert route.is_alive()
+
+
+async def test_mux_generation_fencing_and_cross_job_isolation(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A newer generation closes the old one; other jobs are untouched."""
+    async with _mux_route(
+        tmp_path, tmp_path_factory, monkeypatch, ("A", "B")
+    ) as (_login, target, _mgr, route, backend, _states, registry):
+        host, port = registry["A"]
+        conn_a1 = await asyncio.wait_for(
+            backend.job_connection(
+                target, "A", host, port, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        host_b, port_b = registry["B"]
+        conn_b = await asyncio.wait_for(
+            backend.job_connection(
+                target, "B", host_b, port_b, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        backend._sftp_sem(conn_a1, 4)
+
+        conn_a2 = await asyncio.wait_for(
+            backend.job_connection(
+                target, "A", host, port, generation=2, transport=route.mux
+            ),
+            15,
+        )
+        assert conn_a2 is not conn_a1
+        assert conn_a1.is_closed()
+        assert ("A", 1) not in backend._sftp_locks
+        assert sorted(backend.known_jobs()) == [("A", 2), ("B", 1)]
+        assert (await conn_b.run("b", encoding=None)).stdout == b"B:b\n"
+
+        # A request naming the superseded generation is refused, and the new
+        # connection stays cached (a stale redial cannot resurrect the old one).
+        with pytest.raises(SSHError, match="stale"):
+            await backend.job_connection(
+                target, "A", host, port, generation=1, transport=route.mux
+            )
+        assert sorted(backend.known_jobs()) == [("A", 2), ("B", 1)]
+
+
+async def test_mux_route_redial_replaces_one_channel(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A replacement route closes the old helper and keeps one live channel."""
+    async with _mux_route(
+        tmp_path, tmp_path_factory, monkeypatch, ("A",)
+    ) as (login, target, mgr, route1, backend, _states, registry):
+        host, port = registry["A"]
+        conn1 = await asyncio.wait_for(
+            backend.job_connection(
+                target, "A", host, port, generation=1, transport=route1.mux
+            ),
+            15,
+        )
+        await asyncio.wait_for(route1.stop(), 10)
+        assert conn1.is_closed()
+
+        route2 = await asyncio.wait_for(
+            mgr.open_job_route(
+                target,
+                "login",
+                helper_argv=("python3", "/remote/computemcp-mux.py"),
+                generation=2,
+                factor="SECRET",
+                provision=False,
+            ),
+            CONNECT_TIMEOUT,
+        )
+        try:
+            conn2 = await asyncio.wait_for(
+                backend.job_connection(
+                    target, "A", host, port, generation=2,
+                    transport=route2.mux,
+                ),
+                15,
+            )
+            assert conn2 is not conn1
+            assert (await conn2.run("redial", encoding=None)).stdout == b"A:redial\n"
+            assert login.state["max_channels"] == 1
+            # Each route authenticated exactly once: a healthy route never
+            # re-authenticates for probe/exec/teardown.
+            assert login.state["connections"] == 2
+            assert login.state["auths"] == 2
+            assert route2.is_alive()
+        finally:
+            await asyncio.wait_for(route2.stop(), 10)
+
+
+async def test_mux_stream_reset_and_eof_do_not_leak_or_hang(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    """A reset stream closes its inner connection and frees mux state."""
+    async with _mux_route(
+        tmp_path, tmp_path_factory, monkeypatch, ("A", "B")
+    ) as (_login, target, _mgr, route, backend, _states, registry):
+        host, port = registry["A"]
+        conn_a = await asyncio.wait_for(
+            backend.job_connection(
+                target, "A", host, port, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        host_b, port_b = registry["B"]
+        conn_b = await asyncio.wait_for(
+            backend.job_connection(
+                target, "B", host_b, port_b, generation=1, transport=route.mux
+            ),
+            15,
+        )
+        entry = backend._job_connections[("A", 1)]
+        await asyncio.wait_for(entry.stream.reset("test reset"), 5)
+        assert await _wait_for(lambda: conn_a.is_closed())
+        # B is unaffected by A's reset.
+        assert (await conn_b.run("still", encoding=None)).stdout == b"B:still\n"
+        await asyncio.wait_for(backend.disconnect_job("A"), 10)
+        assert backend.known_jobs() == [("B", 1)]
+        assert await _wait_for(
+            lambda: route.mux.mux.stats.open_streams == 1
+        )
+        assert route.is_alive()
+
+
+class _SessionStdout:
+    async def read(self, size=-1):
+        await asyncio.sleep(0)
+        return b""
+
+
+class _FakeProcess:
+    def __init__(self):
+        self.stdout = _SessionStdout()
+        self.exit_status = 0
+        self.stdin = None
+
+    def terminate(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def channel(self):
+        return None
+
+
+async def test_session_manager_job_scoped_close_keeps_other_job(
+    monkeypatch,
+):
+    """close_for_job(B) must not close A's PTY session."""
+    target = TargetConfig(
+        name="slurm",
+        user="agent",
+        transport=TransportConfig(
+            kind="direct", remote_host="127.0.0.1", remote_port=1
+        ),
+    )
+    backend = SSHBackend()
+
+    async def fake_create_session(self, conn, cwd, columns, rows, term="x"):
+        return _FakeProcess()
+
+    monkeypatch.setattr(SSHBackend, "create_session", fake_create_session)
+
+    seen = []
+
+    async def provider(name):
+        return target, object()
+
+    async def job_provider(name, job_id):
+        seen.append((name, job_id))
+        return target, object()
+
+    manager = SessionManager(
+        backend,
+        provider,
+        SessionConfig(),
+        job_provider=job_provider,
+    )
+    sess_a = await manager.create(
+        "c", target, None, 80, 24, job_id="A"
+    )
+    sess_b = await manager.create(
+        "c", target, None, 80, 24, job_id="B"
+    )
+    assert sess_a.job_id == "A"
+    assert sess_b.job_id == "B"
+    assert seen == [("slurm", "A"), ("slurm", "B")]
+    # Separate job connections were requested, so PTYs cannot share a
+    # transport that stopping one job would tear down.
+    assert sess_a.process is not sess_b.process
+
+    closed = await manager.close_for_job("B")
+    assert closed == 1
+    assert sess_a.id in manager._sessions
+    assert sess_b.id not in manager._sessions
+    await manager.close_for_job("A")
+    assert manager._sessions == {}

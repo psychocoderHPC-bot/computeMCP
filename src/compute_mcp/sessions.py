@@ -25,6 +25,9 @@ from .ssh_backend import ManagedSession, SSHBackend, SSHError
 log = logging.getLogger("compute_mcp.sessions")
 
 ConnectionProvider = Callable[[str], Awaitable[tuple[TargetConfig, asyncssh.SSHClientConnection]]]
+JobConnectionProvider = Callable[
+    [str, str], Awaitable[tuple[TargetConfig, asyncssh.SSHClientConnection]]
+]
 
 
 class SessionError(RuntimeError):
@@ -50,10 +53,15 @@ class SessionManager:
         provider: ConnectionProvider,
         config: SessionConfig,
         dedicated_provider: ConnectionProvider | None = None,
+        job_provider: JobConnectionProvider | None = None,
     ) -> None:
         self.backend = backend
         self.provider = provider
         self.dedicated_provider = dedicated_provider
+        # Job-scoped provider: (target name, job_id) -> connection.  Preferred
+        # when a session names a job, so PTYs on different jobs never share or
+        # invalidate each other's transport.
+        self.job_provider = job_provider
         self.config = config
         self._sessions: dict[str, ManagedSession] = {}
         self._readers: dict[str, asyncio.Task] = {}
@@ -78,6 +86,16 @@ class SessionManager:
             if session.target == target:
                 await self.close(session_id, owner=None, reason=reason)
 
+    async def close_for_job(self, job_id: str, reason: str = "job stopped") -> int:
+        """Close only sessions bound to *job_id*; other jobs keep running."""
+        closed = 0
+        for session_id, session in list(self._sessions.items()):
+            if session.job_id == job_id:
+                with contextlib.suppress(SessionError):
+                    await self.close(session_id, owner=None, reason=reason)
+                    closed += 1
+        return closed
+
     # -- operations --------------------------------------------------------
     def _client_sessions(self, client_id: str) -> list[ManagedSession]:
         return [s for s in self._sessions.values() if s.client_id == client_id]
@@ -89,6 +107,8 @@ class SessionManager:
         cwd: str | None,
         columns: int,
         rows: int,
+        *,
+        job_id: str | None = None,
     ) -> ManagedSession:
         if len(self._client_sessions(client_id)) >= self.config.max_per_client:
             raise SessionLimitError("per-client session limit reached")
@@ -97,7 +117,9 @@ class SessionManager:
 
         dedicated_conn = None
         try:
-            if target.connect_mode == "dedicated" and self.dedicated_provider is not None:
+            if job_id is not None and self.job_provider is not None:
+                _, conn = await self.job_provider(target.name, job_id)
+            elif target.connect_mode == "dedicated" and self.dedicated_provider is not None:
                 _, conn = await self.dedicated_provider(target.name)
                 dedicated_conn = conn
             else:
@@ -117,6 +139,7 @@ class SessionManager:
             created_at=now,
             last_activity=now,
             dedicated_conn=dedicated_conn,
+            job_id=job_id,
         )
         self._sessions[session_id] = session
         self._readers[session_id] = asyncio.create_task(self._drain(session))
@@ -237,6 +260,7 @@ class SessionManager:
             "exit_status": s.exit_status,
             "buffered_bytes": len(s.output_buffer),
             "connection": "dedicated" if s.dedicated_conn is not None else "shared",
+            "job_id": s.job_id,
         }
 
     def list(self, client_id: str, target: str | None = None) -> list[dict]:

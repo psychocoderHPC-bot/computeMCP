@@ -27,6 +27,7 @@ import contextlib
 import inspect
 import logging
 import os
+import posixpath
 import re
 import shlex
 import socket
@@ -41,6 +42,8 @@ from .ssh_backend import (
     SSHError,
     FactorPrompter,
     InteractiveSSHClient,
+    MuxLimits,
+    RouteMuxTransport,
     _empty_known_hosts,
     dial_route,
     make_factor_prompter,
@@ -664,6 +667,66 @@ class RouteTunnel:
 Tunnel = RouteTunnel
 
 
+def mux_helper_argv(
+    target: TargetConfig,
+    deploy_dir: str,
+    registry_path: str,
+    *,
+    python: str = "python3",
+) -> tuple[str, ...]:
+    """Return the argv that launches the shipped helper from a bundle dir.
+
+    The helper is a stdlib-only Python script deployed with the bundle; the
+    gateway never installs packages on the login node.  ``registry_path`` is the
+    per-route JSON registry mapping job_id to a loopback relay endpoint.
+    """
+    return (
+        python,
+        posixpath.join(deploy_dir, "computemcp-mux.py"),
+        "--registry",
+        registry_path,
+    )
+
+
+@dataclass
+class JobRouteTunnel:
+    """A route connection plus its single persistent mux helper channel.
+
+    Unlike :class:`RouteTunnel` this owns no local forwarding: per-job relay
+    endpoints are reached through mux streams keyed by job id.  ``connection``
+    is the shared, authenticated outer route; ``mux`` is the one helper process
+    on it.  ``generation`` fences a replaced endpoint: a tunnel whose generation
+    is not the live one must not be used for new work.
+    """
+
+    target: TargetConfig
+    route: str | None
+    connection: asyncssh.SSHClientConnection
+    mux: RouteMuxTransport
+    generation: int = 0
+    provisioned_endpoint: tuple[str, int] | None = None
+
+    @property
+    def is_direct(self) -> bool:
+        return False
+
+    def is_alive(self) -> bool:
+        return self.mux.is_alive()
+
+    def is_current(self, generation: int) -> bool:
+        return self.generation == generation and self.is_alive()
+
+    async def close_transport(self) -> None:
+        """Close the helper channel but keep the authenticated route open."""
+        await self.mux.close()
+
+    async def stop(self, *, close_connection: bool = True) -> None:
+        """Close the mux helper; optionally close the shared outer route."""
+        await self.mux.close()
+        if close_connection:
+            await _close_connection(self.connection)
+
+
 class TunnelManager:
     """Owns one :class:`RouteTunnel` per target and handles failover."""
 
@@ -676,6 +739,9 @@ class TunnelManager:
         target: TargetConfig,
         route: str,
         connection_timeout: float | None = None,
+        *,
+        factor: str | None = None,
+        prompter: FactorPrompter | None = None,
     ) -> asyncssh.SSHClientConnection:
         """Open a route connection without provisioning or local forwarding.
 
@@ -689,6 +755,9 @@ class TunnelManager:
         ``connection_timeout`` overrides ``ssh.connect_timeout`` for the dial;
         callers that must not stall shutdown pass a small value.  Direct
         transport is rejected: there is no login node to dial separately.
+
+        ``factor``/``prompter`` are accepted so the persistent single-channel
+        route can be opened with the same 2FA handling as a forwarding tunnel.
         """
         if target.transport.kind == "direct":
             raise TunnelError(
@@ -704,6 +773,8 @@ class TunnelManager:
 
         client_keys = _route_client_keys(route_info)
         pin = target.route_host_key_sha256 or None
+        if prompter is None and factor is not None:
+            prompter = make_factor_prompter(factor)
 
         opened: list[asyncssh.SSHClientConnection] = []
         conn: asyncssh.SSHClientConnection | None = None
@@ -714,12 +785,12 @@ class TunnelManager:
                     hop,
                     tunnel=conn,
                     client_keys=client_keys,
-                    prompter=None,
+                    prompter=prompter if is_final else None,
                     pin=pin if is_final else None,
                     ssh=self.ssh,
                     name=route,
                     fallback_user=target.user,
-                    passphrase=None,
+                    passphrase=factor if is_final else None,
                     connect_timeout=connection_timeout,
                 )
                 opened.append(tunnel_conn)
@@ -731,6 +802,76 @@ class TunnelManager:
 
         assert conn is not None  # _iter_hops always yields at least the route
         return conn
+
+    async def open_job_route(
+        self,
+        target: TargetConfig,
+        route: str,
+        *,
+        helper_argv,
+        generation: int = 0,
+        connection: asyncssh.SSHClientConnection | None = None,
+        provision: bool = True,
+        provision_env: dict[str, str] | None = None,
+        factor: str | None = None,
+        prompter: FactorPrompter | None = None,
+        connection_timeout: float | None = None,
+        limits: MuxLimits | None = None,
+    ) -> JobRouteTunnel:
+        """Establish the single-channel job transport for one route.
+
+        The sequence is: dial (or reuse) the authenticated route, run the
+        bootstrap provision command if configured, wait for its sessions to
+        close, then start the persistent helper as exactly one binary session
+        channel.  No local forwarding is created; per-job endpoints are opened
+        later as mux streams.  A caller-supplied ``connection`` is reused as-is
+        and is never closed by this method on failure.  The returned tunnel's
+        ``generation`` fences a stale endpoint.
+        """
+        if target.transport.kind == "direct":
+            raise TunnelError(
+                f"target {target.name!r}: mux transport requires tunnel transport"
+            )
+        owns_connection = connection is None
+        if connection is None:
+            if prompter is None and factor is not None:
+                prompter = make_factor_prompter(factor)
+            connection = await self.open_route_connection(
+                target,
+                route,
+                connection_timeout,
+                factor=factor,
+                prompter=prompter,
+            )
+            if prompter is not None:
+                prompter.clear()
+        try:
+            provisioned: tuple[str, int] | None = None
+            if provision and (target.provision_command or target.bundle):
+                _, _, provisioned = await self._provision_on_connection(
+                    target, route, connection, target.transport, provision_env
+                )
+            mux_transport = RouteMuxTransport(
+                connection, helper_argv, limits=limits
+            )
+            await mux_transport.start()
+        except Exception:
+            if owns_connection:
+                await _close_connection(connection)
+            raise
+        log.info(
+            "target %s: single-channel mux helper started on route %s",
+            target.name,
+            route,
+        )
+        return JobRouteTunnel(
+            target=target,
+            route=route,
+            connection=connection,
+            mux=mux_transport,
+            generation=int(generation),
+            provisioned_endpoint=provisioned,
+        )
 
     async def open_for_route(
         self,
