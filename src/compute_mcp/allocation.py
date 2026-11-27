@@ -53,6 +53,15 @@ PROTOCOL_OPTIONS = ("parsable", "quiet", "wrap")
 #: ``--set`` keys accepted by :func:`compute_plan`.
 OVERRIDE_KEYS = ("nodes", "gpus-per-node", "cpus-per-node", "mem-per-node", "mode")
 
+#: Quantity override keys mapped to the calculated field they feed.  Used to
+#: reject an override that a manual sbatch option would otherwise swallow.
+_OVERRIDE_TO_FIELD = {
+    "nodes": "nodes",
+    "gpus-per-node": "gpus-per-node",
+    "cpus-per-node": "cpus-per-node",
+    "mem-per-node": "memory-per-node",
+}
+
 # Digit sequence followed by a unit: one of K/M/G/T (case-insensitive), with
 # an optional 'i' (binary magnification) and optional trailing 'B'.  Slurm
 # treats a bare letter equivalently to its binary form (M == MiB == 1 MiB,
@@ -91,6 +100,29 @@ _NODES_CONFLICT_KEYS = ("nodes", "n")
 
 #: Task-layout option names that pin the effective task count of a stage.
 _TASK_OPTION_NAMES = ("ntasks-per-node", "ntasks")
+
+#: Order in which the implicit sbatch defaults are emitted.  Explicit mapping
+#: entries keep their configured order and come first; the defaults for every
+#: field the mapping does not name follow in this canonical order.
+_DEFAULT_ORDER = (
+    "nodes",
+    "gpus-per-node",
+    "cpus-per-node",
+    "memory-per-node",
+    "exclusive",
+)
+
+#: Manual option keys that own a calculated resource family.  When one is
+#: present in the sbatch stage it suppresses the implicit default for that
+#: family (and is reported in the preview); an explicit mapping for the same
+#: family remains a hard conflict (see :func:`validate_conflicts`).
+_DEFAULT_OWNER_KEYS: dict[str, tuple[str, ...]] = {
+    "nodes": _NODES_CONFLICT_KEYS,
+    "gpus-per-node": _GPU_CONFLICT_KEYS,
+    "cpus-per-node": ("cpus-per-task", "cpus-per-node", "cpus-per-gpu"),
+    "memory-per-node": _MEMORY_CONFLICT_KEYS,
+    "exclusive": ("exclusive",),
+}
 
 
 @dataclass(frozen=True)
@@ -194,6 +226,32 @@ def _effective_tasks_per_node(options: Mapping[str, Any]) -> int:
                 raise ConfigError(f"slurm {key} must be a positive integer when set")
             return raw
     return 0
+
+
+def _manual_owner(options: Mapping[str, Any], field: str) -> str | None:
+    """Return the manual option key that owns ``field`` in this stage, if any."""
+    for key in _DEFAULT_OWNER_KEYS[field]:
+        if key in options:
+            return key
+    return None
+
+
+def _default_present(field: str, plan: ResolvedPlan) -> bool:
+    """True when the implicit default for ``field`` has a value to emit."""
+    if field == "nodes":
+        return plan.nodes > 0
+    if field == "gpus-per-node":
+        return plan.gpus_per_node is not None and plan.gpus_per_node > 0
+    if field == "cpus-per-node":
+        return plan.cpus_per_node is not None and plan.cpus_per_node >= 1
+    if field == "memory-per-node":
+        return (
+            plan.memory_per_node_mib is not None
+            and plan.memory_per_node_mib > 0
+        )
+    if field == "exclusive":
+        return plan.exclusive
+    raise AssertionError(f"no default predicate for field {field!r}")
 
 
 def validate_conflicts(target: TargetConfig) -> None:
@@ -311,6 +369,23 @@ def compute_plan(
     node = target.node
     parsed = _parse_overrides(target, overrides)
     validate_conflicts(target)
+
+    # An override that a manual sbatch option owns would be silently ignored
+    # once the implicit default is suppressed (design §8).  An explicit mapping
+    # for the field is different: the override feeds that mapping, so it is
+    # still used.
+    sbatch_stage = target.slurm.sbatch if target.slurm is not None else None
+    if sbatch_stage is not None:
+        for override_key, field in _OVERRIDE_TO_FIELD.items():
+            if override_key not in parsed or field in sbatch_stage.mapping:
+                continue
+            owner = _manual_owner(sbatch_stage.options, field)
+            if owner is not None:
+                raise ConfigError(
+                    f"target {target.name!r}: --set {override_key} would be "
+                    f"ignored because the sbatch manual option {owner!r} owns "
+                    f"{field!r}; remove the manual option or the override"
+                )
 
     nodes: int | None
     if "nodes" in parsed:
@@ -600,11 +675,12 @@ def _render_mapped(
     stage: SlurmStageConfig | None,
     plan: ResolvedPlan,
 ) -> tuple[list[str], tuple[str, ...]]:
-    """Render the stage's calculated-value mappings; return (args, emitted).
+    """Render the stage's explicit calculated-value mappings.
 
-    A mapping for a field whose value is ``None`` (or 0 where 0 is "none")
-    emits nothing and is not reported as emitted.  Missing mapping tables
-    yield only the manual arguments.
+    Returns ``(args, emitted)``.  A mapping for a field whose value is
+    ``None`` (or 0 where 0 is "none") emits nothing and is not reported as
+    emitted, but still owns that field (the sbatch implicit default is then
+    not emitted).  The implicit defaults are added by :func:`_render_stage`.
     """
     emitted: list[str] = []
     values: list[str] = []
@@ -644,26 +720,53 @@ def _render_mapped(
     return values, tuple(emitted)
 
 
-def render_args(
-    target: TargetConfig, plan: ResolvedPlan
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Return ``(sbatch_args, srun_args)``: complete option strings per stage.
+@dataclass(frozen=True)
+class _StageRender:
+    """One stage's rendered arguments plus how each field was represented."""
 
-    The two stages are rendered independently from their own manual options
-    and own mapping tables; nothing is copied between them.  Every element of
-    a returned tuple is one complete argument (e.g. ``--nodes=2``,
-    ``--gres=gpu:2``): joining them with newlines fills
-    ``COMPUTEMCP_SBATCH_ARGS`` / ``COMPUTEMCP_SRUN_ARGS`` for the provisioning
-    helper, which supplies its own protocol options.  Order is stable and
-    deterministic: manual options in configuration order first, then the
-    mapped options in the stage's mapping order.
+    args: tuple[str, ...]
+    emitted: tuple[str, ...]
+    mapped: tuple[str, ...]
+    defaulted: tuple[str, ...]
+    suppressed: Mapping[str, str]
+
+
+def _default_args(
+    target: TargetConfig,
+    stage_name: str,
+    field: str,
+    plan: ResolvedPlan,
+    options: Mapping[str, Any],
+) -> list[str]:
+    """Render the implicit default for one calculated field.
+
+    Only the ``sbatch`` stage uses these; the ``srun`` step stays independent
+    so a job step never inherits the whole allocation implicitly.  CPUs per
+    node become ``--cpus-per-task`` only in a one-task-per-node layout: an
+    unspecified layout is pinned with ``--ntasks-per-node=1``, while an
+    explicitly multi-task layout is refused rather than mis-rendered.
     """
-    if target.slurm is None:
-        return (), ()
-    return (
-        _render_stage(target, "sbatch", target.slurm.sbatch, plan),
-        _render_stage(target, "srun", target.slurm.srun, plan),
-    )
+    if field == "nodes":
+        return [f"--nodes={plan.nodes}"]
+    if field == "gpus-per-node":
+        return [f"--gpus-per-node={plan.gpus_per_node}"]
+    if field == "cpus-per-node":
+        effective = _effective_tasks_per_node(options)
+        if effective > 1:
+            raise ConfigError(
+                f"{_ctx(target, stage_name)}: the implicit --cpus-per-task "
+                f"default is incompatible with a multi-task layout "
+                f"(effective task count {effective}); set exactly one task per "
+                "node (ntasks-per-node = 1) or override/map the CPUs explicitly"
+            )
+        prefix = ["--ntasks-per-node=1"] if effective == 0 else []
+        return prefix + [f"--cpus-per-task={plan.cpus_per_node}"]
+    if field == "memory-per-node":
+        # Whole MiB with explicit M unit: the guaranteed-supported unit.
+        return [f"--mem={plan.memory_per_node_mib}M"]
+    if field == "exclusive":
+        return ["--exclusive"]
+    raise AssertionError(f"no default renderer for field {field!r}")
 
 
 def _render_stage(
@@ -671,9 +774,9 @@ def _render_stage(
     stage_name: str,
     stage: SlurmStageConfig | None,
     plan: ResolvedPlan,
-) -> tuple[str, ...]:
+) -> _StageRender:
     if stage is None:
-        return ()  # absent stage: no arguments at all
+        return _StageRender((), (), (), (), {})
     # The scheduler account is a first-class stage field and always leads the
     # stage's arguments so ordering is deterministic and independent of the
     # manual-option order.  An empty/None account emits nothing.
@@ -681,10 +784,30 @@ def _render_stage(
     if stage.account:
         args.append(f"--account={stage.account}")
     args += _render_manual(target, stage_name, stage.options)
-    mapped, _ = _render_mapped(target, stage_name, stage, plan)
-    combined = args + mapped
+    mapped, mapped_fields = _render_mapped(target, stage_name, stage, plan)
+    args += mapped
+
+    # Implicit defaults apply to sbatch only.  An explicit mapping owns its
+    # field even when it currently emits nothing; a manual option owns its
+    # family and suppresses the default (reported in the preview).
+    defaulted: list[str] = []
+    suppressed: dict[str, str] = {}
+    if stage_name == "sbatch":
+        explicitly_mapped = set(stage.mapping)
+        for field in _DEFAULT_ORDER:
+            if field in explicitly_mapped or not _default_present(field, plan):
+                continue
+            owner = _manual_owner(stage.options, field)
+            if owner is not None:
+                suppressed[field] = owner
+                continue
+            args.extend(_default_args(target, stage_name, field, plan, stage.options))
+            defaulted.append(field)
+
+    combined = args
     # Verify no stage setting appears twice: a manual option and a mapped
     # value of the same family must have been caught by validate_conflicts,
+    # and a default is skipped when a mapping or manual option owns its field,
     # so a duplicate is a bug, not something to silently dedupe.
     seen: set[str] = set()
     excess: list[str] = []
@@ -699,33 +822,76 @@ def _render_stage(
             "appeared twice; a conflicting manual option and a mapping must "
             "not both emit"
         )
-    return tuple(combined)
+    return _StageRender(
+        args=tuple(combined),
+        emitted=tuple(mapped_fields) + tuple(defaulted),
+        mapped=tuple(mapped_fields),
+        defaulted=tuple(defaulted),
+        suppressed=dict(suppressed),
+    )
+
+
+def render_args(
+    target: TargetConfig, plan: ResolvedPlan
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return ``(sbatch_args, srun_args)``: complete option strings per stage.
+
+    The two stages are rendered independently from their own manual options
+    and own mapping tables; nothing is copied between them.  Every element of
+    a returned tuple is one complete argument (e.g. ``--nodes=2``,
+    ``--gres=gpu:2``): joining them with newlines fills
+    ``COMPUTEMCP_SBATCH_ARGS`` / ``COMPUTEMCP_SRUN_ARGS`` for the provisioning
+    helper, which supplies its own protocol options.  Order is stable and
+    deterministic: manual options in configuration order first, then the
+    explicit mapping options in the stage's mapping order, then any implicit
+    sbatch defaults in canonical order.
+
+    This is the single renderer shared by ``--dry-run``/preview
+    (:func:`plan_summary` calls it too) and actual submission, so the previewed
+    and executed argument vectors are identical.
+    """
+    if target.slurm is None:
+        return (), ()
+    return (
+        _render_stage(target, "sbatch", target.slurm.sbatch, plan).args,
+        _render_stage(target, "srun", target.slurm.srun, plan).args,
+    )
 
 
 def plan_summary(target: TargetConfig, plan: ResolvedPlan) -> dict:
-    """Serializable preview of the plan, per-stage emitted args and un-emitted
-    calculated fields for the ``--dry-run`` output.
+    """Serializable preview of the plan, per-stage args and field sources.
 
-    ``args`` is the per-stage rendered argument list; ``emitted`` names the
-    calculated fields each stage's mapping turned into options; ``not_emitted``
-    lists the calculated fields no stage emitted (e.g. a calculated memory
-    share when only a manual ``mem`` option is configured, or an exclusivity
-    intent with no ``exclusive`` mapping).  ``manual`` carries the verbatim
+    ``args`` is the per-stage rendered argument list, produced by the same
+    renderer that actually submits, so a dry-run cannot drift from the
+    executed argv.  ``emitted`` names every calculated field a stage turned
+    into an option (explicit mapping or implicit default); ``mapped`` and
+    ``defaulted`` split those two sources; ``suppressed`` maps each sbatch
+    field whose implicit default was suppressed by a manual option to the
+    owning manual key.  ``not_emitted`` lists calculated fields no stage
+    emitted and no manual option suppressed.  ``manual`` carries the verbatim
     manual options per stage; ``account`` carries the per-stage scheduler
     account (``None`` when unset, so ``--dry-run`` can show it).  The preview
-    must keep the *calculated* intent, the *emitted* request and the
+    keeps the *calculated* intent, the *emitted* request and the
     possibly-different manual memory apart.
     """
     slurm = target.slurm
     emitted: dict[str, list[str]] = {"sbatch": [], "srun": []}
+    mapped: dict[str, list[str]] = {"sbatch": [], "srun": []}
+    defaulted: dict[str, list[str]] = {"sbatch": [], "srun": []}
+    suppressed: dict[str, dict[str, str]] = {"sbatch": {}, "srun": {}}
     manual: dict[str, dict[str, Any]] = {"sbatch": {}, "srun": {}}
     account: dict[str, str | None] = {"sbatch": None, "srun": None}
+    stage_args: dict[str, list[str]] = {"sbatch": [], "srun": []}
     if slurm is not None:
         for stage_name, stage in (("sbatch", slurm.sbatch), ("srun", slurm.srun)):
             if stage is None:
                 continue
-            _, fields = _render_mapped(target, stage_name, stage, plan)
-            emitted[stage_name] = list(fields)
+            info = _render_stage(target, stage_name, stage, plan)
+            stage_args[stage_name] = list(info.args)
+            emitted[stage_name] = list(info.emitted)
+            mapped[stage_name] = list(info.mapped)
+            defaulted[stage_name] = list(info.defaulted)
+            suppressed[stage_name] = dict(info.suppressed)
             manual[stage_name] = {str(k): v for k, v in stage.options.items()}
             account[stage_name] = stage.account
     # Map each plan field to its canonical mapping key so that "emitted"
@@ -741,11 +907,13 @@ def plan_summary(target: TargetConfig, plan: ResolvedPlan) -> dict:
         for field, value in plan.calculated_fields()
         if value is not None
     ]
-    emitted_keys = {f for fields in emitted.values() for f in fields}
-    # Report each un-emitted field by its canonical mapping key (same naming
-    # convention as "emitted") so the preview can cross-reference cleanly.
-    not_emitted = [mk for field, mk in all_calculated if mk not in emitted_keys]
-    sbatch, srun = render_args(target, plan)
+    represented_keys = {f for fields in emitted.values() for f in fields}
+    represented_keys |= {f for fields in suppressed.values() for f in fields}
+    # Report each unrepresented field by its canonical mapping key (same
+    # naming convention as "emitted") so the preview can cross-reference.
+    not_emitted = [
+        mk for field, mk in all_calculated if mk not in represented_keys
+    ]
     return {
         "target": target.name,
         "plan": {
@@ -760,7 +928,10 @@ def plan_summary(target: TargetConfig, plan: ResolvedPlan) -> dict:
         "overrides": dict(plan.overrides),
         "manual": manual,
         "account": account,
-        "args": {"sbatch": list(sbatch), "srun": list(srun)},
+        "args": {"sbatch": stage_args["sbatch"], "srun": stage_args["srun"]},
         "emitted": emitted,
+        "mapped": mapped,
+        "defaulted": defaulted,
+        "suppressed": suppressed,
         "not_emitted": not_emitted,
     }
