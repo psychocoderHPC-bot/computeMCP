@@ -643,11 +643,15 @@ def test_parser_accepts_target_shared_set_and_dry_run():
     args = build_parser().parse_args(
         [
             "--config", "x.toml", "target-shared", "hal",
-            "--set", "nodes=2", "--set", "gpus-per-node=1", "--dry-run",
+            "--set", "nodes=2", "--set", "gpus-per-node=1",
+            "--root-mode", "clean", "--clean-home", "/benchmarks/run-42",
+            "--dry-run",
         ]
     )
     assert args.command == "target-shared"
     assert args.overrides == ["nodes=2", "gpus-per-node=1"]
+    assert args.root_mode == "clean"
+    assert args.clean_home == "/benchmarks/run-42"
     assert args.dry_run is True
 
 
@@ -685,6 +689,34 @@ async def test_control_target_shared_dry_run_uses_preview_without_factor(
     out = capsys.readouterr().out
     assert "planned:" in out
     assert "shared_reuse:" in out
+
+
+async def test_control_target_shared_dry_run_forwards_root_home_and_set(
+    monkeypatch, capsys
+):
+    calls, _ = await _run_control(
+        monkeypatch,
+        [
+            "target-shared", "hal", "--2fa", "--dry-run",
+            "--set", "nodes=2",
+            "--root-mode", "clean", "--clean-home", "/benchmarks/run-42",
+        ],
+        {"target": "hal", "connected": False, "planned": {"plan": {}}},
+    )
+    # The requested target-level overrides reach the preview body; no factor
+    # is prompted for or sent on a dry-run.
+    assert calls == [
+        (
+            "POST",
+            "/v1/targets/hal/preview",
+            {
+                "set": {"nodes": 2},
+                "root_mode": "clean",
+                "clean_home": "/benchmarks/run-42",
+            },
+        )
+    ]
+    capsys.readouterr()
 
 
 @pytest.mark.parametrize(
@@ -810,6 +842,35 @@ async def test_control_target_sbatch_dry_run_uses_preview(monkeypatch):
     )
     assert calls == [
         ("POST", "/v1/targets/hal/preview", {"set": {"nodes": 2}})
+    ]
+
+
+async def test_control_target_sbatch_dry_run_forwards_root_home_and_set(
+    monkeypatch,
+):
+    preview = {"target": "hal", "planned": {"plan": {}}}
+    calls, _ = await _run_control(
+        monkeypatch,
+        [
+            "target-sbatch", "hal", "--2fa", "--dry-run",
+            "--set", "gpus-per-node=1",
+            "--root-mode", "clean", "--clean-home", "/benchmarks/run-42",
+            "--request-id", "r1",
+        ],
+        preview,
+    )
+    # The preview carries the requested allocation fields exactly as the real
+    # submit would, but never the 2FA factor or the submit idempotency id.
+    assert calls == [
+        (
+            "POST",
+            "/v1/targets/hal/preview",
+            {
+                "set": {"gpus-per-node": 1},
+                "root_mode": "clean",
+                "clean_home": "/benchmarks/run-42",
+            },
+        )
     ]
 
 

@@ -288,6 +288,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="allocation override (repeatable), e.g. --set gpus-per-node=2",
     )
     p.add_argument(
+        "--root-mode", choices=("fakeroot", "clean"), default=None,
+        help="root filesystem mode to preview for the shared job",
+    )
+    p.add_argument(
+        "--clean-home", default=None, metavar="PATH",
+        help="home subdirectory to preview for the shared job (relative to "
+        "the client home)",
+    )
+    p.add_argument(
         "--dry-run", action="store_true",
         help="preview the allocation without starting or reusing the shared job",
     )
@@ -536,7 +545,9 @@ async def _run(args: argparse.Namespace) -> int:
                 # shared-job start or reuse happens on a dry-run.
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/preview",
-                    json_body=_target_body(None, overrides),
+                    json_body=_preview_body(
+                        overrides, args.root_mode, args.clean_home
+                    ),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_preview(args, body)
@@ -552,7 +563,9 @@ async def _run(args: argparse.Namespace) -> int:
             if args.dry_run:
                 body = await control.request(
                     "POST", f"/v1/targets/{args.target}/preview",
-                    json_body=_target_body(None, overrides),
+                    json_body=_preview_body(
+                        overrides, args.root_mode, args.clean_home
+                    ),
                     timeout=_resolve_timeout(args, config, [args.target]),
                 )
                 _emit_preview(args, body)
@@ -671,6 +684,25 @@ def _sbatch_body(
         body["clean_home"] = clean_home
     if request_id is not None:
         body["request_id"] = request_id
+    return body or None
+
+
+def _preview_body(
+    overrides: dict | None,
+    root_mode: str | None,
+    clean_home: str | None,
+) -> dict | None:
+    """Build a dry-run preview body without submit-only authentication data.
+
+    The preview mirrors the allocation-selecting submit fields: repeatable
+    overrides plus the requested private root mode and clean home.  A 2FA
+    factor and a submit idempotency id are never part of a preview.
+    """
+    body = _target_body(None, overrides) or {}
+    if root_mode is not None:
+        body["root_mode"] = root_mode
+    if clean_home is not None:
+        body["clean_home"] = clean_home
     return body or None
 
 
