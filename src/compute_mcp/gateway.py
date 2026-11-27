@@ -16,9 +16,9 @@ import json
 import logging
 import os
 import posixpath
+import shlex
 import signal
 import sys
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,7 +37,7 @@ from .allocation import (
     render_args,
     validate_conflicts,
 )
-from .bundle import BundleError, public_key_for, resolve_deploy_dir
+from .bundle import BundleError, ensure_deployed, public_key_for, resolve_deploy_dir
 from .config import (
     ConfigError,
     GatewayConfig,
@@ -48,6 +48,7 @@ from .config import (
     default_config_path,
     default_token_path,
     load_config,
+    parse_job_limits,
     validate_target_name,
 )
 from .enrollment import (
@@ -94,6 +95,26 @@ RECOVERY_POLL_SECONDS = 5.0
 # is already gone (gateway shutdown after a lost route).  Bound the dial so
 # shutdown cannot hang on an unreachable login node.
 _CLOSE_ROUTE_TIMEOUT = 15.0
+
+
+def _configured_state_root(config: GatewayConfig) -> Path:
+    """Durable gateway job state root, derived from the environment/config.
+
+    A temp directory is deliberately not a fallback: job records, lock files
+    and the mux relay registry must survive a gateway restart.  Production
+    callers pass an explicit ``--state-dir`` or ``COMPUTEMCP_STATE_DIR``; a
+    config file places the state next to itself.  Tests pass a ``tmp_path``
+    explicitly through ``Gateway(state_root=...)``.
+    """
+    env = os.environ.get("COMPUTEMCP_STATE_DIR")
+    if env:
+        return Path(env)
+    if config.config_path:
+        return Path(config.config_path).resolve().parent / "state"
+    raise ConfigError(
+        "no durable job state root: pass --state-dir, set "
+        "COMPUTEMCP_STATE_DIR, or configure a gateway config file"
+    )
 
 
 def _container_env_fields(target: TargetConfig) -> dict[str, str]:
@@ -483,6 +504,257 @@ class SlurmProvisioner:
         await self._delegate("detach", record)
 
 
+_STAGE_STATE_TO_SCHEDULER = {
+    "PENDING": "PENDING",
+    "STARTING": "CONFIGURING",
+    "READY": "RUNNING",
+    "TERMINAL": "COMPLETED",
+}
+
+
+def _parse_stage_output(text: str) -> dict[str, str]:
+    """Parse the line-oriented ``KEY value`` output of the T8 helper.
+
+    The helper prints one key per line (``SLURM_JOB_ID``, ``STATE``,
+    ``CORRELATION_TOKEN``, ``IMAGE_DIGEST``...).  Unknown lines are ignored so
+    adding a field to the helper does not break an older gateway.
+    """
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        key, sep, value = line.partition(" ")
+        if not sep:
+            continue
+        key = key.strip().upper().replace("-", "_").replace(".", "_")
+        values[key] = value.strip()
+    return values
+
+
+class BundleStageProvisioner:
+    """JobProvisioner backed by the shipped ``computemcp-provision.sh``.
+
+    Every operation invokes the helper's explicit stage (``submit``,
+    ``observe``, ``attach``, ``cancel``, ``detach``) over the live login route
+    with the complete ``COMPUTEMCP_*`` contract.  It is not a scheduler shim:
+    ``submit`` performs the bundle deploy/sbatch step, ``observe`` maps a
+    terminal/purged job to ``COMPLETED`` so the quota slot is released, and
+    ``detach`` never signals Slurm.
+
+    ``run``/``deploy_dir``/``connection`` are injection points for tests.  A
+    test runner also skips the remote bundle upload: the configured deploy
+    directory is used verbatim, so the production factory can be exercised
+    without SSH.
+    """
+
+    def __init__(
+        self,
+        gateway: "Gateway",
+        target: TargetConfig,
+        *,
+        run: Callable[..., Any] | None = None,
+        deploy_dir: str | None = None,
+        connection: Any = None,
+    ) -> None:
+        self.gateway = gateway
+        self.target = target
+        self._run = run
+        self._deploy_dir = deploy_dir
+        self._connection = connection
+
+    # -- transport / environment ------------------------------------------
+    def _route_connection(self) -> Any:
+        if self._connection is not None:
+            return self._connection
+        runtime = self.gateway.runtimes.get(self.target.name)
+        tunnel = getattr(runtime, "tunnel", None)
+        connection = getattr(tunnel, "connection", None)
+        if connection is None:
+            raise jobcore.JobError(
+                f"target {self.target.name!r} has no live route connection for "
+                "a Slurm stage"
+            )
+        return connection
+
+    def _stage_env(self, record: "jobcore.JobRecord") -> dict[str, str]:
+        target = self.target
+        env: dict[str, str] = {
+            "COMPUTEMCP_SBATCH_ARGS": "",
+            "COMPUTEMCP_SRUN_ARGS": "",
+            "COMPUTEMCP_SYSTEM": target.name,
+        }
+        env.update(_container_env_fields(target))
+        overrides = record.parameters.get("set")
+        if overrides is not None and not isinstance(overrides, dict):
+            overrides = None
+        try:
+            plan, _provision_env = self.gateway._resolve_allocation(
+                target, overrides
+            )
+            sbatch, srun = render_args(target, plan)
+            env.update(build_provision_env(target, plan, sbatch, srun))
+        except (ConfigError, ValueError):
+            # A target without a full allocation block still gets a complete
+            # stage contract; the helper reports the missing field itself.
+            pass
+        private = record.kind == "private"
+        env.update(
+            {
+                "COMPUTEMCP_JOB_ID": record.job_id,
+                "COMPUTEMCP_JOB_KIND": record.kind,
+                "COMPUTEMCP_CLIENT_ID": (
+                    record.owner_client_id if private else ""
+                ),
+                "COMPUTEMCP_ROOT_MODE": (
+                    record.root_mode or target.root_mode
+                ),
+                "COMPUTEMCP_CLEAN_HOME": (
+                    (record.home or "") if private else ""
+                ),
+                "COMPUTEMCP_HOME_BASE": target.home_base or "",
+                "COMPUTEMCP_CORRELATION_TOKEN": record.correlation_token,
+                "COMPUTEMCP_STATE_DIR": str(
+                    Path(self.gateway.state_root or self.gateway._default_state_root())
+                    / "jobs"
+                    / record.job_id
+                ),
+            }
+        )
+        return env
+
+    async def _stage_argv(self, action: str) -> list[str]:
+        connection = self._route_connection()
+        deploy_dir = self._deploy_dir
+        if deploy_dir is None:
+            if self._run is None:
+                deploy_dir = await ensure_deployed(connection, self.target)
+            else:
+                deploy_dir = resolve_deploy_dir(self.target)
+        script = posixpath.join(deploy_dir, "computemcp-provision.sh")
+        return ["bash", script, action]
+
+    async def _execute(
+        self, action: str, record: "jobcore.JobRecord"
+    ) -> dict[str, str]:
+        argv = await self._stage_argv(action)
+        env = self._stage_env(record)
+        command = " ".join(shlex.quote(part) for part in argv)
+        runner = self._run or self.gateway.backend.run
+        result = await _maybe_await(
+            runner(self._route_connection(), command, env=env,
+                   timeout=self.target.provision_timeout)
+        )
+        if hasattr(result, "exit_status"):
+            code = int(getattr(result, "exit_status", 0) or 0)
+            out = (getattr(result, "stdout", b"") or b"").decode(
+                errors="replace"
+            )
+            err = (getattr(result, "stderr", b"") or b"").decode(
+                errors="replace"
+            )
+        elif isinstance(result, tuple) and len(result) >= 3:
+            code, out, err = int(result[0]), str(result[1] or ""), str(result[2] or "")
+        else:
+            code, out, err = 0, str(result or ""), ""
+        if code != 0:
+            detail = err.strip() or out.strip() or f"{action} exited {code}"
+            if action == "submit":
+                raise jobcore.SchedulerRejected(detail)
+            raise jobcore.JobError(detail)
+        parsed = _parse_stage_output(out)
+        if action == "submit" and not parsed.get("SLURM_JOB_ID"):
+            # ``sbatch --parsable`` style fallback: the helper normally prints
+            # an explicit key, but an older helper may print only the id line.
+            first = out.strip().splitlines()[0] if out.strip() else ""
+            if first and first.split()[0].isdigit():
+                parsed["SLURM_JOB_ID"] = first.split()[0]
+        return parsed
+
+    # -- JobProvisioner protocol ------------------------------------------
+    async def submit(self, record: "jobcore.JobRecord") -> str:
+        parsed = await self._execute("submit", record)
+        slurm_id = parsed.get("SLURM_JOB_ID", "")
+        if not slurm_id.isdigit():
+            raise jobcore.SchedulerRejected(
+                f"submit stage produced no numeric Slurm id: {parsed!r}"
+            )
+        digest = _stage_digest(parsed)
+        if digest:
+            # The record is persisted by JobManager.submit after this call.
+            record.base_digest = digest
+        cluster = parsed.get("CLUSTER")
+        return f"{slurm_id};{cluster}" if cluster else slurm_id
+
+    async def observe(self, job: "jobcore.JobRecord | str") -> str | None:
+        record = self._record_for(job)
+        parsed = await self._execute("observe", record)
+        digest = _stage_digest(parsed)
+        if digest:
+            record.base_digest = digest
+        state = (parsed.get("STATE") or "").upper()
+        return _STAGE_STATE_TO_SCHEDULER.get(state, state or None)
+
+    async def attach(
+        self, record: "jobcore.JobRecord"
+    ) -> Mapping[str, Any] | None:
+        parsed = await self._execute("attach", record)
+        endpoint = parsed.get("ENDPOINT")
+        if not endpoint:
+            return None
+        payload: dict[str, Any] = {
+            "node": parsed.get("NODE") or "unknown",
+            "relay_endpoint": endpoint,
+            "generation": record.generation + 1,
+        }
+        if parsed.get("CONTAINER_PORT"):
+            payload["container_endpoint"] = (
+                f"{payload['node']}:{parsed['CONTAINER_PORT']}"
+            )
+        return payload
+
+    async def cancel(self, job: "jobcore.JobRecord | str") -> None:
+        await self._execute("cancel", self._record_for(job))
+
+    async def detach(self, record: "jobcore.JobRecord") -> None:
+        await self._execute("detach", record)
+
+    def _record_for(
+        self, job: "jobcore.JobRecord | str"
+    ) -> "jobcore.JobRecord":
+        if isinstance(job, jobcore.JobRecord):
+            return job
+        store = self.gateway.job_store
+        if store is not None:
+            record = self._find_by_slurm_id(store, str(job))
+            if record is not None:
+                return record
+        raise jobcore.JobError(f"no job record for Slurm id {job!r}")
+
+    @staticmethod
+    def _find_by_slurm_id(
+        store: "jobcore.JobStore", slurm_id: str
+    ) -> "jobcore.JobRecord | None":
+        for record in store.scan():
+            if record.slurm_job_id == slurm_id:
+                return record
+        return None
+
+
+def _stage_digest(parsed: Mapping[str, str]) -> str | None:
+    for key in (
+        "IMAGE_DIGEST",
+        "BASE_DIGEST",
+        "DIGEST",
+        "IMAGE_DIGEST_SHA256",
+        "IMAGE_DIGEST_HEX",
+    ):
+        value = parsed.get(key)
+        if value:
+            return value
+    return None
+
+
 class _RouteOnlyTunnel:
     """A dialed login route with no provisioning and no local forwarding.
 
@@ -745,12 +1017,7 @@ class Gateway:
         return target.slurm is not None and target.bundle is not None
 
     def _default_state_root(self) -> Path:
-        env = os.environ.get("COMPUTEMCP_STATE_DIR")
-        if env:
-            return Path(env)
-        if self.config.config_path:
-            return Path(self.config.config_path).resolve().parent / "state"
-        return Path(tempfile.mkdtemp(prefix="computemcp-gateway-jobs-"))
+        return _configured_state_root(self.config)
 
     def _ensure_jobs(self) -> jobcore.JobManager:
         """Create the durable job registry on first use (idempotent)."""
@@ -1070,15 +1337,56 @@ class Gateway:
         deploy_dir = resolve_deploy_dir(target)
         return mux_helper_argv(target, deploy_dir, str(path))
 
-    def _resolve_clean_home(self, clean_home: str | None) -> str | None:
+    def _resolve_clean_home(
+        self,
+        clean_home: str | None,
+        *,
+        target: TargetConfig | None = None,
+        client_id: str | None = None,
+    ) -> str | None:
+        """Validate and normalise a private-job clean home.
+
+        The returned value is the path relative to the client's private home
+        (``<home-base>/agents/<client>/``), which is what the bundle helper
+        consumes as ``COMPUTEMCP_CLEAN_HOME``.  When a local, absolute
+        ``home_base`` is configured the components are checked for symlink
+        escapes with the same public errors the bundle raises; the remote
+        helper repeats the check on the real host.
+        """
         if clean_home is None:
             return None
         if not isinstance(clean_home, str) or not clean_home.strip():
-            raise ConfigError("clean_home must be a non-empty path")
-        relative = clean_home.strip().lstrip("/")
-        parts = Path(relative).parts
-        if not relative or relative in (".", "..") or ".." in parts:
-            raise ConfigError("clean_home must be a relative path inside the home")
+            raise ConfigError("COMPUTEMCP_CLEAN_HOME must name a directory")
+        value = clean_home.strip()
+        if value.startswith("/"):
+            value = value[1:]
+        parts = [part for part in value.split("/") if part not in ("", ".")]
+        if not parts:
+            raise ConfigError("COMPUTEMCP_CLEAN_HOME must name a directory")
+        if any(part == ".." for part in parts):
+            raise ConfigError("COMPUTEMCP_CLEAN_HOME must not contain '..'")
+        relative = "/".join(parts)
+        base = target.home_base if target is not None else None
+        if base and os.path.isabs(base):
+            base_real = Path(os.path.realpath(base))
+            current = base_real
+            components: list[str] = []
+            if client_id:
+                components.extend(("agents", client_id))
+            components.extend(parts)
+            for part in components:
+                current = current / part
+                if current.is_symlink():
+                    raise ConfigError(
+                        f"refusing a symlink in the home path: {current}"
+                    )
+            resolved = Path(os.path.realpath(current))
+            private = base_real / "agents" / client_id if client_id else base_real
+            private_real = Path(os.path.realpath(private))
+            try:
+                resolved.relative_to(private_real)
+            except ValueError:
+                raise ConfigError("resolved home escapes the home base") from None
         return relative
 
     def _endpoint(self, runtime: TargetRuntime) -> tuple[str, int]:
@@ -1296,6 +1604,16 @@ class Gateway:
     # -- state machine -----------------------------------------------------
     async def ensure_connected(self, name: str) -> TargetRuntime:
         target = self._target(name)
+        if self._is_multijob(target):
+            # Recovery for the durable job path is route-open only.  It must
+            # never run the legacy provision command (which can submit outside
+            # the registry/quota) and must never scancel an existing job.
+            async with self._lock(name):
+                await self._open_slurm_route_locked(
+                    target, self.runtimes[name], None
+                )
+            self._ensure_jobs()
+            return self.runtimes[name]
         async with self._lock(name):
             runtime = self.runtimes[name]
             if runtime.state == "connected":
@@ -1686,13 +2004,21 @@ class Gateway:
         self.tunnels.release_local_port(local_port)
 
     def preview_target(
-        self, name: str, overrides: dict[str, Any] | None = None
+        self,
+        name: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        root_mode: str | None = None,
+        clean_home: str | None = None,
+        client: Client | None = None,
     ) -> dict:
         """Pure allocation preview: no connection, no allocation, no state change.
 
-        Returns the resolved plan summary, the per-stage rendered args and the
-        provision environment contract.  For a connected target, a preview whose
-        effective settings differ from the retained ones reports
+        Returns the resolved plan summary, the per-stage rendered args, the
+        provision environment contract and the job-selection fields the CLI
+        renders: root mode, the resolved private home, shared-job reuse and
+        conflict status, and remaining private quota.  For a connected target, a
+        preview whose effective settings differ from the retained ones reports
         ``needs_refresh``; a plain connect and a preview never disturb the live
         allocation.
         """
@@ -1701,6 +2027,30 @@ class Gateway:
         plan, provision_env = self._resolve_allocation(target, overrides)
         sbatch, srun = render_args(target, plan)
         summary = plan_summary(target, plan)
+        effective_root = root_mode or target.root_mode
+        home = self._resolve_clean_home(
+            clean_home if clean_home is not None else target.clean_home,
+            target=target,
+            client_id=client.client_id if client is not None else None,
+        )
+        multijob = self._is_multijob(target)
+        shared = self._active_shared_record(name) if multijob else None
+        params = {"set": dict(overrides)} if overrides else {}
+        conflict = bool(
+            shared is not None
+            and _settings_signature(
+                shared.parameters, shared.root_mode, shared.home
+            )
+            != _settings_signature(params, effective_root, home)
+        )
+        quota_available: bool | None = None
+        if multijob and client is not None:
+            if self.quota is not None:
+                quota_available = self.quota.available(client.client_id, name) > 0
+            else:
+                # No registry has been created yet (preview before start); the
+                # configured limit is the honest, side-effect-free answer.
+                quota_available = client.job_limit(name) > 0
         result = {
             "target": name,
             "connected": runtime.state == "connected",
@@ -1708,6 +2058,12 @@ class Gateway:
             "sbatch_args": list(sbatch),
             "srun_args": list(srun),
             "provision_env": provision_env,
+            "root_mode": effective_root,
+            "home": home,
+            "clean_home": home,
+            "shared_reuse": shared.job_id if shared is not None else False,
+            "settings_conflict": conflict,
+            "quota_available": quota_available,
             "would_emit": {
                 "sbatch": list(sbatch),
                 "srun": list(srun),
@@ -2507,37 +2863,51 @@ class Gateway:
         params = dict(parameters or {})
         if overrides:
             params["set"] = dict(overrides)
-        requested = _settings_signature(params, root_mode, None)
+        effective_root = root_mode or target.root_mode
+        home = self._resolve_clean_home(
+            clean_home, target=target, client_id=client.client_id
+        )
+        requested = _settings_signature(params, effective_root, home)
 
         async with self._shared_lock(name):
-            existing = self._active_shared_record(name)
-            if existing is not None:
-                result = self.public_status(name)
-                result["job"] = _public_job(existing)
-                result["job_id"] = existing.job_id
-                if _settings_signature(
-                    existing.parameters, existing.root_mode, existing.home
-                ) != requested:
-                    result["settings_conflict"] = True
-                    result["error"] = (
-                        "shared job settings differ from the active shared job; "
-                        "it is not replaced automatically"
-                    )
-                return result
-            request = jobcore.JobRequest(
-                client_id=client.client_id,
-                target=name,
-                request_id=f"shared:{name}:{uuid.uuid4().hex}",
-                kind="shared",
-                parameters=params,
-                root_mode=root_mode,
-                home=None,
+            # The in-process lock only serializes tasks of this gateway.  The
+            # durable per-target lock makes the check-and-submit atomic across
+            # gateway processes, so two instances create exactly one shared
+            # job.  The blocking acquisition runs off the event loop.
+            file_lock = await asyncio.to_thread(
+                manager.store.shared_lock, name, client.client_id
             )
-            record = await manager.submit(request)
-            result = self.public_status(name)
-            result["job"] = _public_job(record)
-            result["job_id"] = record.job_id
-            return result
+            try:
+                existing = self._active_shared_record(name)
+                if existing is not None:
+                    result = self.public_status(name)
+                    result["job"] = _public_job(existing)
+                    result["job_id"] = existing.job_id
+                    if _settings_signature(
+                        existing.parameters, existing.root_mode, existing.home
+                    ) != requested:
+                        result["settings_conflict"] = True
+                        result["error"] = (
+                            "shared job settings differ from the active shared "
+                            "job; it is not replaced automatically"
+                        )
+                    return result
+                request = jobcore.JobRequest(
+                    client_id=client.client_id,
+                    target=name,
+                    request_id=f"shared:{name}:{uuid.uuid4().hex}",
+                    kind="shared",
+                    parameters=params,
+                    root_mode=effective_root,
+                    home=home,
+                )
+                record = await manager.submit(request)
+                result = self.public_status(name)
+                result["job"] = _public_job(record)
+                result["job_id"] = record.job_id
+                return result
+            finally:
+                await asyncio.to_thread(file_lock.release)
 
     async def target_sbatch(
         self,
@@ -2549,6 +2919,7 @@ class Gateway:
         overrides: dict[str, Any] | None = None,
         root_mode: str | None = None,
         clean_home: str | None = None,
+        factor: str | None = None,
     ) -> dict:
         """Reserve a quota slot, submit one private job, return it as pending."""
         target = self._target(name)
@@ -2556,11 +2927,18 @@ class Gateway:
             raise web.HTTPBadRequest(
                 text="private Slurm jobs are not available on this target"
             )
-        await self.open_target(name)
+        await self.open_target(name, factor=factor)
         manager = self._ensure_jobs()
         params = dict(parameters or {})
         if overrides:
             params["set"] = dict(overrides)
+        # A target-level clean_home is the default; a request value wins.  The
+        # resolved path is validated symlink-safely against the private home.
+        home = self._resolve_clean_home(
+            clean_home if clean_home is not None else target.clean_home,
+            target=target,
+            client_id=client.client_id,
+        )
         request = jobcore.JobRequest(
             client_id=client.client_id,
             target=name,
@@ -2568,7 +2946,7 @@ class Gateway:
             kind="private",
             parameters=params,
             root_mode=root_mode or target.root_mode,
-            home=self._resolve_clean_home(clean_home),
+            home=home,
         )
         record = await manager.submit(request)
         return _public_job(record)
@@ -2739,6 +3117,22 @@ class Gateway:
             raise web.HTTPBadRequest(text="'clean_home' must be a string")
         return value
 
+    @staticmethod
+    def _body_job_limits(body: dict) -> dict[str, int] | None:
+        """Parse and validate the operator's ``{"job_limits": {...}}`` map."""
+        value = body.get("job_limits")
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise web.HTTPBadRequest(
+                text="'job_limits' must be an object mapping target to limit"
+            )
+        entries = [f"{target}={limit}" for target, limit in value.items()]
+        try:
+            return parse_job_limits(entries)
+        except ConfigError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from exc
+
     async def h_connect(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         name = request.match_info["target"]
@@ -2777,7 +3171,15 @@ class Gateway:
         client.require_target(name)
         body = await self._request_json(request)
         overrides = self._body_overrides(body)
-        return web.json_response(self.preview_target(name, overrides=overrides))
+        return web.json_response(
+            self.preview_target(
+                name,
+                overrides=overrides,
+                root_mode=self._body_root_mode(body),
+                clean_home=self._body_clean_home(body),
+                client=client,
+            )
+        )
 
     async def h_stop(self, request: web.Request) -> web.Response:
         client = self._auth(request)
@@ -2822,6 +3224,7 @@ class Gateway:
                 overrides=overrides,
                 parameters=self._body_parameters(body),
                 root_mode=self._body_root_mode(body),
+                clean_home=self._body_clean_home(body),
             )
         )
 
@@ -2841,6 +3244,7 @@ class Gateway:
                 overrides=self._body_overrides(body),
                 root_mode=self._body_root_mode(body),
                 clean_home=self._body_clean_home(body),
+                factor=self._body_factor(body),
             )
         )
 
@@ -3059,6 +3463,7 @@ class Gateway:
             "label": cfg.label,
             "allow_all": cfg.allow_all,
             "targets": sorted(self.config.targets) if cfg.allow_all else list(cfg.targets),
+            "job_limits": dict(cfg.job_limits),
             "session_count": self.sessions.count_for_client(cfg.client_id),
         }
 
@@ -3203,8 +3608,18 @@ class Gateway:
         # DENIED / CONSUMED / EXPIRED are all terminal for the requester.
         return web.json_response({"status": pending.status})
 
-    async def approve_enrollment(self, request_id: str) -> PendingEnrollment:
-        """Operator action: mint a token, append the client, reload, approve."""
+    async def approve_enrollment(
+        self,
+        request_id: str,
+        *,
+        job_limits: dict[str, int] | None = None,
+    ) -> PendingEnrollment:
+        """Operator action: mint a token, append the client, reload, approve.
+
+        ``job_limits`` is the already-validated operator quota map.  It is
+        written to the client block and recorded on the pending request, so a
+        reload applies it and a later poll can report it.
+        """
         path = self.config.config_path
         if not path:
             raise ConfigError("no config path recorded; cannot enroll")
@@ -3226,13 +3641,19 @@ class Gateway:
         # rejected.  If the config append then fails, drop the orphan hash.
         append_token_hash(token_path, pending.client_id, token)
         try:
-            append_client(path, pending.client_id, pending.targets, pending.label)
+            append_client(
+                path,
+                pending.client_id,
+                pending.targets,
+                pending.label,
+                job_limits=job_limits,
+            )
         except Exception:
             self._rollback_token(token_path, pending.client_id)
             raise
 
         await self.reload()
-        self.enrollments.approve(request_id)
+        self.enrollments.approve(request_id, job_limits=job_limits)
         pending.token = token
         log.info(
             "approved enrollment %s: client %r -> targets %s",
@@ -3281,8 +3702,12 @@ class Gateway:
     async def h_enroll_approve(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         client.require_admin()
+        body = await self._request_json(request)
+        job_limits = self._body_job_limits(body)
         try:
-            pending = await self.approve_enrollment(request.match_info["request"])
+            pending = await self.approve_enrollment(
+                request.match_info["request"], job_limits=job_limits
+            )
         except EnrollmentError as exc:
             # An unknown or expired id, and a request already consumed, all
             # share one message after _expire(), so 404 is the honest status
@@ -3293,6 +3718,7 @@ class Gateway:
                 "request_id": pending.request_id,
                 "client_id": pending.client_id,
                 "targets": list(pending.targets),
+                "job_limits": dict(pending.job_limits),
                 "status": pending.status,
             }
         )
@@ -4030,6 +4456,12 @@ def build_parser() -> argparse.ArgumentParser:
         "~/.config/computeMCP-gateway/config.toml)",
     )
     parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        help="durable job state root (default: COMPUTEMCP_STATE_DIR or the "
+        "gateway config directory's state/ subdirectory)",
+    )
     parser.add_argument("--listen", help="override server.listen")
     parser.add_argument("--port", type=int, help="override server.port")
     parser.add_argument(
@@ -4147,6 +4579,67 @@ def _print_route_summary(runtime: TargetRuntime) -> str:
     return f"{runtime.state}" + (f" ({runtime.last_error})" if runtime.last_error else "")
 
 
+def _production_route_opener(gateway: Gateway) -> Callable[..., Any]:
+    """Open the single-channel mux route used by the durable job path.
+
+    This is the T5/T6c transport: one authenticated route connection plus the
+    persistent ``computemcp-mux.py`` helper, whose per-route registry maps a
+    job id to its loopback relay.  It never provisions and never submits.
+    """
+
+    async def opener(target: TargetConfig, route: str, factor: str | None):
+        runtime = gateway.runtimes.get(target.name)
+        generation = runtime.route_epoch if runtime is not None else 0
+        helper_argv = gateway._mux_helper_argv(target, route)
+        return await gateway.tunnels.open_job_route(
+            target,
+            route,
+            helper_argv=helper_argv,
+            generation=generation,
+            provision=False,
+            factor=factor,
+        )
+
+    return opener
+
+
+def build_production_gateway(
+    config: GatewayConfig,
+    *,
+    transport_override: str | None = None,
+    state_root: str | os.PathLike[str] | None = None,
+    stage_runner: Callable[..., Any] | None = None,
+    stage_deploy_dir: str | None = None,
+    stage_connection: Any = None,
+) -> Gateway:
+    """Construct the gateway with its real job/provisioning wiring.
+
+    ``_amain`` uses this so production never runs with a temp state root or a
+    squeue-only placeholder.  The tests inject a fake ``stage_runner`` to drive
+    the same construction and submission path without SSH or a cluster.
+    """
+    if state_root is None:
+        state_root = _configured_state_root(config)
+    gateway = Gateway(
+        config,
+        transport_override=transport_override,
+        state_root=state_root,
+    )
+
+    def factory(target: TargetConfig) -> BundleStageProvisioner:
+        return BundleStageProvisioner(
+            gateway,
+            target,
+            run=stage_runner,
+            deploy_dir=stage_deploy_dir,
+            connection=stage_connection,
+        )
+
+    gateway.provisioner_factory = factory
+    gateway.route_opener = _production_route_opener(gateway)
+    return gateway
+
+
 async def _amain(args: argparse.Namespace) -> int:
     config = load_config(args.config, token_file=args.token_file)
     if args.listen:
@@ -4157,7 +4650,12 @@ async def _amain(args: argparse.Namespace) -> int:
         config = dataclasses.replace(
             config, server=dataclasses.replace(config.server, port=args.port)
         )
-    gateway = Gateway(config, transport_override=args.transport)
+    state_root = args.state_dir if getattr(args, "state_dir", None) else None
+    gateway = build_production_gateway(
+        config,
+        transport_override=args.transport,
+        state_root=state_root,
+    )
     app = gateway.create_app()
     runner = web.AppRunner(app)
     await runner.setup()
