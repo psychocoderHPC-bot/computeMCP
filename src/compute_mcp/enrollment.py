@@ -55,6 +55,10 @@ class PendingEnrollment:
     expires_at: float
     secret_hash: str
     status: str = PENDING
+    # Operator-set per-target private-job limits.  This is deliberately *not* a
+    # field of the unauthenticated request: only an operator approval may set
+    # quota.  Empty means "use the configured default".
+    job_limits: dict[str, int] = field(default_factory=dict)
     # Plaintext token is populated on approval and cleared after first delivery.
     token: str | None = field(default=None, repr=False)
 
@@ -136,9 +140,36 @@ class EnrollmentManager:
             raise EnrollmentError("unknown enrollment request")
         return request
 
-    def approve(self, request_id: str) -> tuple[PendingEnrollment, str]:
-        """Mark a pending request approved and mint its token."""
+    def approve(
+        self,
+        request_id: str,
+        job_limits: dict[str, int] | None = None,
+    ) -> tuple[PendingEnrollment, str]:
+        """Mark a pending request approved and mint its token.
+
+        ``job_limits`` is the operator-supplied per-target limit map.  The
+        unauthenticated ``create`` path never accepts it, so a requester cannot
+        grant itself quota.  Values are validated here for shape; target
+        existence and client authorization are enforced when the client is
+        appended to the configuration.
+        """
         request = self.get_by_id(request_id)
+        if job_limits is not None:
+            normalized: dict[str, int] = {}
+            if not isinstance(job_limits, dict):
+                raise EnrollmentError("job_limits must be a mapping")
+            for target, value in job_limits.items():
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                ):
+                    raise EnrollmentError(
+                        f"job limit for {str(target)!r} must be a "
+                        "non-negative integer"
+                    )
+                normalized[str(target)] = value
+            request.job_limits = normalized
         if request.status == PENDING:
             request.status = APPROVED
             request.token = new_token()
