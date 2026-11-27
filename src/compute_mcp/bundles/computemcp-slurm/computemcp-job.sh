@@ -27,7 +27,7 @@ if [ -n "$SETTINGS" ] && [ -r "$SETTINGS" ]; then
 fi
 
 STATE="${COMPUTEMCP_STATE_DIR:?COMPUTEMCP_STATE_DIR is required}"
-CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
+CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-0}"
 SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 
 # Resolve the bundle directory.  Slurm may copy this batch script into its spool
@@ -62,7 +62,9 @@ mkdir -p "$STATE"
 exec 8>"$STATE/job-run.lock"
 flock -n 8 || { echo 'Another job is already using this state directory.' >&2; exit 1; }
 
-READY="$STATE/ready-$SLURM_JOB_ID"
+# Per-job readiness marker.  The batch job owns one state directory, so the
+# name need not carry the Slurm id (and must not collide across co-located jobs).
+READY="$STATE/ready"
 STARTED=0
 cleanup() {
     rm -f "$READY"
@@ -110,8 +112,20 @@ fi
 bash "$CONTAINER_SCRIPT" start
 STARTED=1
 
+# The container script picks the actual Dropbear port at start time (0 asks for
+# an ephemeral port) and publishes it in the per-job state directory.  Wait for
+# the banner on THAT port, not on the request value.
+ACTUAL_CONTAINER_PORT="$CONTAINER_PORT"
+if [ -s "$STATE/container.port" ]; then
+    ACTUAL_CONTAINER_PORT="$(head -n 1 "$STATE/container.port" || true)"
+fi
+[[ "$ACTUAL_CONTAINER_PORT" =~ ^[0-9]+$ ]] || {
+    echo "Container port was not published in $STATE/container.port" >&2
+    exit 1
+}
+
 # Publish the node only after the container serves an SSH banner.
-python3 - "$CONTAINER_PORT" "$SSH_WAIT_SECONDS" <<'PY'
+python3 - "$ACTUAL_CONTAINER_PORT" "$SSH_WAIT_SECONDS" <<'PY'
 import socket
 import time
 import sys
@@ -135,10 +149,10 @@ raise SystemExit(f"Container SSH server did not become ready on port {sys.argv[1
 PY
 
 NODE="$(hostname -s)"
-TEMP_READY="$(mktemp "$STATE/ready-$SLURM_JOB_ID.XXXXXX")"
+TEMP_READY="$(mktemp "$STATE/ready.XXXXXX")"
 printf '%s\n' "$NODE" > "$TEMP_READY"
 mv -- "$TEMP_READY" "$READY"
-echo "Container ready on $NODE, port $CONTAINER_PORT." >&2
+echo "Container ready on $NODE, port $ACTUAL_CONTAINER_PORT." >&2
 
 # Keep the allocation alive; the EXIT trap stops the container on termination.
 while :; do

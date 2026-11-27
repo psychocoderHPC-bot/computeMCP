@@ -61,7 +61,10 @@ fi
 SYSTEM_DIR="$STORAGE_ROOT/$SYSTEM"
 SANDBOX="${COMPUTEMCP_SANDBOX_DIR:-$SYSTEM_DIR/sandbox}"
 HOST_HOME="${COMPUTEMCP_HOST_HOME:-$SYSTEM_DIR/home}"
-STATE="$SYSTEM_DIR/state"
+# A per-job caller (the Slurm batch job) passes its own state directory so the
+# container's endpoint/port/runtime files never collide with a co-located job.
+# Direct/legacy callers keep the target-level state directory.
+STATE="${COMPUTEMCP_STATE_DIR:-$SYSTEM_DIR/state}"
 
 # Runtime name.  Docker is daemon-global and Apptainer instances are per-host,
 # so the target name alone collides for two users on the same node.  The remote
@@ -70,10 +73,21 @@ STATE="$SYSTEM_DIR/state"
 # is an optional operator/test override and is validated exactly like the
 # derived value.
 REMOTE_UID="$(id -u 2>/dev/null || true)"
-if [ -n "$REMOTE_UID" ]; then
-    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$REMOTE_UID-$SYSTEM}"
+JOB_ID="${COMPUTEMCP_JOB_ID:-default}"
+if ! { [[ "$JOB_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] &&
+       [ "$JOB_ID" != . ] && [ "$JOB_ID" != .. ]; }; then
+    echo "Invalid job id: $JOB_ID" >&2
+    exit 2
+fi
+# Keep this derivation identical to computemcp-provision.sh.
+if [ -n "${COMPUTEMCP_CONTAINER_NAME:-}" ]; then
+    NAME="$COMPUTEMCP_CONTAINER_NAME"
+elif [ -n "$REMOTE_UID" ]; then
+    NAME="computemcp-$REMOTE_UID-$SYSTEM"
+    [ "$JOB_ID" = default ] || NAME="$NAME-$JOB_ID"
 else
-    NAME="${COMPUTEMCP_CONTAINER_NAME:-computemcp-$SYSTEM}"
+    NAME="computemcp-$SYSTEM"
+    [ "$JOB_ID" = default ] || NAME="$NAME-$JOB_ID"
 fi
 if ! { [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && [ "$NAME" != . ] && [ "$NAME" != .. ]; }; then
     echo "Invalid container name: $NAME" >&2
@@ -109,6 +123,29 @@ IMAGE="$(normalize_image "$IMAGE")"
 CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
 SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 
+# Root mode.  ``fakeroot`` is the persistent writable per-target sandbox;
+# ``clean`` is an operator-prepared immutable SIF whose digest is recorded and
+# which gets its own writable runtime directories per job.
+ROOT_MODE="${COMPUTEMCP_ROOT_MODE:-fakeroot}"
+case "$ROOT_MODE" in
+    fakeroot|clean) ;;
+    *)
+        echo "Invalid COMPUTEMCP_ROOT_MODE: $ROOT_MODE (expected fakeroot or clean)." >&2
+        exit 2
+        ;;
+esac
+CLEAN_IMAGE="${COMPUTEMCP_CLEAN_IMAGE:-}"
+if [ "$ROOT_MODE" = clean ]; then
+    if [ "$RUNTIME" = docker ]; then
+        echo 'clean root mode requires Apptainer (an immutable SIF), not Docker.' >&2
+        exit 2
+    fi
+    [ -n "$CLEAN_IMAGE" ] || {
+        echo 'COMPUTEMCP_CLEAN_IMAGE is required for clean root mode.' >&2
+        exit 2
+    }
+fi
+
 # Docker-only defaults.  The gateway never needs to know these.
 SSH_USER="${COMPUTEMCP_SSH_USER:-ubuntu}"
 if ! { [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] && [ "$SSH_USER" != root ]; }; then
@@ -141,7 +178,14 @@ if [ "$RUNTIME" = apptainer ]; then
     command -v apptainer >/dev/null || { echo 'apptainer not found.' >&2; exit 1; }
     unset APPTAINER_BIND APPTAINER_BINDPATH
 fi
-if ! { [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] && (( CONTAINER_PORT >= 1024 && CONTAINER_PORT <= 65535 )); }; then
+# ``0`` means "pick a free ephemeral port on this node"; a fixed value must be
+# an unprivileged TCP port.  Docker always needs a concrete container port.
+if [ "$RUNTIME" = docker ] && [ "$CONTAINER_PORT" = 0 ]; then
+    CONTAINER_PORT=2222
+fi
+if ! { [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] &&
+       { [ "$CONTAINER_PORT" = 0 ] ||
+         (( CONTAINER_PORT >= 1024 && CONTAINER_PORT <= 65535 )); }; }; then
     echo "Invalid container port: $CONTAINER_PORT" >&2
     exit 2
 fi
@@ -544,16 +588,26 @@ for relative in ("usr/lib/sftp-server", "usr/libexec/sftp-server"):
     if not path.exists() and not path.is_symlink():
         path.symlink_to("/usr/lib/openssh/sftp-server")
 
+# The Dropbear port is a RUNTIME setting: baking it into the shared sandbox
+# startscript makes two co-located jobs collide.  The start reads the port and
+# writes its PID into the per-job runtime directory bound at
+# /computemcp-runtime, so each job has its own port and PID file.
 write(".singularity.d/startscript", '''#!/bin/sh
 set -eu
 test -s %s/.ssh/authorized_keys
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
+RUNTIME_DIR=/computemcp-runtime
+[ -s "$RUNTIME_DIR/container.port" ] || {
+    echo "computemcp: missing $RUNTIME_DIR/container.port" >&2
+    exit 1
+}
+PORT="$(cat "$RUNTIME_DIR/container.port")"
 # User namespaces are not required for the fakeroot-command fallback.
 exec env -u LD_PRELOAD -u FAKEROOTKEY FAKEROOTDONTTRYCHOWN=1 \\
     /usr/bin/fakeroot /usr/sbin/dropbear -F -E -e -s -j -k \\
-    -p 127.0.0.1:%s -P /run/dropbear-computemcp.pid \\
+    -p 127.0.0.1:$PORT -P "$RUNTIME_DIR/dropbear.pid" \\
     -r /etc/dropbear/dropbear_ed25519_host_key
-''' % (home, port), 0o755)
+''' % (home,), 0o755)
 print(":".join(account))
 CONFIGURE
 
@@ -561,22 +615,37 @@ CONFIGURE
     echo "Configured sandbox $SSH_USER account and authorized_keys." >&2
 }
 
-apptainer_start() {
-    command -v apptainer >/dev/null
-    [ -d "$SANDBOX" ] || { echo "Missing sandbox; use build first." >&2; exit 1; }
-    test -x "$SANDBOX$(printf '/usr/local/bin/computemcp-%s-shell' "$SSH_USER")" || {
-        echo "Run configure once before starting this existing sandbox." >&2
-        exit 1
-    }
-    test -s "$HOST_HOME/.ssh/authorized_keys" || {
-        echo "Missing authorized_keys; run configure first." >&2
-        exit 1
-    }
-    if apptainer instance list | awk -v NAME="$NAME" '$1 == NAME {FOUND=1} END {exit !FOUND}'; then
-        echo "STOP: $NAME is already running on this node." >&2
-        exit 1
+# --- Runtime instance helpers ----------------------------------------------
+# The Dropbear port is chosen per job at start time (CONTAINER_PORT=0 asks for
+# an ephemeral port) and published in the job state and in the per-job runtime
+# directory bound into the instance.  This is what lets two jobs on one compute
+# node coexist without sharing a port, PID file or startscript value.
+pick_ephemeral_port() {
+    python3 - <<'PYPORT'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PYPORT
+}
+
+select_container_port() {
+    if [ -z "${CONTAINER_PORT:-}" ] || [ "$CONTAINER_PORT" = 0 ]; then
+        CONTAINER_PORT="$(pick_ephemeral_port)"
     fi
-    local GPU_ARGS=()
+}
+
+publish_runtime_port() {
+    local RUNTIME_DIR="$1"
+    mkdir -p "$RUNTIME_DIR"
+    printf '%s\n' "$CONTAINER_PORT" > "$RUNTIME_DIR/container.port"
+    chmod 600 "$RUNTIME_DIR/container.port"
+    printf '%s\n' "$CONTAINER_PORT" > "$STATE/container.port.tmp.$$"
+    mv -f "$STATE/container.port.tmp.$$" "$STATE/container.port"
+}
+
+setup_gpu_args() {
+    GPU_ARGS=()
     if has_vendor nvidia; then
         GPU_ARGS+=(--nv)
     fi
@@ -586,16 +655,79 @@ apptainer_start() {
     if has_vendor amd || has_vendor intel; then
         if [ -d /dev/dri ]; then GPU_ARGS+=(--bind /dev/dri); else echo 'AMD/Intel selected but /dev/dri is absent; skipping it.' >&2; fi
     fi
+}
+
+check_port_free() {
     if command -v ss >/dev/null && [ -n "$(ss -H -ltn "sport = :$CONTAINER_PORT")" ]; then
         echo "STOP: port $CONTAINER_PORT is already in use." >&2
         exit 1
     fi
+}
+
+instance_exists() {
+    apptainer instance list | awk -v NAME="$NAME" '$1 == NAME {FOUND=1} END {exit !FOUND}'
+}
+
+clean_digest() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$CLEAN_IMAGE" | awk '{print $1}'
+    else
+        python3 - "$CLEAN_IMAGE" <<'PYDIGEST'
+import hashlib
+import sys
+with open(sys.argv[1], "rb") as stream:
+    print(hashlib.sha256(stream.read()).hexdigest())
+PYDIGEST
+    fi
+}
+
+record_clean_digest() {
+    local DIGEST
+    DIGEST="$(clean_digest)"
+    printf '%s\n' "$DIGEST" > "$STATE/image.digest.tmp.$$"
+    mv -f "$STATE/image.digest.tmp.$$" "$STATE/image.digest"
+    echo "Clean base $CLEAN_IMAGE digest $DIGEST" >&2
+}
+
+clean_configure() {
+    command -v apptainer >/dev/null
+    [ -r "$CLEAN_IMAGE" ] || { echo "Clean image missing/unreadable: $CLEAN_IMAGE" >&2; exit 1; }
+    record_clean_digest
+    install_authorized_key
+    echo "Configured clean base $CLEAN_IMAGE; digest recorded." >&2
+}
+
+apptainer_start() {
+    command -v apptainer >/dev/null
+    if [ "$ROOT_MODE" = clean ]; then
+        clean_start
+        return
+    fi
+    [ -d "$SANDBOX" ] || { echo "Missing sandbox; use build first." >&2; exit 1; }
+    test -x "$SANDBOX$(printf '/usr/local/bin/computemcp-%s-shell' "$SSH_USER")" || {
+        echo "Run configure once before starting this existing sandbox." >&2
+        exit 1
+    }
+    test -s "$HOST_HOME/.ssh/authorized_keys" || {
+        echo "Missing authorized_keys; run configure first." >&2
+        exit 1
+    }
+    if instance_exists; then
+        echo "STOP: $NAME is already running on this node." >&2
+        exit 1
+    fi
+    select_container_port
+    setup_gpu_args
+    check_port_free
     if [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
         export APPTAINERENV_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
     fi
     # A sandbox built for another architecture cannot start here; fail with an
     # actionable message before Apptainer emits its opaque exec-format error.
     check_sandbox_arch
+    local RUNTIME_DIR="$STATE/runtime"
+    mkdir -p "$RUNTIME_DIR/run"
+    publish_runtime_port "$RUNTIME_DIR"
     local COMMON=(--fakeroot --writable --containall --no-mount "home,cwd,hostfs,bind-paths")
     # Start from a directory that exists on this node: an inherited batch CWD
     # may be a path that is absent on the compute node, which makes Apptainer
@@ -605,6 +737,8 @@ apptainer_start() {
     apptainer instance start "${COMMON[@]}" \
         --bind "$HOST_HOME:/root" \
         --bind "$HOST_HOME:/home/$SSH_USER" \
+        --bind "$RUNTIME_DIR:/computemcp-runtime" \
+        --bind "$RUNTIME_DIR/run:/run" \
         --bind /etc/resolv.conf:/etc/resolv.conf:ro \
         "${GPU_ARGS[@]}" "$SANDBOX" "$NAME"
     wait_for_banner 127.0.0.1 "$CONTAINER_PORT" || {
@@ -615,11 +749,55 @@ apptainer_start() {
     echo "Container ready on $(hostname -s), port $CONTAINER_PORT." >&2
 }
 
+clean_start() {
+    command -v apptainer >/dev/null
+    [ -r "$CLEAN_IMAGE" ] || { echo "Clean image missing/unreadable: $CLEAN_IMAGE" >&2; exit 1; }
+    test -s "$HOST_HOME/.ssh/authorized_keys" || {
+        echo "Missing authorized_keys; run configure first." >&2
+        exit 1
+    }
+    if instance_exists; then
+        echo "STOP: $NAME is already running on this node." >&2
+        exit 1
+    fi
+    record_clean_digest
+    select_container_port
+    setup_gpu_args
+    check_port_free
+    if [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
+        export APPTAINERENV_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
+    fi
+    local RUNTIME_DIR="$STATE/runtime"
+    mkdir -p "$RUNTIME_DIR/run" "$RUNTIME_DIR/tmp"
+    publish_runtime_port "$RUNTIME_DIR"
+    # An immutable base is never modified: the instance gets ephemeral writable
+    # overlays for /run and /tmp plus the per-job runtime directory.  The
+    # prepared base's startscript reads /computemcp-runtime/container.port.
+    cd /
+    APPTAINERENV_COMPUTEMCP_CONTAINER_PORT="$CONTAINER_PORT" \
+    APPTAINERENV_COMPUTEMCP_RUNTIME_DIR=/computemcp-runtime \
+    apptainer instance start --fakeroot --containall \
+        --no-mount "home,cwd,hostfs,bind-paths" --writable-tmpfs \
+        --bind "$HOST_HOME:/root" \
+        --bind "$HOST_HOME:/home/$SSH_USER" \
+        --bind "$RUNTIME_DIR:/computemcp-runtime" \
+        --bind "$RUNTIME_DIR/run:/run" \
+        --bind "$RUNTIME_DIR/tmp:/tmp" \
+        --bind /etc/resolv.conf:/etc/resolv.conf:ro \
+        "${GPU_ARGS[@]}" "$CLEAN_IMAGE" "$NAME"
+    wait_for_banner 127.0.0.1 "$CONTAINER_PORT" || {
+        echo 'Apptainer SSH endpoint did not become ready.' >&2
+        exit 1
+    }
+    printf '%s\n' "127.0.0.1:$CONTAINER_PORT" > "$STATE/container.endpoint"
+    echo "Clean container ready on $(hostname -s), port $CONTAINER_PORT." >&2
+}
+
 apptainer_stop() {
     if command -v apptainer >/dev/null; then
         apptainer instance stop "$NAME" || true
     fi
-    rm -f "$STATE/container.endpoint"
+    rm -f "$STATE/container.endpoint" "$STATE/container.port"
 }
 
 apptainer_shell() {
@@ -876,15 +1054,39 @@ docker_ensure_started() {
 case "$RUNTIME" in
     apptainer)
         case "$ACTION" in
-            build)      apptainer_build; apptainer_configure ;;
-            configure)  apptainer_configure ;;
-            update)     apptainer_configure ;;
+            build)
+                if [ "$ROOT_MODE" = clean ]; then
+                    echo 'clean root mode uses a prepared immutable image; no build.' >&2
+                    clean_configure
+                else
+                    apptainer_build
+                    apptainer_configure
+                fi
+                ;;
+            configure)
+                if [ "$ROOT_MODE" = clean ]; then
+                    clean_configure
+                else
+                    apptainer_configure
+                fi
+                ;;
+            update)
+                if [ "$ROOT_MODE" = clean ]; then
+                    clean_configure
+                else
+                    apptainer_configure
+                fi
+                ;;
             start)      apptainer_start ;;
             stop|close) apptainer_stop ;;
             shell)      apptainer_shell ;;
             fingerprint) apptainer_fingerprint ;;
             endpoint)
-                [ -d "$SANDBOX" ] || { echo 'Missing sandbox.' >&2; exit 1; }
+                if [ "$ROOT_MODE" = clean ]; then
+                    [ -r "$CLEAN_IMAGE" ] || { echo 'Missing clean image.' >&2; exit 1; }
+                else
+                    [ -d "$SANDBOX" ] || { echo 'Missing sandbox.' >&2; exit 1; }
+                fi
                 printf 'ENDPOINT 127.0.0.1:%s\n' "$CONTAINER_PORT"
                 ;;
         esac

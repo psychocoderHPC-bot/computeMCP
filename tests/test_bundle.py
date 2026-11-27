@@ -500,3 +500,26 @@ async def test_run_retries_a_refused_route_channel(monkeypatch):
     result = await bundle_module._run(conn, "mkdir -p /scratch/x")
     assert conn.calls == 2
     assert result.exit_status == 0
+
+
+def test_bundle_ships_stage_helpers_and_relay_job_options():
+    """The deployed bundle exposes every stage helper and the relay flags.
+
+    Packaging regression guard: a stage or helper that is not shipped cannot be
+    deployed.  The relay must accept an explicit job id and endpoint file so
+    several relays can run on one login node.
+    """
+    contents = load_bundle("computemcp-slurm")
+    files = dict(contents.files)
+    assert "computemcp-relay.py" in files
+    assert "computemcp-container.sh" in files
+
+    provision = files["computemcp-provision.sh"].decode("utf-8")
+    for action in ("submit", "observe", "attach", "cancel", "detach", "teardown"):
+        assert action in provision, action
+    relay = files["computemcp-relay.py"].decode("utf-8")
+    assert "--job-id" in relay
+    assert "--ready-file" in relay
+    container = files["computemcp-container.sh"].decode("utf-8")
+    assert "--writable-tmpfs" in container
+    assert "container.port" in container
