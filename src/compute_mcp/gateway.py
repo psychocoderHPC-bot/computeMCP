@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import shlex
 import signal
 import sys
@@ -663,6 +664,13 @@ class BundleStageProvisioner:
                 raise jobcore.SchedulerRejected(detail)
             raise jobcore.JobError(detail)
         parsed = _parse_stage_output(out)
+        if not _stage_digest(parsed):
+            # The container helper reports the prepared clean base digest on
+            # stderr ("Clean base ... digest <hex>") when it configures/starts
+            # the image; keep it when the stage output has no explicit key.
+            match = re.search(r"digest\s+([0-9a-fA-F]{64})", err)
+            if match:
+                parsed["IMAGE_DIGEST"] = match.group(1)
         if action == "submit" and not parsed.get("SLURM_JOB_ID"):
             # ``sbatch --parsable`` style fallback: the helper normally prints
             # an explicit key, but an older helper may print only the id line.
