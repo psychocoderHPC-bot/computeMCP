@@ -27,6 +27,11 @@
 #     "/opt/computeMCP-gateway/systems/other.toml",
 # ]
 
+# Durable job state root (not a TOML key). The gateway uses --state-dir, then
+# COMPUTEMCP_STATE_DIR, then <config-dir>/state. There is no temporary fallback.
+# For a Slurm target the root must be on storage that the gateway and the login
+# and compute nodes see at the same absolute path, because the login-node mux
+# helper reads <state_root>/mux/<target>.json.
 [server]
 # Bind address. On the host that Terok/Podman reaches via
 # host.containers.internal this is typically the host-side gateway address

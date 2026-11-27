@@ -183,6 +183,13 @@ The registry maps a `job_id` to a loopback relay endpoint and is rewritten when
 a job becomes ready or is cancelled. Relay ports stay internal to the gateway
 and helper.
 
+The registry file is `<state_root>/mux/<target>.json`. The gateway writes it on
+the gateway host and the helper reads it on the login node, so `state_root` must
+be the same absolute path on both. A missing or unreadable file makes the helper
+reject `OPEN` with `registry_unreadable: cannot read <path> ...`. The gateway
+maps that rejection to HTTP 502. Retrying does not help; the operator must put
+the state root on shared storage.
+
 ## Shared and private jobs
 
 A target has at most one active shared job. Any authorized client may start it
@@ -205,11 +212,17 @@ explicit `job_id` addresses that job after target and ownership checks.
 
 ## Durable job state
 
-Job records live under the gateway state root, normally
-`$COMPUTEMCP_STATE_DIR` or `<config-dir>/state`, in `jobs/<job_id>/`. Each
-record holds the job identity, owner, request id and effective parameters, the
-scheduler id and cluster, the resolved root mode and home, the ready node and
-endpoint generation, and the terminal or uncertain reason.
+The gateway resolves the durable state root from `--state-dir`, then
+`COMPUTEMCP_STATE_DIR`, then `<config-dir>/state`. It has no temporary
+fallback: without one of those three, startup fails with
+`no durable job state root`. For a Slurm target the root must be on storage
+visible at the same absolute path to the gateway and the login/compute nodes,
+because the mux helper reads `<state_root>/mux/<target>.json` there.
+
+Job records live under `<state_root>/jobs/<job_id>/`. Each record holds the job
+identity, owner, request id and effective parameters, the scheduler id and
+cluster, the resolved root mode and home, the ready node and endpoint
+generation, and the terminal or uncertain reason.
 
 Writes are atomic: a temp file, `fsync`, `os.replace`, and a directory `fsync`.
 A crash leaves the previous or the next complete record. Shared-job creation
@@ -237,14 +250,15 @@ A gateway restart rebuilds the job manager from disk and reconciles before it
 accepts new submissions. Reconciliation never calls `sbatch`.
 
 - A record that already has a scheduler id is queried with `squeue`.
-- A record without a scheduler id is matched by its persisted correlation
-  token, which the gateway passes to `sbatch` as a job comment, when the
-  bundle adapter supports comment lookup.
+- A record without a scheduler id is passed to the bundle adapter's
+  `find_by_token`. The helper persists the correlation token before `sbatch`,
+  passes it as `--comment`, and recovery compares it against `squeue %k` and
+  then `sacct` `Comment`, with a bounded timeout.
 - A recovered scheduler id moves `submitting` or `submission_unknown` to
   `pending` and keeps the quota slot.
-- Without comment lookup, an ambiguous submission stays `submission_unknown`
-  and keeps its slot until operator reconciliation. The gateway never
-  resubmits it automatically.
+- When recovery finds nothing, the job stays `submission_unknown` and keeps
+  its slot until operator reconciliation. The gateway never resubmits it
+  automatically.
 - A missing `squeue` entry alone does not prove that a submission failed.
 
 After the restart, `target-open` restores the shared-job view and `job-list`

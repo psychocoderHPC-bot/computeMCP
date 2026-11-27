@@ -204,6 +204,10 @@ Rules:
 - There is no MCP dry-run at this revision. Inspect quota with
   `computeMCP_job_list`/`computeMCP_job_status` before submitting. The
   operator CLI has `--dry-run`.
+- A `submission_unknown` job may recover when the gateway reconciles by its
+  `--comment` token. Do not resubmit it.
+- A 502 whose text names `registry_unreadable` means the operator's state root
+  is not shared with the login node. Report it; retrying will not help.
 
 On a non-Slurm Docker target there are no jobs. The shared container stays the
 default, so plain calls work without a `job_id`:

@@ -57,5 +57,17 @@ otherwise.
   reloads, and returns the applied `job_limits`.
 - The preview route returns `root_mode`, `home`, `clean_home`,
   `shared_reuse`, `settings_conflict`, and `quota_available`.
+- The durable state root has no temporary fallback. It comes from
+  `--state-dir`, `COMPUTEMCP_STATE_DIR`, or `<config-dir>/state`, and a Slurm
+  target requires it on storage shared with the login/compute nodes at one
+  absolute path.
+- A mux registry that the login node cannot read fails with
+  `registry_unreadable` and HTTP 502, not a generic server error.
+- `submission_unknown` recovery uses the helper's `--comment` token through
+  the bundle adapter's `find_by_token`, with `squeue` first and `sacct` for
+  jobs that left the active view.
+- The provisioning docs state the Apptainer 1.x, fakeroot, and non-root
+  account prerequisites, and that the helper probes them before build or
+  start.
 - The bundle documentation now names five helper files: provision, container,
   job, relay, and mux.
