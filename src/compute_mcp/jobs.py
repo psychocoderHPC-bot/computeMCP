@@ -22,6 +22,9 @@ Design invariants
   never resubmitted automatically; reconciliation looks the token up in the
   scheduler before a new request is accepted.
 * Teardown detaches.  Only an explicit stop calls ``scancel``.
+* Shared-job creation takes :meth:`JobStore.shared_lock`, an ``O_EXCL``
+  lockfile keyed by target, so two gateway processes cannot both pass the
+  get-or-create check and submit a second shared job.
 """
 
 from __future__ import annotations
@@ -478,10 +481,12 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _owner_payload(*, lease_seconds: float) -> dict[str, Any]:
+def _owner_payload(
+    *, lease_seconds: float, identity: str | None = None
+) -> dict[str, Any]:
     pid = os.getpid()
     now = time.time()
-    return {
+    payload = {
         "host": socket.gethostname(),
         "boot_id": _boot_id(),
         "pid": pid,
@@ -490,6 +495,9 @@ def _owner_payload(*, lease_seconds: float) -> dict[str, Any]:
         "created_at": now,
         "token": uuid.uuid4().hex,
     }
+    if identity is not None:
+        payload["identity"] = identity
+    return payload
 
 
 class _FileLock:
@@ -617,10 +625,25 @@ class JobStore:
         for record in self.scan():
             yield record.job_id
 
-    def find_by_request_id(self, request_id: str) -> JobRecord | None:
+    def find_by_request_id(
+        self, request_id: str, owner_client_id: str | None = None
+    ) -> JobRecord | None:
+        """Return a record carrying ``request_id``, optionally owner-scoped.
+
+        Submission paths must pass ``owner_client_id``: two clients may use
+        the same idempotency key, and a caller must never observe another
+        client's job through a request-id replay.  ``None`` is an
+        administrative scan and returns the first match.
+        """
         for record in self.scan():
-            if record.request_id == request_id:
-                return record
+            if record.request_id != request_id:
+                continue
+            if (
+                owner_client_id is not None
+                and record.owner_client_id != owner_client_id
+            ):
+                continue
+            return record
         return None
 
     # -- per-job auxiliary files -------------------------------------------
@@ -733,6 +756,45 @@ class JobStore:
             poll_interval=poll_interval,
         )
 
+    def shared_lock_path(self, target: str) -> Path:
+        """Lockfile path for the per-target shared-job creation lock."""
+        if not isinstance(target, str) or not target:
+            raise JobError("shared lock target must be a non-empty string")
+        digest = hashlib.sha256(
+            target.encode("utf-8", "surrogatepass")
+        ).hexdigest()[:32]
+        return self.locks_dir / f"shared-{digest}.lock"
+
+    def shared_lock(
+        self,
+        target: str,
+        owner: str,
+        *,
+        timeout: float = 10.0,
+        lease_seconds: float = 60.0,
+        poll_interval: float = 0.01,
+    ) -> _FileLock:
+        """Cross-process, per-target lock around shared-job creation.
+
+        The lock is keyed by ``target`` only, so two gateway processes using
+        different owner labels still contend for the same target: at most one
+        of them can pass the get-or-create check and persist a shared record
+        at a time.  ``owner`` is validated and recorded in the lock payload
+        for diagnostics.  It reuses the same ``O_EXCL`` + lease/staleness
+        machinery as :meth:`acquire_lock` and :meth:`quota_lock`, so a dead
+        holder is recovered after its lease expires or its pid disappears.
+        """
+        if not isinstance(owner, str) or not owner:
+            raise JobError("shared lock owner must be a non-empty string")
+        self._ensure_dir(self.locks_dir)
+        return self._acquire_file_lock(
+            self.shared_lock_path(target),
+            timeout=timeout,
+            lease_seconds=lease_seconds,
+            poll_interval=poll_interval,
+            identity=f"shared:{target}:{owner}",
+        )
+
     @staticmethod
     def _read_lock_file(path: Path) -> dict[str, Any] | None:
         return _read_json(path)
@@ -775,11 +837,12 @@ class JobStore:
         timeout: float,
         lease_seconds: float,
         poll_interval: float,
+        identity: str | None = None,
     ) -> _FileLock:
         self._ensure_dir(path.parent)
         deadline = time.monotonic() + float(timeout)
         while True:
-            owner = _owner_payload(lease_seconds=lease_seconds)
+            owner = _owner_payload(lease_seconds=lease_seconds, identity=identity)
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
@@ -939,19 +1002,40 @@ class QuotaManager:
 
     # -- configuration ------------------------------------------------------
 
+    @staticmethod
+    def _coerce_limit(limit: int) -> int:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            raise ValueError("job limit must be a non-negative integer")
+        return int(limit)
+
     def limit_for(self, client_id: str, target: str) -> int:
         return self._limits.get(client_id, {}).get(target, self._default_limit)
 
     def set_limit(self, client_id: str, target: str, limit: int) -> None:
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
-            raise ValueError("job limit must be a non-negative integer")
+        value = self._coerce_limit(limit)
         with self._thread_lock:
-            self._limits.setdefault(str(client_id), {})[str(target)] = int(limit)
+            self._limits.setdefault(str(client_id), {})[str(target)] = value
 
     def set_limits(self, limits: Mapping[str, Mapping[str, int]]) -> None:
+        """Replace the override map *exactly* with ``limits``.
+
+        An absent client/target falls back to ``default_limit`` and an
+        explicit ``0`` disables private jobs.  Incremental merging is wrong
+        here: removing a ``job_limits`` entry from the config must not leave
+        the stale override (and its old value) in force after a reload.
+        Validation is done before the swap so a malformed map leaves the
+        current overrides untouched.
+        """
+        replacement: dict[str, dict[str, int]] = {}
         for client_id, per_target in limits.items():
-            for target, limit in per_target.items():
-                self.set_limit(client_id, target, limit)
+            if not isinstance(per_target, Mapping):
+                raise ValueError("job limits must map targets to integers")
+            replacement[str(client_id)] = {
+                str(target): self._coerce_limit(limit)
+                for target, limit in per_target.items()
+            }
+        with self._thread_lock:
+            self._limits = replacement
 
     # -- inspection ---------------------------------------------------------
 
@@ -1201,15 +1285,20 @@ def _request_signature(
     *,
     kind: str,
     target: str,
+    owner_client_id: str,
     parameters: Mapping[str, Any],
     root_mode: str | None,
     base_digest: str | None,
     home: str | None,
 ) -> str:
+    # The owner is part of the signature even though lookups are scoped by
+    # owner: it keeps a same-named request from another client from ever
+    # comparing equal, so a lookup bug degrades to a conflict, not a leak.
     return json.dumps(
         {
             "kind": kind,
             "target": target,
+            "owner_client_id": owner_client_id,
             "parameters": dict(parameters),
             "root_mode": root_mode,
             "base_digest": base_digest,
@@ -1225,6 +1314,7 @@ def _record_signature(record: JobRecord) -> str:
     return _request_signature(
         kind=record.kind,
         target=record.target,
+        owner_client_id=record.owner_client_id,
         parameters=record.parameters,
         root_mode=record.root_mode,
         base_digest=record.base_digest,
@@ -1236,6 +1326,7 @@ def _request_signature_of(request: JobRequest) -> str:
     return _request_signature(
         kind=request.kind,
         target=request.target,
+        owner_client_id=request.client_id,
         parameters=request.parameters,
         root_mode=request.root_mode,
         base_digest=request.base_digest,
@@ -1399,7 +1490,9 @@ class JobManager:
         signature = _request_signature_of(request)
 
         async with self._submit_lock:
-            existing = self.store.find_by_request_id(request.request_id)
+            existing = self.store.find_by_request_id(
+                request.request_id, request.client_id
+            )
             if existing is not None:
                 if _record_signature(existing) != signature:
                     raise RequestIdConflict(request.request_id)
