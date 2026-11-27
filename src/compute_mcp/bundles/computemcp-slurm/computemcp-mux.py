@@ -18,6 +18,13 @@ The registry is a JSON object mapping a computeMCP ``job_id`` to a relay
 endpoint.  An endpoint may be ``"127.0.0.1:PORT"`` or
 ``{"host": "127.0.0.1", "port": PORT}``.  Hosts must be loopback; the helper
 never dials an arbitrary destination and never shells out.
+
+The registry lives under the gateway's configured ``state_root``.  On a Slurm
+target the gateway writes it on the gateway host while this helper reads it on
+the login node, so ``state_root`` must be a directory both hosts see at the
+same absolute path.  The helper never falls back to a gateway-local path: a
+missing or unreadable registry is reported as ``registry_unreadable`` with the
+path and that sharing requirement.
 """
 
 import argparse
@@ -54,11 +61,32 @@ ABSOLUTE_MAX_PAYLOAD = 16 * 1024 * 1024
 RECV_WINDOW = 256 * 1024
 CREDIT_THRESHOLD = 64 * 1024
 REGISTRY_MAX_BYTES = 4 * 1024 * 1024
+# Generous enough that the path and the shared-state_root hint survive in the
+# OPEN_ERR payload; the control payload limit is much larger.
+REGISTRY_ERROR_LIMIT = 512
 CONNECT_TIMEOUT = 10.0
 
 
 class ProtocolError(Exception):
     """The gateway violated the wire protocol."""
+
+
+class RegistryUnreadable(ValueError):
+    """The ``--registry`` path is missing, unreadable or not valid JSON.
+
+    ``str(exc)`` is a self-describing ``registry_unreadable`` message that
+    names the path and the shared ``state_root`` requirement, so the gateway
+    can surface it to the caller instead of a generic unknown-job error.
+    """
+
+    def __init__(self, path, reason):
+        self.path = path
+        self.reason = reason
+        super().__init__(
+            "registry_unreadable: cannot read %s: %s (the mux registry lives "
+            "under the shared state_root; that directory must be shared "
+            "between the gateway and login nodes)" % (path, reason)
+        )
 
 
 def check_python(version_info):
@@ -120,19 +148,27 @@ def parse_endpoint(value):
 
 
 def load_registry(path):
-    """Read and validate the job_id -> relay endpoint registry."""
+    """Read and validate the job_id -> relay endpoint registry.
+
+    Raises :class:`RegistryUnreadable` (a ``registry_unreadable`` message) for
+    a missing, unreadable or malformed registry so callers can report the
+    shared-``state_root`` hint instead of an unknown-job error.
+    """
     if not path:
-        raise ValueError("no registry path configured")
-    with open(path, "rb") as handle:
-        raw = handle.read(REGISTRY_MAX_BYTES + 1)
+        raise RegistryUnreadable("<unset>", "no registry path configured")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(REGISTRY_MAX_BYTES + 1)
+    except OSError as exc:
+        raise RegistryUnreadable(path, str(exc))
     if len(raw) > REGISTRY_MAX_BYTES:
-        raise ValueError("registry file is too large")
+        raise RegistryUnreadable(path, "registry file is too large")
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise ValueError("registry is not valid JSON: %s" % exc)
+        raise RegistryUnreadable(path, "not valid JSON: %s" % exc)
     if not isinstance(data, dict):
-        raise ValueError("registry must be a JSON object")
+        raise RegistryUnreadable(path, "registry must be a JSON object")
     registry = {}
     for job_id, endpoint in data.items():
         if not isinstance(job_id, str) or not job_id:
@@ -142,6 +178,21 @@ def load_registry(path):
         except ValueError:
             continue
     return registry
+
+
+def preflight_registry(path):
+    """Validate the registry before the helper serves any OPEN request.
+
+    Returns ``True`` when the registry is readable JSON.  On failure the
+    actionable ``registry_unreadable`` message is written to stderr and
+    ``False`` is returned so ``main`` can exit non-zero at startup.
+    """
+    try:
+        load_registry(path)
+    except RegistryUnreadable as exc:
+        sys.stderr.write("computemcp-mux: %s\n" % exc)
+        return False
+    return True
 
 
 def encode_frame(frame_type, stream_id, payload=b""):
@@ -572,11 +623,18 @@ class Helper:
             if relay_writer is not None:
                 with contextlib.suppress(Exception):
                     relay_writer.close()
+            # A registry problem is not an unknown job: keep the full
+            # ``registry_unreadable`` hint so the gateway can relay it.
+            limit = (
+                REGISTRY_ERROR_LIMIT
+                if isinstance(exc, RegistryUnreadable)
+                else 200
+            )
             await self.send_control(
                 OPEN_ERR,
                 "OPEN_ERR",
                 stream_id=stream_id,
-                error=_short(exc),
+                error=_short(exc, limit),
             )
             return
         finally:
@@ -720,6 +778,10 @@ def main(argv=None):
         sys.stderr.write(
             "computemcp-mux: --registry or COMPUTEMCP_MUX_REGISTRY is required\n"
         )
+        return 2
+    # Fail fast at startup: a missing/unreadable/malformed registry means the
+    # gateway's state_root is not visible here, which no later OPEN can fix.
+    if not preflight_registry(args.registry):
         return 2
     try:
         asyncio.run(_amain(args))

@@ -249,3 +249,95 @@ def test_old_python_check_errors_cleanly(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "Python >=" in err
     assert "99.0" in err
+
+
+# ---------------------------------------------------------------------------
+# Registry preflight: a missing/unreadable/malformed registry is not an
+# unknown job.  The helper names the path and the shared-state_root contract,
+# fails fast at startup, and reports the same text on OPEN.
+# ---------------------------------------------------------------------------
+
+def _assert_registry_error(message, path):
+    assert "registry_unreadable" in message
+    assert str(path) in message
+    assert "state_root" in message
+    assert "shared" in message
+
+
+def test_load_registry_rejects_missing_file(tmp_path):
+    module = load_helper_module()
+    missing = tmp_path / "absent.json"
+    with pytest.raises(module.RegistryUnreadable) as excinfo:
+        module.load_registry(str(missing))
+    _assert_registry_error(str(excinfo.value), missing)
+
+
+def test_load_registry_rejects_unreadable_file(tmp_path, monkeypatch):
+    module = load_helper_module()
+    path = tmp_path / "registry.json"
+    path.write_text("{}", encoding="utf-8")
+    real_open = open
+
+    def deny(target, *args, **kwargs):
+        if str(target) == str(path):
+            raise PermissionError("permission denied")
+        return real_open(target, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", deny)
+    with pytest.raises(module.RegistryUnreadable) as excinfo:
+        module.load_registry(str(path))
+    _assert_registry_error(str(excinfo.value), path)
+
+
+def test_load_registry_rejects_malformed_json(tmp_path):
+    module = load_helper_module()
+    path = tmp_path / "registry.json"
+    path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(module.RegistryUnreadable) as excinfo:
+        module.load_registry(str(path))
+    message = str(excinfo.value)
+    _assert_registry_error(message, path)
+    assert "not valid JSON" in message
+
+
+def test_load_registry_accepts_good_file(tmp_path):
+    module = load_helper_module()
+    path = write_registry(tmp_path, {"job-a": "127.0.0.1:1234"})
+    assert module.load_registry(str(path)) == {"job-a": ("127.0.0.1", 1234)}
+    assert module.preflight_registry(str(path)) is True
+
+
+def test_startup_exits_nonzero_when_registry_is_unreadable(tmp_path):
+    missing = tmp_path / "absent.json"
+    result = subprocess.run(
+        [sys.executable, str(HELPER), "--registry", str(missing)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    _assert_registry_error(result.stderr, missing)
+
+
+async def test_open_after_registry_disappears_reports_registry_unreadable(
+    tmp_path,
+):
+    registry = write_registry(tmp_path, {})
+    proc, mux = await spawn_helper(registry)
+    relay = await RelayServer(b"K:").start()
+    try:
+        registry.unlink()
+        with pytest.raises(OpenError) as excinfo:
+            await mux.open_stream("job-x", timeout=TIMEOUT)
+        _assert_registry_error(str(excinfo.value), registry)
+
+        # The helper survives the failed OPEN and re-reads the registry.
+        registry.write_text(
+            json.dumps({"job-x": "127.0.0.1:%d" % relay.port}),
+            encoding="utf-8",
+        )
+        stream = await mux.open_stream("job-x", timeout=TIMEOUT)
+        assert await read_exactly(stream, 2) == b"K:"
+    finally:
+        await stop_helper(proc, mux)
+        await relay.stop()

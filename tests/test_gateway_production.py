@@ -13,10 +13,12 @@ piece is the production object graph built by ``build_production_gateway``.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from compute_mcp import jobs
@@ -38,8 +40,10 @@ from compute_mcp.config import (
 from compute_mcp.gateway import (
     BundleStageProvisioner,
     Gateway,
+    _error_middleware,
     build_production_gateway,
 )
+from compute_mcp.mux import OpenError
 
 FINGERPRINT = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
 
@@ -684,3 +688,79 @@ async def test_regular_submit_never_consults_token(tmp_path):
     assert record["slurm_job_id"] is not None
     assert provisioner.submit_calls == 1
     assert provisioner.token_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# L. close fallback: never open a second route while a channel is live
+# ---------------------------------------------------------------------------
+def test_mux_registry_lives_under_the_shared_state_root(tmp_path):
+    """The registry path is state_root/mux/<target>.json, never a temp dir."""
+    gw = make_gateway(tmp_path)
+    path = gw._registry_path("frontier")
+    assert path == tmp_path / "state" / "mux" / "frontier.json"
+
+
+async def test_close_fallback_skips_dial_while_stale_channel_is_live(
+    tmp_path, monkeypatch, caplog
+):
+    """A dead-but-retained tunnel must not trigger a second authenticated dial.
+
+    The tunnel object can outlive its liveness while the mux helper channel is
+    closing.  If that outer connection still has a live session channel, the
+    advisory close skips (with a warning) instead of opening a new route to the
+    same login node.
+    """
+    gw = make_gateway(tmp_path)
+    target = gw.config.targets["frontier"]
+    runtime = gw.runtimes["frontier"]
+    runtime.state = "connected"
+    runtime.active_route = "frontier"
+    stale = _FakeTunnel(target, "frontier")
+    stale._alive = False
+    stale.connection = SimpleNamespace(_channels={"session": object()})
+    runtime.tunnel = stale
+
+    dialed = []
+
+    async def no_dial(*args, **kwargs):
+        dialed.append((args, kwargs))
+        raise AssertionError("must not open a second authenticated route")
+
+    async def no_close(*args, **kwargs):
+        raise AssertionError("close must be skipped while a channel is live")
+
+    monkeypatch.setattr(gw.tunnels, "open_route_connection", no_dial)
+    monkeypatch.setattr(gw.tunnels, "run_close_command", no_close)
+    monkeypatch.setattr(
+        "compute_mcp.gateway._CLOSE_CHANNEL_DRAIN_TIMEOUT", 0.0
+    )
+
+    with caplog.at_level(logging.WARNING, logger="compute_mcp.gateway"):
+        await gw._run_close_command("frontier")
+
+    assert dialed == []
+    assert any(
+        "still live on the stale route" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# M. mux OPEN_ERR text reaches the caller
+# ---------------------------------------------------------------------------
+async def test_error_middleware_surfaces_mux_registry_error():
+    message = (
+        "registry_unreadable: cannot read /shared/state/mux/frontier.json: "
+        "No such file or directory (the mux registry lives under the shared "
+        "state_root; that directory must be shared between the gateway and "
+        "login nodes)"
+    )
+
+    async def handler(request):
+        raise OpenError(message)
+
+    with pytest.raises(web.HTTPBadGateway) as excinfo:
+        await _error_middleware(SimpleNamespace(), handler)
+
+    assert "registry_unreadable" in excinfo.value.text
+    assert "/shared/state/mux/frontier.json" in excinfo.value.text
