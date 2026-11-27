@@ -33,14 +33,19 @@ from pathlib import Path
 
 import pytest
 
+from fakes.conftest import fake_slurm_env  # noqa: F401
 from test_provision_shell import (
     PROVISION,
     _Stubs,
     _base_env,
     _cleanup,
     _docker_counts,
+    _fake_env,
+    _fake_records,
     _free_port,
+    _job_dir,
     _published_port,
+    _run_provision,
     _wait_port,
     stubs_banner_path,
 )
@@ -66,7 +71,7 @@ def test_slurm_mode_submits_sbatch_and_reports_relay_endpoint(tmp_path, stubs):
     workdir = tmp_path / "slurm"
     workdir.mkdir()
     storage = workdir / "storage"
-    state_dir = storage / "slurmflow" / "state"
+    state_dir = storage / "slurmflow" / "state" / "jobs" / "default"
 
     env = _base_env("slurmflow", storage, container_port)
     env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
@@ -295,3 +300,36 @@ def test_direct_mode_stop_with_full_env(tmp_path, stubs):
         assert not _wait_port(published_port, timeout=3)
     finally:
         _cleanup()
+
+
+def test_submit_observe_and_cancel_stages(tmp_path, stubs, fake_slurm_env):
+    """Stage flow end to end: submit returns, observe reports, cancel cancels.
+
+    This is the multi-job contract on the real helper: a submit that does not
+    wait for the queue, an observe that reflects the scheduler, and an explicit
+    cancel that emits exactly one ``scancel``.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "e2estage", job_id="e2e"
+    )
+    jobdir = _job_dir(storage, "e2estage", "e2e")
+
+    submit = _run_provision(env, workdir, "submit", "e2e")
+    assert submit.returncode == 0, (submit.returncode, submit.stderr)
+    assert "STATE pending" in submit.stdout, submit.stdout
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    observe = _run_provision(env, workdir, "observe", "e2e")
+    assert observe.returncode == 0, observe.stderr
+    assert "STATE pending" in observe.stdout, observe.stdout
+
+    assert fake_slurm_env.run("slurmctl", "start-job", slurm_id).returncode == 0
+    observe = _run_provision(env, workdir, "observe", "e2e")
+    assert "STATE starting" in observe.stdout, observe.stdout
+
+    cancel = _run_provision(env, workdir, "cancel", "e2e")
+    assert cancel.returncode == 0, cancel.stderr
+    cancels = [r for r in _fake_records(fake_slurm_env) if r["command"] == "scancel"]
+    assert len(cancels) == 1, cancels
+    terminal = _run_provision(env, workdir, "observe", "e2e")
+    assert "STATE terminal" in terminal.stdout, terminal.stdout
