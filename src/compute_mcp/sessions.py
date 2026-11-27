@@ -20,6 +20,7 @@ from typing import Awaitable, Callable
 import asyncssh
 
 from .config import SessionConfig, TargetConfig
+from .files import JobAccessError
 from .ssh_backend import ManagedSession, SSHBackend, SSHError
 
 log = logging.getLogger("compute_mcp.sessions")
@@ -28,6 +29,9 @@ ConnectionProvider = Callable[[str], Awaitable[tuple[TargetConfig, asyncssh.SSHC
 JobConnectionProvider = Callable[
     [str, str], Awaitable[tuple[TargetConfig, asyncssh.SSHClientConnection]]
 ]
+# (target name, job_id) -> authorized.  Must return False for both an unknown id
+# and an id owned by another client, and runs before any connection I/O.
+JobAuthorizer = Callable[[str, str], Awaitable[bool]]
 
 
 class SessionError(RuntimeError):
@@ -54,6 +58,7 @@ class SessionManager:
         config: SessionConfig,
         dedicated_provider: ConnectionProvider | None = None,
         job_provider: JobConnectionProvider | None = None,
+        job_authorizer: JobAuthorizer | None = None,
     ) -> None:
         self.backend = backend
         self.provider = provider
@@ -62,6 +67,9 @@ class SessionManager:
         # when a session names a job, so PTYs on different jobs never share or
         # invalidate each other's transport.
         self.job_provider = job_provider
+        # Optional pre-I/O ownership check.  Without it the job_provider is
+        # responsible for refusing an unknown/foreign id.
+        self.job_authorizer = job_authorizer
         self.config = config
         self._sessions: dict[str, ManagedSession] = {}
         self._readers: dict[str, asyncio.Task] = {}
@@ -100,6 +108,21 @@ class SessionManager:
     def _client_sessions(self, client_id: str) -> list[ManagedSession]:
         return [s for s in self._sessions.values() if s.client_id == client_id]
 
+    async def _authorize_job(self, target: str, job_id: str) -> None:
+        if self.job_authorizer is None:
+            return
+        try:
+            allowed = await self.job_authorizer(target, job_id)
+        except JobAccessError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never become an oracle
+            log.debug(
+                "job authorization failed for %s/%r: %s", target, job_id, exc
+            )
+            raise JobAccessError() from exc
+        if not allowed:
+            raise JobAccessError()
+
     async def create(
         self,
         client_id: str,
@@ -115,9 +138,22 @@ class SessionManager:
         if not (1 <= columns <= 1000) or not (1 <= rows <= 1000):
             raise SessionError("invalid terminal size")
 
+        if job_id is not None:
+            job_id = str(job_id)
+            if not job_id:
+                raise SessionError("job_id must be a non-empty string")
+            # An explicit id is never silently replaced by a shared or private
+            # default.  Refuse it before any connection work when this manager
+            # has no job-scoped provider to resolve it.
+            if self.job_provider is None:
+                raise SessionError(
+                    "job-scoped session requested but no job provider is configured"
+                )
+            await self._authorize_job(target.name, job_id)
+
         dedicated_conn = None
         try:
-            if job_id is not None and self.job_provider is not None:
+            if job_id is not None:
                 _, conn = await self.job_provider(target.name, job_id)
             elif target.connect_mode == "dedicated" and self.dedicated_provider is not None:
                 _, conn = await self.dedicated_provider(target.name)
