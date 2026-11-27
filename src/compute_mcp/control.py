@@ -250,21 +250,50 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("target-stop", help="stop a target")
     p.add_argument("target")
 
-    for name, help_ in (
-        ("target-open", "open or reuse a target's login route (never submits)"),
-        ("target-shared", "start or reuse a target's shared job"),
-    ):
-        p = sub.add_parser(name, help=help_)
-        p.add_argument("target")
-        p.add_argument(
-            "--2fa",
-            dest="use_2fa",
-            action="store_true",
-            help="prompt for the second factor (input is hidden)",
-        )
-        p.add_argument("--timeout", dest="action_timeout", type=float,
-                       default=argparse.SUPPRESS, metavar="SECONDS",
-                       help="override the request timeout")
+    p = sub.add_parser(
+        "target-open", help="open or reuse a target's login route (never submits)"
+    )
+    p.add_argument("target")
+    p.add_argument(
+        "--2fa",
+        dest="use_2fa",
+        action="store_true",
+        help="prompt for the second factor (input is hidden)",
+    )
+    p.add_argument(
+        "--set", dest="overrides", action="append", default=None,
+        metavar="KEY=VALUE",
+        help="allocation override (repeatable); target-open never allocates, "
+        "so this is accepted for symmetry and ignored",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="preview the allocation without opening the route",
+    )
+    p.add_argument("--timeout", dest="action_timeout", type=float,
+                   default=argparse.SUPPRESS, metavar="SECONDS",
+                   help="override the request timeout")
+
+    p = sub.add_parser("target-shared", help="start or reuse a target's shared job")
+    p.add_argument("target")
+    p.add_argument(
+        "--2fa",
+        dest="use_2fa",
+        action="store_true",
+        help="prompt for the second factor (input is hidden)",
+    )
+    p.add_argument(
+        "--set", dest="overrides", action="append", default=None,
+        metavar="KEY=VALUE",
+        help="allocation override (repeatable), e.g. --set gpus-per-node=2",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="preview the allocation without starting or reusing the shared job",
+    )
+    p.add_argument("--timeout", dest="action_timeout", type=float,
+                   default=argparse.SUPPRESS, metavar="SECONDS",
+                   help="override the request timeout")
 
     p = sub.add_parser("target-sbatch", help="submit a private Slurm job")
     p.add_argument("target")
@@ -484,19 +513,40 @@ async def _run(args: argparse.Namespace) -> int:
             body = await control.request("POST", f"/v1/targets/{args.target}/stop")
             _emit(args, body, lambda b: f"{b['name']} -> {b['state']}")
         elif cmd == "target-open":
-            body = await control.request(
-                "POST", f"/v1/targets/{args.target}/open",
-                json_body=_target_body(factor, None),
-                timeout=_resolve_timeout(args, config, [args.target]),
-            )
-            _emit_route(args, body)
+            overrides = _parse_overrides(getattr(args, "overrides", None))
+            if getattr(args, "dry_run", False):
+                # A dry-run must never open the route; reuse the preview path.
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/preview",
+                    json_body=_target_body(None, overrides),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_preview(args, body)
+            else:
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/open",
+                    json_body=_target_body(factor, None),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_route(args, body)
         elif cmd == "target-shared":
-            body = await control.request(
-                "POST", f"/v1/targets/{args.target}/shared",
-                json_body=_target_body(factor, None),
-                timeout=_resolve_timeout(args, config, [args.target]),
-            )
-            _emit_route_job(args, body)
+            overrides = _parse_overrides(args.overrides)
+            if args.dry_run:
+                # Same preview contract as target-sbatch; no route dial and no
+                # shared-job start or reuse happens on a dry-run.
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/preview",
+                    json_body=_target_body(None, overrides),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_preview(args, body)
+            else:
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/shared",
+                    json_body=_target_body(factor, overrides),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_route_job(args, body)
         elif cmd == "target-sbatch":
             overrides = _parse_overrides(args.overrides)
             if args.dry_run:
@@ -724,6 +774,38 @@ def _emit_jobs(args, body: dict) -> None:
         )
 
 
+def _preview_lookup(body: dict, *keys):
+    """First non-null value for any key, at top level or under ``planned``.
+
+    Also checks ``planned.plan`` so a future gateway schema may report these
+    fields next to the resolved resource plan.  The gateway's preview schema
+    may grow new fields; reading them defensively lets the CLI render them
+    without inventing a value when they are absent.
+    """
+    planned = body.get("planned")
+    containers = [body]
+    if isinstance(planned, dict):
+        containers.append(planned)
+        plan = planned.get("plan")
+        if isinstance(plan, dict):
+            containers.append(plan)
+    for container in containers:
+        for key in keys:
+            if key in container and container[key] is not None:
+                return container[key]
+    return None
+
+
+def _preview_display(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
 def _emit_preview(args, body: dict) -> None:
     """Print a stable, labeled dry-run block.
 
@@ -741,6 +823,27 @@ def _emit_preview(args, body: dict) -> None:
     print(f"connected: {body.get('connected')}")
     if body.get("needs_refresh"):
         print("needs_refresh: true")
+
+    # Root mode, home selection, shared reuse/conflict and private quota are
+    # part of the design's preview contract (design section 8).  The current
+    # gateway preview route does not return them yet, so missing fields render
+    # as "-" instead of a guessed value.
+    shared_reuse = _preview_lookup(body, "shared_reuse", "reuse")
+    if shared_reuse is None:
+        shared_job_id = _preview_lookup(body, "shared_job_id")
+        if shared_job_id is not None:
+            shared_reuse = f"job {shared_job_id}"
+    print("settings:")
+    print(f"  root_mode: {_preview_display(_preview_lookup(body, 'root_mode'))}")
+    home = _preview_lookup(body, "home", "clean_home")
+    print(f"  home: {_preview_display(home)}")
+    print(f"  shared_reuse: {_preview_display(shared_reuse)}")
+    conflict = _preview_lookup(body, "settings_conflict", "shared_conflict")
+    print(f"  settings_conflict: {_preview_display(conflict)}")
+    quota = _preview_lookup(
+        body, "quota_available", "private_quota_available", "quota"
+    )
+    print(f"  quota_available: {_preview_display(quota)}")
 
     print("planned:")
     print(f"  mode: {plan.get('mode')}")

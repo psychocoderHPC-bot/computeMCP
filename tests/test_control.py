@@ -639,6 +639,137 @@ async def test_control_target_shared_pending_job_is_not_ready(monkeypatch, capsy
     assert "state: ready" not in out
 
 
+def test_parser_accepts_target_shared_set_and_dry_run():
+    args = build_parser().parse_args(
+        [
+            "--config", "x.toml", "target-shared", "hal",
+            "--set", "nodes=2", "--set", "gpus-per-node=1", "--dry-run",
+        ]
+    )
+    assert args.command == "target-shared"
+    assert args.overrides == ["nodes=2", "gpus-per-node=1"]
+    assert args.dry_run is True
+
+
+async def test_control_target_shared_sends_set_and_factor(monkeypatch):
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["target-shared", "hal", "--2fa", "--set", "nodes=2"],
+        {
+            "name": "hal",
+            "state": "connected",
+            "job": {"job_id": "S1", "state": "pending"},
+        },
+    )
+    assert calls == [
+        (
+            "POST",
+            "/v1/targets/hal/shared",
+            {"factor": "SECRET", "set": {"nodes": 2}},
+        )
+    ]
+
+
+async def test_control_target_shared_dry_run_uses_preview_without_factor(
+    monkeypatch, capsys
+):
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["target-shared", "hal", "--2fa", "--dry-run", "--set", "gpus-per-node=2"],
+        {"target": "hal", "connected": False, "planned": {"plan": {}}},
+    )
+    # Dry-run uses the preview route and never prompts for or sends a factor.
+    assert calls == [
+        ("POST", "/v1/targets/hal/preview", {"set": {"gpus-per-node": 2}})
+    ]
+    out = capsys.readouterr().out
+    assert "planned:" in out
+    assert "shared_reuse:" in out
+
+
+@pytest.mark.parametrize(
+    "argv,path",
+    [
+        (["target-connect", "hal", "--2fa"], "/v1/targets/hal/connect"),
+        (["target-open", "hal", "--2fa"], "/v1/targets/hal/open"),
+        (["target-shared", "hal", "--2fa"], "/v1/targets/hal/shared"),
+        (["target-sbatch", "hal", "--2fa"], "/v1/targets/hal/sbatch"),
+    ],
+)
+async def test_control_2fa_forwarded_on_target_commands(monkeypatch, argv, path):
+    calls, _ = await _run_control(
+        monkeypatch,
+        argv,
+        {"name": "hal", "state": "connected", "active_route": "hal"},
+    )
+    assert calls == [("POST", path, {"factor": "SECRET"})]
+
+
+async def test_control_target_open_dry_run_uses_preview(monkeypatch):
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["target-open", "hal", "--dry-run"],
+        {"target": "hal", "connected": False, "planned": {"plan": {}}},
+    )
+    assert calls == [("POST", "/v1/targets/hal/preview", None)]
+
+
+async def test_control_preview_renders_design_fields(monkeypatch, capsys):
+    preview = {
+        "target": "hal",
+        "connected": False,
+        "root_mode": "clean",
+        "home": "agents/alpaka/benchmarks/run-42",
+        "shared_reuse": {"reuse": True, "job_id": "S1"},
+        "settings_conflict": False,
+        "quota_available": {"available": 1, "limit": 2},
+        "planned": {"plan": {"mode": "full"}},
+    }
+    await _run_control(
+        monkeypatch, ["target-sbatch", "hal", "--dry-run"], preview
+    )
+    out = capsys.readouterr().out
+    assert "root_mode: clean" in out
+    assert "home: agents/alpaka/benchmarks/run-42" in out
+    assert 'shared_reuse: {"job_id": "S1", "reuse": true}' in out
+    assert "settings_conflict: false" in out
+    assert 'quota_available: {"available": 1, "limit": 2}' in out
+
+
+async def test_control_preview_missing_design_fields_is_not_invented(
+    monkeypatch, capsys
+):
+    preview = {"target": "hal", "connected": False, "planned": {"plan": {}}}
+    await _run_control(
+        monkeypatch, ["target-sbatch", "hal", "--dry-run"], preview
+    )
+    out = capsys.readouterr().out
+    assert "root_mode: -" in out
+    assert "home: -" in out
+    assert "shared_reuse: -" in out
+    assert "settings_conflict: -" in out
+    assert "quota_available: -" in out
+
+
+async def test_control_preview_json_keeps_design_fields(monkeypatch, capsys):
+    preview = {
+        "target": "hal",
+        "connected": False,
+        "root_mode": "fakeroot",
+        "home": "shared",
+        "settings_conflict": True,
+        "quota_available": {"available": 0},
+    }
+    await _run_control(
+        monkeypatch, ["--json", "target-sbatch", "hal", "--dry-run"], preview
+    )
+    data = json.loads(capsys.readouterr().out)
+    assert data["root_mode"] == "fakeroot"
+    assert data["home"] == "shared"
+    assert data["settings_conflict"] is True
+    assert data["quota_available"] == {"available": 0}
+
+
 async def test_control_target_sbatch_body(monkeypatch):
     calls, _ = await _run_control(
         monkeypatch,
