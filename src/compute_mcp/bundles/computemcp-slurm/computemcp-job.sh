@@ -112,17 +112,41 @@ fi
 bash "$CONTAINER_SCRIPT" start
 STARTED=1
 
-# The container script picks the actual Dropbear port at start time (0 asks for
-# an ephemeral port) and publishes it in the per-job state directory.  Wait for
-# the banner on THAT port, not on the request value.
-ACTUAL_CONTAINER_PORT="$CONTAINER_PORT"
+# The container script picks the actual reachable port at start time and
+# publishes it in the per-job state directory.  Apptainer publishes the node
+# loopback port; Docker publishes the concrete EPHEMERAL HOST port its
+# ``127.0.0.1::<container-port>`` mapping was assigned, because that host port
+# (not the in-container port) is what a process on the compute node can dial.
+# Wait for the banner on THAT port, never on the raw request value: the Slurm
+# default request is 0 (\"pick an ephemeral port\"), which is not a readiness
+# value and must be rejected rather than waited on.
+ACTUAL_CONTAINER_PORT=""
 if [ -s "$STATE/container.port" ]; then
     ACTUAL_CONTAINER_PORT="$(head -n 1 "$STATE/container.port" || true)"
 fi
-[[ "$ACTUAL_CONTAINER_PORT" =~ ^[0-9]+$ ]] || {
-    echo "Container port was not published in $STATE/container.port" >&2
+if ! { [[ "$ACTUAL_CONTAINER_PORT" =~ ^[0-9]+$ ]] &&
+       (( ACTUAL_CONTAINER_PORT >= 1 && ACTUAL_CONTAINER_PORT <= 65535 )); }; then
+    ACTUAL_CONTAINER_PORT=""
+fi
+# Fall back to the published endpoint host port when container.port is missing
+# (older container script, or a Docker run that only wrote container.endpoint).
+if [ -z "$ACTUAL_CONTAINER_PORT" ] && [ -s "$STATE/container.endpoint" ]; then
+    ENDPOINT_VALUE="$(head -n 1 "$STATE/container.endpoint" || true)"
+    ENDPOINT_PORT="${ENDPOINT_VALUE##*:}"
+    if [[ "$ENDPOINT_PORT" =~ ^[0-9]+$ ]] &&
+        (( ENDPOINT_PORT >= 1 && ENDPOINT_PORT <= 65535 )); then
+        ACTUAL_CONTAINER_PORT="$ENDPOINT_PORT"
+    fi
+fi
+# Last resort: a concrete nonzero request (direct/legacy calls only).
+if [ -z "$ACTUAL_CONTAINER_PORT" ] && [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] &&
+    (( CONTAINER_PORT >= 1 && CONTAINER_PORT <= 65535 )); then
+    ACTUAL_CONTAINER_PORT="$CONTAINER_PORT"
+fi
+if [ -z "$ACTUAL_CONTAINER_PORT" ]; then
+    echo "Container port was not published in $STATE/container.port (or $STATE/container.endpoint), and the request value '$CONTAINER_PORT' is not a usable port (0 means ephemeral)." >&2
     exit 1
-}
+fi
 
 # Publish the node only after the container serves an SSH banner.
 python3 - "$ACTUAL_CONTAINER_PORT" "$SSH_WAIT_SECONDS" <<'PY'

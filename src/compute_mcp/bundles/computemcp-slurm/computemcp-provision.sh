@@ -744,11 +744,37 @@ job_container_port() {
             return 0
         fi
     fi
-    if [ "$CONTAINER_PORT" != 0 ]; then
+    # Docker maps the container port to an ephemeral HOST port, which is what a
+    # process on the compute node dials.  Fall back to the host port published
+    # in container.endpoint when container.port was not written (an older
+    # container helper).  A literal 0 is "ephemeral", never a readiness value.
+    if [ -s "$STATE/container.endpoint" ]; then
+        VALUE="$(head -n 1 "$STATE/container.endpoint" || true)"
+        VALUE="${VALUE##*:}"
+        if [[ "$VALUE" =~ ^[0-9]+$ ]] && (( VALUE >= 1 && VALUE <= 65535 )); then
+            printf '%s\n' "$VALUE"
+            return 0
+        fi
+    fi
+    if [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] &&
+        (( CONTAINER_PORT >= 1 && CONTAINER_PORT <= 65535 )); then
         printf '%s\n' "$CONTAINER_PORT"
         return 0
     fi
     return 1
+}
+# Drop the readiness/publication files of a PREVIOUS allocation before a new
+# sbatch.  A re-submit reuses the per-job state directory, so a stale ready
+# node, container port/endpoint or cancellation marker would make observe and
+# attach report (or dial) the dead allocation's endpoint.
+clear_stale_runtime_state() {
+    local MARKER
+    rm -f -- "$STATE/ready" "$STATE/container.port" \
+        "$STATE/container.endpoint" "$STATE/cancelled"
+    for MARKER in "$STATE"/ready.*; do
+        [ -e "$MARKER" ] || continue
+        rm -f -- "$MARKER"
+    done
 }
 
 # --- Direct (non-Slurm) mode helpers ---------------------------------------
@@ -901,6 +927,9 @@ submit_allocation() {
     printf '%s\n' "$NAME" > "$STATE/instance"
     printf '%s\n' "$RUNTIME" > "$STATE/container.runtime"
 
+    # Every submit is a fresh allocation: forget the previous run's readiness.
+    clear_stale_runtime_state
+
     local SETTINGS="$STATE/srun-$SYSTEM.settings"
     local HELPER_ARGS=(--parsable --job-name="$NAME")
     sbatch_has() {
@@ -960,18 +989,24 @@ attach_job() {
     ensure_jobid || true
     [ -n "$JOBID" ] || { echo 'No tracked job; submit first.' >&2; exit 1; }
     local END=$((SECONDS + WAIT_SECONDS))
-    local NODE="" RAW=""
+    local NODE="" RAW="" VOCAB=""
     while (( SECONDS < END )); do
         RAW="$(raw_job_state || true)"
-        case "$RAW" in
-            RUNNING)
-                if [ -s "$STATE/ready" ]; then
-                    read -r NODE < "$STATE/ready" || true
-                    [ -n "$NODE" ] && break
-                fi
+        NODE=""
+        if [ -s "$STATE/ready" ]; then
+            read -r NODE < "$STATE/ready" || true
+        fi
+        # Use the same mapping as observe (mapped_state/state_vocab) so the
+        # two stages can never disagree about a state.  SUSPENDED, COMPLETING,
+        # CONFIGURING, REQUEUED and RESIZING are non-terminal there, so attach
+        # keeps waiting for them instead of aborting on its own private list.
+        VOCAB="$(mapped_state)"
+        case "$VOCAB" in
+            ready)
+                [ -n "$NODE" ] && break
                 ;;
-            PENDING|CONFIGURING) ;;
-            COMPLETING|SUSPENDED|STOPPED)
+            pending|starting) ;;
+            terminal)
                 tail -n 60 "$STATE/slurm-$JOBID.log" >&2 2>/dev/null || true
                 echo "Job $JOBID is terminal ($RAW)." >&2
                 exit 1
@@ -1192,6 +1227,8 @@ if [ "$ACTION" = provision ]; then
 
     if [ -z "$JOBID" ]; then
         stop_relay
+        # Fresh allocation: forget the previous run's readiness/publication.
+        clear_stale_runtime_state
         # Re-use the submit stage without re-running ensure_container.
         SETTINGS="$STATE/srun-$SYSTEM.settings"
         HELPER_ARGS=(--parsable --job-name="$NAME")

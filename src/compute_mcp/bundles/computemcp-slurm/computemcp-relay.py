@@ -110,7 +110,17 @@ def parse_server_argv(argv):
     return job_id, port, jobid, node, ready
 
 
+USAGE = ('usage: computemcp-relay.py [--job-id ID] [--ready-file FILE] '
+         'PORT SLURM_JOB_ID NODE [READY]')
+
+# Guard the mode dispatch so an empty/partial argv prints usage instead of
+# raising IndexError and dumping a traceback.
+if len(sys.argv) < 2:
+    raise SystemExit(USAGE)
+
 if sys.argv[1] == '--check':
+    if len(sys.argv) < 3:
+        raise SystemExit(USAGE)
     try:
         with socket.create_connection(('127.0.0.1', int(sys.argv[2])), timeout=10) as conn:
             with conn.makefile('rb') as reader:
@@ -124,6 +134,8 @@ if sys.argv[1] == '--check':
 
 
 if sys.argv[1] == '--connect':
+    if len(sys.argv) < 3:
+        raise SystemExit(USAGE)
     container_port = int(sys.argv[2])
     with socket.create_connection(('127.0.0.1', container_port), timeout=10) as conn:
         conn.settimeout(None)

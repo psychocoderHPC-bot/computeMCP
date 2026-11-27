@@ -37,10 +37,31 @@ image, or path is hardcoded either way.
 ## Login-node requirements
 
 Slurm client tools (`sbatch`, `squeue`, `scancel`, `srun`), Bash, `flock`,
-`python3`, and the selected runtime (`apptainer` or `docker`).  The Apptainer
-configure step uses `python3` on the login node, so Python 3 remains a login
-node requirement even though the argument bridge itself is pure Bash.  Compute
-nodes need the same runtime and `python3`.
+`python3` (3.8 or newer), and the selected runtime (`apptainer` or `docker`).
+The Apptainer configure step uses `python3` on the login node, so Python 3
+remains a login node requirement even though the argument bridge itself is pure
+Bash.  Compute nodes need the same runtime and `python3`.
+
+### Apptainer prerequisites
+
+`computemcp-container.sh` probes Apptainer before `build`/`configure`/`start`
+and fails with an actionable message instead of letting a later step emit an
+opaque error:
+
+* **Apptainer 1.x or newer.**  Legacy Singularity (major version `0`) is
+  rejected.  An unparseable `apptainer --version` output is only a warning,
+  because a site wrapper may hide it.
+* **Working `--fakeroot`.**  The fakeroot sandbox needs either a setuid-root
+  Apptainer install or unprivileged user namespaces
+  (`unshare --user --map-root-user true`).  Running as root also satisfies it.
+  When neither is available the helper names both remedies.
+* **A writable sandbox account.**  Some base images ship no `ubuntu` account.
+  `%post` creates one when the shadow tools are present, and `configure` creates
+  a non-root account with a free UID/GID when the image still has none.
+
+For immutable `clean` root mode, `COMPUTEMCP_IMAGE_DIGEST` pins the expected
+base-image SHA-256.  A mismatch aborts the run; without a pin, the first digest
+is recorded and a later change is reported as a warning.
 
 ## Gateway configuration
 
