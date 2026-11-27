@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 import aiohttp
@@ -36,6 +37,7 @@ from .config import (
     GatewayConfig,
     default_config_path,
     load_config,
+    parse_job_limits,
 )
 from .factor import FactorPromptError, prompt_factor
 
@@ -47,6 +49,20 @@ DEFAULT_TIMEOUT = 60.0
 # Extra slack on top of a target's provision_timeout so the HTTP client waits
 # past the provisioning command's own deadline for the connect handshake.
 PROVISION_HANDSHAKE_MARGIN = 60.0
+# Extra slack on top of a job-wait deadline so the client does not time out
+# before the gateway's own bounded wait returns.
+JOB_WAIT_MARGIN = 15.0
+# One public message for an unknown job and another client's job.  The gateway
+# already collapses both to 404 with this text; the CLI normalizes to it so a
+# caller can never tell the two cases apart.
+JOB_NOT_FOUND_TEXT = "job not found"
+
+
+def _normalize_gateway_error(message: str) -> str:
+    """Collapse every job 404 to the single public not-found message."""
+    if message.startswith("gateway error 404"):
+        return JOB_NOT_FOUND_TEXT
+    return message
 
 
 def _resolve_gateway(config: GatewayConfig, override: str | None) -> str:
@@ -192,6 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("approve", help="approve an enrollment request (admin)")
     p.add_argument("request_id")
+    p.add_argument(
+        "--job-limit", dest="job_limit", action="append", default=None,
+        metavar="TARGET=N",
+        help="per-target private-job limit for the approved client "
+        "(repeatable), e.g. --job-limit frontier=2 --job-limit juwels=0",
+    )
     p = sub.add_parser("deny", help="deny an enrollment request (admin)")
     p.add_argument("request_id")
 
@@ -227,6 +249,72 @@ def build_parser() -> argparse.ArgumentParser:
         )
     p = sub.add_parser("target-stop", help="stop a target")
     p.add_argument("target")
+
+    for name, help_ in (
+        ("target-open", "open or reuse a target's login route (never submits)"),
+        ("target-shared", "start or reuse a target's shared job"),
+    ):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("target")
+        p.add_argument(
+            "--2fa",
+            dest="use_2fa",
+            action="store_true",
+            help="prompt for the second factor (input is hidden)",
+        )
+        p.add_argument("--timeout", dest="action_timeout", type=float,
+                       default=argparse.SUPPRESS, metavar="SECONDS",
+                       help="override the request timeout")
+
+    p = sub.add_parser("target-sbatch", help="submit a private Slurm job")
+    p.add_argument("target")
+    p.add_argument(
+        "--2fa",
+        dest="use_2fa",
+        action="store_true",
+        help="prompt for the second factor (input is hidden)",
+    )
+    p.add_argument(
+        "--set", dest="overrides", action="append", default=None,
+        metavar="KEY=VALUE",
+        help="allocation override (repeatable), e.g. --set gpus-per-node=2",
+    )
+    p.add_argument(
+        "--root-mode", choices=("fakeroot", "clean"), default=None,
+        help="root filesystem mode for the private job",
+    )
+    p.add_argument(
+        "--clean-home", default=None, metavar="PATH",
+        help="home subdirectory used as HOME (relative to the client home)",
+    )
+    p.add_argument(
+        "--request-id", default=None, metavar="ID",
+        help="idempotency id; reusing it with different settings is rejected",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="preview the allocation without submitting (no job is created)",
+    )
+    p.add_argument("--timeout", dest="action_timeout", type=float,
+                   default=argparse.SUPPRESS, metavar="SECONDS",
+                   help="override the request timeout")
+
+    p = sub.add_parser("job-list", help="list jobs visible to the caller")
+    p.add_argument("--target", default=None, help="limit to one target")
+
+    p = sub.add_parser("job-status", help="show one job")
+    p.add_argument("job_id")
+
+    p = sub.add_parser("job-wait", help="wait until a job is ready or terminal")
+    p.add_argument("job_id")
+    p.add_argument(
+        "--timeout", dest="action_timeout", type=float, default=30.0,
+        metavar="SECONDS",
+        help="maximum wait in seconds (default: 30); the job is left intact",
+    )
+
+    p = sub.add_parser("job-stop", help="cancel a job")
+    p.add_argument("job_id")
 
     for name, help_ in (
         ("client-connect", "connect every target a client may access"),
@@ -277,6 +365,26 @@ class Control:
                 raise SystemExit(f"gateway error {response.status}: {text[:500]}")
             return json.loads(text) if text else {}
 
+    async def job_request(
+        self,
+        method: str,
+        path: str,
+        json_body: dict | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        """Issue a job-scoped request and hide job-id existence in a 404.
+
+        A foreign job id and an unknown job id both become the same public
+        message.  Quota and authorization failures keep the gateway's text
+        (they do not reveal whether the id exists).
+        """
+        try:
+            return await self.request(
+                method, path, json_body=json_body, timeout=timeout
+            )
+        except SystemExit as exc:
+            raise SystemExit(_normalize_gateway_error(str(exc))) from None
+
 
 async def _run(args: argparse.Namespace) -> int:
     config = load_config(args.config, token_file=args.token_file)
@@ -319,8 +427,14 @@ async def _run(args: argparse.Namespace) -> int:
             body = await control.request("GET", "/v1/enroll-requests")
             _emit(args, body, _render_enrollments)
         elif cmd == "approve":
+            try:
+                limits = parse_job_limits(args.job_limit)
+            except ConfigError as exc:
+                raise SystemExit(str(exc)) from None
+            payload = {"job_limits": limits} if limits else None
             body = await control.request(
-                "POST", f"/v1/enroll-requests/{args.request_id}/approve"
+                "POST", f"/v1/enroll-requests/{args.request_id}/approve",
+                json_body=payload,
             )
             _emit(
                 args,
@@ -369,6 +483,67 @@ async def _run(args: argparse.Namespace) -> int:
         elif cmd == "target-stop":
             body = await control.request("POST", f"/v1/targets/{args.target}/stop")
             _emit(args, body, lambda b: f"{b['name']} -> {b['state']}")
+        elif cmd == "target-open":
+            body = await control.request(
+                "POST", f"/v1/targets/{args.target}/open",
+                json_body=_target_body(factor, None),
+                timeout=_resolve_timeout(args, config, [args.target]),
+            )
+            _emit_route(args, body)
+        elif cmd == "target-shared":
+            body = await control.request(
+                "POST", f"/v1/targets/{args.target}/shared",
+                json_body=_target_body(factor, None),
+                timeout=_resolve_timeout(args, config, [args.target]),
+            )
+            _emit_route_job(args, body)
+        elif cmd == "target-sbatch":
+            overrides = _parse_overrides(args.overrides)
+            if args.dry_run:
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/preview",
+                    json_body=_target_body(None, overrides),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_preview(args, body)
+            else:
+                body = await control.request(
+                    "POST", f"/v1/targets/{args.target}/sbatch",
+                    json_body=_sbatch_body(
+                        factor, overrides, args.root_mode, args.clean_home,
+                        args.request_id,
+                    ),
+                    timeout=_resolve_timeout(args, config, [args.target]),
+                )
+                _emit_job(args, body)
+        elif cmd == "job-list":
+            path = "/v1/jobs"
+            if args.target:
+                path = f"{path}?target={urllib.parse.quote(args.target)}"
+            body = await control.request("GET", path)
+            _emit_jobs(args, body)
+        elif cmd == "job-status":
+            body = await control.job_request(
+                "GET", f"/v1/jobs/{urllib.parse.quote(args.job_id)}"
+            )
+            _emit_job(args, body)
+        elif cmd == "job-wait":
+            wait_for = args.action_timeout
+            if wait_for is None:
+                wait_for = 30.0
+            body = await control.job_request(
+                "GET",
+                f"/v1/jobs/{urllib.parse.quote(args.job_id)}"
+                f"?wait=true&timeout={wait_for:g}",
+                timeout=wait_for + JOB_WAIT_MARGIN,
+            )
+            _emit_job(args, body)
+        elif cmd == "job-stop":
+            body = await control.job_request(
+                "POST",
+                f"/v1/jobs/{urllib.parse.quote(args.job_id)}/cancel",
+            )
+            _emit_job(args, body)
         elif cmd.startswith("client-"):
             await _client_action(args, control, config, cmd[len("client-"):])
         else:
@@ -427,15 +602,126 @@ def _target_body(factor: str | None, overrides: dict | None) -> dict | None:
     return body or None
 
 
+def _sbatch_body(
+    factor: str | None,
+    overrides: dict | None,
+    root_mode: str | None,
+    clean_home: str | None,
+    request_id: str | None,
+) -> dict | None:
+    """Build the private-submit request body, omitting every unset field."""
+    body: dict = {}
+    if factor is not None:
+        body["factor"] = factor
+    if overrides is not None:
+        body["set"] = overrides
+    if root_mode is not None:
+        body["root_mode"] = root_mode
+    if clean_home is not None:
+        body["clean_home"] = clean_home
+    if request_id is not None:
+        body["request_id"] = request_id
+    return body or None
+
+
 def _emit_target(args, body: dict) -> None:
     """Print a target state line plus any gateway warning (to stderr)."""
     if args.json:
         print(json.dumps(body, indent=2))
         return
     print(f"{body['name']} -> {body['state']} ({body.get('active_route')})")
+    job = body.get("job")
+    if isinstance(job, dict):
+        print(f"job: {job.get('job_id')} state={job.get('state')}")
     warning = body.get("warning")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
+
+
+def _route_lines(body: dict) -> list[str]:
+    """Render route state on its own lines, apart from any job state."""
+    lines = [
+        f"target: {body.get('name') or body.get('target') or '-'}",
+        f"route: {'open' if body.get('state') == 'connected' else 'absent'}",
+        f"route_state: {body.get('state') or '-'}",
+        f"active_route: {body.get('active_route') or '-'}",
+    ]
+    return lines
+
+
+def _job_lines(job: dict) -> list[str]:
+    return [
+        f"job: {job.get('job_id') or '-'}",
+        f"target: {job.get('target') or '-'}",
+        f"kind: {job.get('kind') or '-'}",
+        f"state: {job.get('state') or '-'}",
+        f"slurm_job_id: {job.get('slurm_job_id') or '-'}",
+        f"cluster: {job.get('cluster') or '-'}",
+        f"scheduler_state: {job.get('scheduler_state') or '-'}",
+        f"root_mode: {job.get('root_mode') or '-'}",
+        f"home: {job.get('home') or '-'}",
+        f"node: {job.get('node') or '-'}",
+        f"terminal_reason: {job.get('terminal_reason') or '-'}",
+    ]
+
+
+def _emit_route(args, body: dict) -> None:
+    """Print target route state and any gateway warning."""
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return
+    print("\n".join(_route_lines(body)))
+    warning = body.get("warning")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+
+
+def _emit_route_job(args, body: dict) -> None:
+    """Print route state and the shared job state as separate blocks."""
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return
+    print("\n".join(_route_lines(body)))
+    job = body.get("job")
+    if isinstance(job, dict):
+        print("\n".join(_job_lines(job)))
+    if body.get("settings_conflict"):
+        print("settings_conflict: true")
+    error = body.get("error")
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+
+
+def _emit_job(args, body: dict) -> None:
+    """Print one job record as labeled lines."""
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return
+    print("\n".join(_job_lines(body)))
+
+
+def _emit_jobs(args, body: dict) -> None:
+    """Print the visible job list as a stable table."""
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return
+    jobs = body.get("jobs") or []
+    if not jobs:
+        print("no jobs")
+        return
+    print(
+        f"{'JOB_ID':<22}{'TARGET':<16}{'KIND':<8}{'STATE':<12}"
+        f"{'SLURM_JOB_ID':<16}CLUSTER"
+    )
+    for job in jobs:
+        print(
+            f"{str(job.get('job_id') or '-'):<22}"
+            f"{str(job.get('target') or '-'):<16}"
+            f"{str(job.get('kind') or '-'):<8}"
+            f"{str(job.get('state') or '-'):<12}"
+            f"{str(job.get('slurm_job_id') or '-'):<16}"
+            f"{job.get('cluster') or '-'}"
+        )
 
 
 def _emit_preview(args, body: dict) -> None:
