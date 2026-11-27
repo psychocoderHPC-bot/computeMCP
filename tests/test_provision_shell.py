@@ -40,6 +40,7 @@ the wrong provisioning mode.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import json
@@ -179,6 +180,28 @@ def _published_port(container_port: int) -> int:
 def _shell_quote(text: str) -> str:
     """Render a value the way bash ``printf %q`` does for the settings file."""
     return "'" + text.replace("'", "'\\''") + "'"
+
+
+def _embedded_python_blocks(script: Path) -> list[tuple[str, str]]:
+    """Extract ``python3 ... <<'TAG' ... TAG`` heredocs from a shell script.
+
+    Only blocks whose opening command mentions ``python`` are returned, and the
+    interpreter reads the body verbatim, so parsing the captured body is the
+    same source the shipped script executes.
+    """
+    text = script.read_text(encoding="utf-8")
+    blocks: list[tuple[str, str]] = []
+    for match in re.finditer(r"<<'([A-Za-z_][A-Za-z0-9_]*)'\n", text):
+        tag = match.group(1)
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        header = text[line_start:match.start()]
+        if "python" not in header:
+            continue
+        end = text.find("\n" + tag + "\n", match.end())
+        if end == -1:
+            continue
+        blocks.append((tag, text[match.end():end]))
+    return blocks
 
 
 # --- stub scripts ----------------------------------------------------------
@@ -3870,3 +3893,310 @@ def test_submit_applies_provision_env_bootstrap(tmp_path, stubs, fake_slurm_env)
     settings = _job_dir(storage, "envboot", "env") / "srun-envboot.settings"
     assert settings.exists()
     assert "COMPUTEMCP_PROVISION_ENV" in settings.read_text()
+
+
+# --- Portability and prerequisite regressions ------------------------------
+#
+# R1/R2 review findings on the bundle: Python 3.8 compatibility of the embedded
+# helpers, the missing Apptainer account on bare base images, the Apptainer
+# prerequisite probe, the Slurm+Docker published-port bug, stale re-submit
+# state, the digest pin, and the relay argv guard.
+
+
+def test_embedded_container_python_is_python38_compatible():
+    """The embedded Python helpers must parse with the 3.8 grammar.
+
+    ``computemcp-container.sh`` embeds Python that runs on the node's
+    ``python3``.  A 3.9-only call (``Path.is_relative_to``) previously slipped
+    in, so every block is parsed with ``feature_version=(3, 8)``.
+    """
+    blocks = _embedded_python_blocks(CONTAINER)
+    tags = {tag for tag, _ in blocks}
+    assert {"PY", "CONFIGURE", "PYPORT", "PYDIGEST"} <= tags, tags
+    for tag, code in blocks:
+        ast.parse(
+            code,
+            filename=f"{CONTAINER.name}:{tag}",
+            feature_version=(3, 8),
+        )
+
+
+def test_relay_cli_rejects_missing_arguments():
+    """No argv or a partial mode must print usage, never an IndexError."""
+    relay = BUNDLE_DIR / "computemcp-relay.py"
+    noargs = subprocess.run(
+        [sys.executable, str(relay)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert noargs.returncode != 0, noargs.stdout
+    assert "usage:" in (noargs.stdout + noargs.stderr).lower(), noargs.stderr
+    assert "Traceback" not in noargs.stderr, noargs.stderr
+
+    partial = subprocess.run(
+        [sys.executable, str(relay), "--check"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert partial.returncode != 0, partial.stdout
+    assert "usage:" in (partial.stdout + partial.stderr).lower(), partial.stderr
+    assert "Traceback" not in partial.stderr, partial.stderr
+
+
+def _apptainer_probe_env(tmp_path: Path, version: str) -> dict:
+    root = tmp_path / "appprobe"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    stub = bin_dir / "apptainer"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'apptainer version {version}\\n'\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+            "COMPUTEMCP_SYSTEM": "probe",
+            "COMPUTEMCP_STORAGE_ROOT": str(root / "storage"),
+            "COMPUTEMCP_SANDBOX_DIR": str(root / "sandbox"),
+            "COMPUTEMCP_HOST_HOME": str(root / "home"),
+            "COMPUTEMCP_CONTAINER_PORT": str(_free_port()),
+        }
+    )
+    env["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+    return env
+
+
+def test_apptainer_prerequisites_reject_legacy_version(tmp_path):
+    """A legacy Singularity (major 0) fails with an actionable message."""
+    env = _apptainer_probe_env(tmp_path, "0.9.9")
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0, (result.returncode, result.stderr)
+    assert "1.x or newer is required" in result.stderr, result.stderr
+    assert "Singularity" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_accept_modern_version(tmp_path):
+    """Apptainer 1.x passes the probe and reaches the normal configure path."""
+    env = _apptainer_probe_env(tmp_path, "1.3.3")
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    # No sandbox exists, so configure stops there; the prerequisite check did
+    # not reject the version.
+    assert "1.x or newer is required" not in result.stderr, result.stderr
+    assert "Missing sandbox" in result.stderr, result.stderr
+
+
+def test_apptainer_configure_creates_missing_account(tmp_path):
+    """A base image with only ``root`` gets a non-root account for the user.
+
+    Some images (the NVIDIA CUDA bases) ship no ``ubuntu`` account.  Configure
+    must create one with a free UID/GID instead of aborting.
+    """
+    root = tmp_path / "apptainer"
+    sandbox = _make_fake_sandbox(root)
+    (sandbox / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/bash\n")
+    (sandbox / "etc/shadow").write_text("root:*:19000:0:99999:7:::\n")
+    result, sandbox, host_home = _run_apptainer_configure(
+        tmp_path, "agent", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    accounts = _passwd_account(sandbox)
+    assert "agent" in accounts, accounts
+    line = accounts["agent"]
+    assert int(line[2]) >= 1000, line
+    assert line[2] == line[3], line
+    assert line[5] == "/home/agent", line
+    assert line[6] == "/usr/local/bin/computemcp-agent-shell", line
+
+    groups = {}
+    for group_line in (sandbox / "etc/group").read_text().splitlines():
+        fields = group_line.split(":")
+        groups[fields[0]] = fields
+    assert "agent" in groups, groups
+    assert groups["agent"][2] == line[3], groups
+    shadow = (sandbox / "etc/shadow").read_text()
+    assert any(row.startswith("agent:") for row in shadow.splitlines()), shadow
+    assert (host_home / ".ssh/authorized_keys").is_file()
+
+
+def test_clean_image_digest_pin_mismatch_fails(tmp_path, stubs):
+    """An operator-pinned digest aborts on a different clean base."""
+    env, _sandbox, _host_home, _log = _apptainer_base_env(
+        tmp_path, stubs, system="digest"
+    )
+    image = tmp_path / "clean-base.sif"
+    image.write_bytes(b"immutable clean base\n")
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    job_state = tmp_path / "storage" / "digest" / "state" / "jobs" / "pin"
+    job_env = dict(env)
+    job_env.update(
+        {
+            "COMPUTEMCP_ROOT_MODE": "clean",
+            "COMPUTEMCP_CLEAN_IMAGE": str(image),
+            "COMPUTEMCP_STATE_DIR": str(job_state),
+            "COMPUTEMCP_JOB_ID": "pin",
+        }
+    )
+
+    wrong = dict(job_env)
+    wrong["COMPUTEMCP_IMAGE_DIGEST"] = "0" * 64
+    rejected = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=wrong,
+        cwd=tmp_path,
+    )
+    assert rejected.returncode != 0, (rejected.returncode, rejected.stderr)
+    assert "digest mismatch" in rejected.stderr, rejected.stderr
+
+    pinned = dict(job_env)
+    pinned["COMPUTEMCP_IMAGE_DIGEST"] = "sha256:" + digest
+    accepted = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=pinned,
+        cwd=tmp_path,
+    )
+    assert accepted.returncode == 0, (accepted.returncode, accepted.stderr)
+    assert (job_state / "image.digest").read_text().strip() == digest
+
+
+def test_submit_clears_stale_runtime_state(tmp_path, stubs, fake_slurm_env):
+    """A re-submit drops the previous allocation's readiness files."""
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "staleflow", job_id="stale"
+    )
+    jobdir = _job_dir(storage, "staleflow", "stale")
+    jobdir.mkdir(parents=True, exist_ok=True)
+    stale = {
+        "ready": "dead-node\n",
+        "container.port": "23456\n",
+        "container.endpoint": "127.0.0.1:23456\n",
+        "cancelled": "cancelled\n",
+        "ready.ABC123": "dead-node\n",
+    }
+    for name, value in stale.items():
+        (jobdir / name).write_text(value, encoding="utf-8")
+
+    result = _run_provision(env, workdir, "submit", "stale")
+    assert result.returncode == 0, (result.returncode, result.stderr)
+    for name in stale:
+        assert not (jobdir / name).exists(), name
+
+
+def test_observe_and_attach_agree_on_non_terminal_states(
+    tmp_path, stubs, fake_slurm_env
+):
+    """SUSPENDED/COMPLETING/STOPPED are non-terminal in observe AND attach.
+
+    Regression: observe mapped them to ``starting`` while attach aborted with
+    "terminal", so the two stages disagreed about the same allocation.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "agreeflow", job_id="agree"
+    )
+    jobdir = _job_dir(storage, "agreeflow", "agree")
+    submit = _run_provision(env, workdir, "submit", "agree")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    attach_env = dict(env)
+    attach_env["COMPUTEMCP_WAIT_SECONDS"] = "1"
+    for native in ("SUSPENDED", "COMPLETING", "STOPPED"):
+        queue = json.loads(fake_slurm_env.queue_path.read_text(encoding="utf-8"))
+        queue["jobs"][slurm_id]["state"] = native
+        fake_slurm_env.queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+        observed = _run_provision(env, workdir, "observe", "agree")
+        assert observed.returncode == 0, observed.stderr
+        assert "STATE starting" in observed.stdout, (native, observed.stdout)
+
+        attached = _run_provision(attach_env, workdir, "attach", "agree")
+        assert attached.returncode != 0, (native, attached.stderr)
+        combined = (attached.stdout + attached.stderr).lower()
+        assert "timed out" in combined, (native, combined)
+        assert "is terminal" not in combined, (native, combined)
+
+
+def test_slurm_docker_port_zero_uses_published_host_port(tmp_path, stubs):
+    """Slurm+Docker: port 0 resolves to the concrete published host port.
+
+    Restriction: the request is 0 ("ephemeral"), so the readiness check and the
+    relay must dial the host port Docker published, never 0 and never the
+    in-container 2222.
+    """
+    published = _free_port()
+    forward = _free_port()
+    workdir = tmp_path / "portzero"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / "portzero" / "state" / "jobs" / "default"
+
+    env = _base_env("portzero", storage, 0)
+    env["COMPUTEMCP_CONTAINER_PORT"] = "0"
+    env["COMPUTEMCP_FORWARD_PORT"] = str(forward)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["SLURM_JOB_OUT"] = str(workdir / "slurm-job.out")
+    env["SLURM_JOBID_FILE"] = str(state_dir / "jobid")
+    env["PATH"] = stubs.slurm.shell_path
+
+    result = subprocess.run(
+        ["bash", str(PROVISION), "provision"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=workdir,
+    )
+    job_pid_file = Path(env["SLURM_JOB_OUT"] + ".pid")
+
+    def teardown():
+        if job_pid_file.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(job_pid_file.read_text().strip()), 15)
+        _cleanup()
+
+    try:
+        assert result.returncode == 0, (
+            f"provision exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert (state_dir / "container.port").read_text().strip() == str(
+            published
+        )
+        endpoint_line = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("ENDPOINT")
+        )
+        assert endpoint_line.strip() == f"ENDPOINT 127.0.0.1:{forward}"
+        slurm_log = (workdir / "slurm.log").read_text()
+        assert f"--connect {published}" in slurm_log, slurm_log
+        assert "--connect 0" not in slurm_log, slurm_log
+        assert "--connect 2222" not in slurm_log, slurm_log
+    finally:
+        teardown()

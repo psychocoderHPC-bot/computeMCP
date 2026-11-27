@@ -169,14 +169,52 @@ case "$RUNTIME" in
     "") echo 'COMPUTEMCP_CONTAINER_RUNTIME must be apptainer or docker.' >&2; exit 2 ;;
     *) echo "Unsupported container runtime: $RUNTIME" >&2; exit 2 ;;
 esac
+# Apptainer prerequisite probe.  A legacy Singularity (major < 1) or an install
+# whose --fakeroot cannot work (no setuid helper and no unprivileged user
+# namespaces) fails later with an opaque error.  Fail up front with an
+# actionable message instead.  An unknown version output is only a warning: a
+# site wrapper may hide it, and the real operation still reports its own error.
+check_apptainer_prerequisites() {
+    local BIN VERSION_RAW MAJOR
+    BIN="$(command -v apptainer || true)"
+    [ -n "$BIN" ] || { echo 'apptainer not found.' >&2; exit 1; }
+    VERSION_RAW="$("$BIN" --version 2>/dev/null || true)"
+    VERSION_RAW="$(printf '%s\n' "$VERSION_RAW" |
+        grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)"
+    if [ -n "$VERSION_RAW" ]; then
+        MAJOR="${VERSION_RAW%%.*}"
+        if [[ "$MAJOR" =~ ^[0-9]+$ ]] && (( MAJOR < 1 )); then
+            echo "Apptainer 1.x or newer is required (found '$VERSION_RAW' at $BIN). Install Apptainer, not legacy Singularity." >&2
+            exit 1
+        fi
+    else
+        echo "WARNING: could not determine the Apptainer version from '$BIN --version'; continuing." >&2
+    fi
+    # --fakeroot needs either a setuid-root install or unprivileged user
+    # namespaces.  The root user and a setuid binary need no further probe.
+    if [ "$(id -u)" = 0 ] || [ -u "$BIN" ]; then
+        return 0
+    fi
+    if command -v unshare >/dev/null 2>&1 &&
+        unshare --user --map-root-user true >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "Apptainer --fakeroot is unavailable: $BIN is not setuid and unprivileged user namespaces are disabled. Enable user namespaces or install a setuid-root Apptainer (see the bundle README)." >&2
+    exit 1
+}
+
 # Environment hygiene for the Apptainer path.  A bind list inherited from the
-# login node or the scheduler spool environment (APPTAINER_BIND/BINDPATH) would
-# silently change the mount set of ``instance start``; drop it once, before any
-# apptainer invocation.  Done after the availability check so a missing binary
-# still fails with the established message.
+# login node or the scheduler spool environment (APPTAINER_BIND/BINDPATH or the
+# legacy SINGULARITY_BIND/BINDPATH) would silently change the mount set of
+# ``instance start``; drop it once, before any apptainer invocation.  Done after
+# the availability check so a missing binary still fails with the established
+# message.
 if [ "$RUNTIME" = apptainer ]; then
     command -v apptainer >/dev/null || { echo 'apptainer not found.' >&2; exit 1; }
-    unset APPTAINER_BIND APPTAINER_BINDPATH
+    unset APPTAINER_BIND APPTAINER_BINDPATH SINGULARITY_BIND SINGULARITY_BINDPATH
+    case "$ACTION" in
+        build|configure|update|start) check_apptainer_prerequisites ;;
+    esac
 fi
 # ``0`` means "pick a free ephemeral port on this node"; a fixed value must be
 # an unprivileged TCP port.  Docker always needs a concrete container port.
@@ -413,8 +451,21 @@ apptainer_build() {
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y --no-install-recommends \
     dropbear-bin openssh-sftp-server openssh-client ca-certificates \
-    git curl build-essential cmake ninja-build python3
+    git curl build-essential cmake ninja-build python3 passwd
 mkdir -p /root /home/ubuntu /etc/dropbear /.singularity.d/libs /usr/libexec
+# Some base images (e.g. the NVIDIA CUDA images) ship no ``ubuntu`` account.
+# Create it so ``configure`` has an account to rename to the gateway's login
+# user.  Guarded: an image without the shadow tools still builds, and
+# ``configure`` creates the account itself when none exists.
+if ! grep -q '^ubuntu:' /etc/group 2>/dev/null &&
+    command -v groupadd >/dev/null 2>&1; then
+    groupadd --gid 1000 ubuntu || true
+fi
+if ! grep -q '^ubuntu:' /etc/passwd 2>/dev/null &&
+    command -v useradd >/dev/null 2>&1; then
+    useradd --uid 1000 --gid 1000 --create-home --home-dir /home/ubuntu \
+        --shell /bin/bash ubuntu || true
+fi
 touch /usr/bin/nvidia-smi
 test -x /usr/lib/openssh/sftp-server
 for DESTINATION in /usr/lib/sftp-server /usr/libexec/sftp-server; do
@@ -465,7 +516,9 @@ shell = "/usr/local/bin/computemcp-" + user + "-shell"
 def target(relative):
     path = root / relative
     resolved = path.resolve(strict=False)
-    if not resolved.is_relative_to(root) or path.is_symlink():
+    # Python 3.8 floor: Path.is_relative_to is 3.9+.  A path is contained in
+    # root when it is root itself or root is one of its parents.
+    if not (root == resolved or root in resolved.parents) or path.is_symlink():
         raise SystemExit(f"Refusing configuration through symlink: {path}")
     return path
 
@@ -497,8 +550,8 @@ rows = [line.split(":") for line in passwd.read_text().splitlines()]
 # Idempotency: a first configure renames the base-image ``ubuntu`` account to
 # the requested user, so a second configure (every ``ensure_container``) sees no
 # ``ubuntu`` account and must reconfigure the already-renamed one in place
-# instead of aborting.  Exactly one candidate is accepted; anything else
-# (neither, both, duplicates) is ambiguous and rejected.
+# instead of aborting.  More than one candidate (both ``ubuntu`` and ``user``,
+# or duplicates) is ambiguous and rejected.
 #
 # A change of the configured container user (e.g. the default moved from
 # ``agent`` to ``ubuntu``) must not require rebuilding the sandbox.  When
@@ -506,6 +559,11 @@ rows = [line.split(":") for line in passwd.read_text().splitlines()]
 # previously-managed account is detected by its computeMCP shell path
 # ``/usr/local/bin/computemcp-<name>-shell``; it is renamed in place, so no
 # marker file is needed and old sandboxes keep working.
+#
+# Some base images (the NVIDIA CUDA images, for example) ship no non-root
+# account at all.  When no candidate exists, create one with a free non-root
+# UID/GID instead of aborting; ``%post`` also tries to create ``ubuntu`` but is
+# skipped on images without the shadow tools.
 ubuntu_accounts = [row for row in rows if row[0] == "ubuntu"]
 user_accounts = [row for row in rows if row[0] == user]
 managed = [
@@ -529,20 +587,82 @@ if (
     and managed[0][2] != "0"
 ):
     candidates.append(managed[0])
-if len(candidates) != 1:
+# Any category with more than one matching row is ambiguous, even when it
+# produced no candidate (two ``ubuntu`` rows, or two managed accounts).  Do not
+# mistake that ambiguity for "no account at all" and create a third one.
+ambiguous = (
+    len(ubuntu_accounts) > 1
+    or len(user_accounts) > 1
+    or len(managed) > 1
+    or len(candidates) > 1
+)
+if ambiguous:
     found = ", ".join(f"{row[0]}(uid={row[2]})" for row in rows)
     raise SystemExit(
         f"Expected exactly one 'ubuntu' or '{user}' account; found: {found}"
     )
-account = candidates[0]
+created = not candidates
+if created:
+    group_path = target("etc/group")
+    group_rows = (
+        [line.split(":") for line in group_path.read_text().splitlines()]
+        if group_path.exists() else []
+    )
+    used_uids = {
+        int(row[2]) for row in rows if len(row) > 2 and row[2].isdigit()
+    }
+    used_gids = {
+        int(row[2]) for row in group_rows if len(row) > 2 and row[2].isdigit()
+    }
+    for value in [1000] + list(range(1001, 60000)):
+        if value not in used_uids and value not in used_gids:
+            account_id = value
+            break
+    else:
+        raise SystemExit("Could not find a free non-root UID/GID for the account")
+    account = [user, "*", str(account_id), str(account_id), user, home, shell]
+    rows.append(account)
+else:
+    account = candidates[0]
 if account[2] == "0":
     raise SystemExit(f"Refusing account {account[0]!r} with UID 0")
 
-for relative in ("etc/passwd", "etc/shadow"):
+for relative in ("etc/passwd", "etc/shadow", "etc/group"):
     path = target(relative)
     backup = target(relative + ".computemcp-backup")
     if path.exists() and not backup.exists():
         shutil.copy2(path, backup)
+
+if created:
+    group_path = target("etc/group")
+    group_rows = (
+        [line.split(":") for line in group_path.read_text().splitlines()]
+        if group_path.exists() else []
+    )
+    if not any(
+        len(row) > 2 and row[2] == account[2] for row in group_rows
+    ):
+        group_rows.append([user, "x", account[2], ""])
+        write(
+            "etc/group",
+            "".join(":".join(row) + "\n" for row in group_rows),
+            stat.S_IMODE(group_path.stat().st_mode)
+            if group_path.exists() else 0o644,
+        )
+    shadow_path = target("etc/shadow")
+    shadow_content = shadow_path.read_text() if shadow_path.exists() else ""
+    if not any(
+        line.split(":")[0] == user for line in shadow_content.splitlines()
+    ):
+        if shadow_content and not shadow_content.endswith("\n"):
+            shadow_content += "\n"
+        shadow_content += f"{user}:*:19000:0:99999:7:::\n"
+        write(
+            "etc/shadow",
+            shadow_content,
+            stat.S_IMODE(shadow_path.stat().st_mode)
+            if shadow_path.exists() else 0o640,
+        )
 
 # Rename the sandbox account to the gateway's login account, keeping UID/GID.
 original_name = account[0]
@@ -682,8 +802,28 @@ PYDIGEST
 }
 
 record_clean_digest() {
-    local DIGEST
+    local DIGEST EXPECTED RECORDED
     DIGEST="$(clean_digest)"
+    # An operator-pinned expected digest (COMPUTEMCP_IMAGE_DIGEST, with an
+    # optional ``sha256:`` prefix) must match exactly: a mismatch means the
+    # immutable base was swapped and the run must not continue silently.
+    EXPECTED="$(printf '%s' "${COMPUTEMCP_IMAGE_DIGEST:-}" | tr 'A-F' 'a-f')"
+    case "$EXPECTED" in
+        sha256:*) EXPECTED="${EXPECTED#sha256:}" ;;
+    esac
+    if [ -n "$EXPECTED" ]; then
+        if [ "$EXPECTED" != "$DIGEST" ]; then
+            echo "Clean image digest mismatch for $CLEAN_IMAGE: expected $EXPECTED, got $DIGEST. Refusing to use a different base than the pinned digest." >&2
+            exit 1
+        fi
+    elif [ -r "$STATE/image.digest" ]; then
+        # Without a pin, compare against the digest recorded on first use and
+        # warn when the base changed underneath the sandbox.
+        RECORDED="$(head -n 1 "$STATE/image.digest" || true)"
+        if [ -n "$RECORDED" ] && [ "$RECORDED" != "$DIGEST" ]; then
+            echo "WARNING: clean image $CLEAN_IMAGE digest changed since it was recorded ($RECORDED -> $DIGEST); updating the record." >&2
+        fi
+    fi
     printf '%s\n' "$DIGEST" > "$STATE/image.digest.tmp.$$"
     mv -f "$STATE/image.digest.tmp.$$" "$STATE/image.digest"
     echo "Clean base $CLEAN_IMAGE digest $DIGEST" >&2
@@ -729,6 +869,12 @@ apptainer_start() {
     mkdir -p "$RUNTIME_DIR/run"
     publish_runtime_port "$RUNTIME_DIR"
     local COMMON=(--fakeroot --writable --containall --no-mount "home,cwd,hostfs,bind-paths")
+    # Bind /etc/resolv.conf only when the node has one; a missing file makes
+    # Apptainer's bind fail and the whole start aborts.
+    local RESOLV_BIND=()
+    if [ -r /etc/resolv.conf ]; then
+        RESOLV_BIND=(--bind /etc/resolv.conf:/etc/resolv.conf:ro)
+    fi
     # Start from a directory that exists on this node: an inherited batch CWD
     # may be a path that is absent on the compute node, which makes Apptainer
     # warn and fall back to '/'.  The bind set and instance-start arguments are
@@ -739,7 +885,7 @@ apptainer_start() {
         --bind "$HOST_HOME:/home/$SSH_USER" \
         --bind "$RUNTIME_DIR:/computemcp-runtime" \
         --bind "$RUNTIME_DIR/run:/run" \
-        --bind /etc/resolv.conf:/etc/resolv.conf:ro \
+        "${RESOLV_BIND[@]}" \
         "${GPU_ARGS[@]}" "$SANDBOX" "$NAME"
     wait_for_banner 127.0.0.1 "$CONTAINER_PORT" || {
         echo 'Apptainer SSH endpoint did not become ready.' >&2
@@ -770,6 +916,12 @@ clean_start() {
     local RUNTIME_DIR="$STATE/runtime"
     mkdir -p "$RUNTIME_DIR/run" "$RUNTIME_DIR/tmp"
     publish_runtime_port "$RUNTIME_DIR"
+    # Bind /etc/resolv.conf only when the node has one; a missing file makes
+    # Apptainer's bind fail and the whole start aborts.
+    local RESOLV_BIND=()
+    if [ -r /etc/resolv.conf ]; then
+        RESOLV_BIND=(--bind /etc/resolv.conf:/etc/resolv.conf:ro)
+    fi
     # An immutable base is never modified: the instance gets ephemeral writable
     # overlays for /run and /tmp plus the per-job runtime directory.  The
     # prepared base's startscript reads /computemcp-runtime/container.port.
@@ -783,7 +935,7 @@ clean_start() {
         --bind "$RUNTIME_DIR:/computemcp-runtime" \
         --bind "$RUNTIME_DIR/run:/run" \
         --bind "$RUNTIME_DIR/tmp:/tmp" \
-        --bind /etc/resolv.conf:/etc/resolv.conf:ro \
+        "${RESOLV_BIND[@]}" \
         "${GPU_ARGS[@]}" "$CLEAN_IMAGE" "$NAME"
     wait_for_banner 127.0.0.1 "$CONTAINER_PORT" || {
         echo 'Apptainer SSH endpoint did not become ready.' >&2
@@ -1039,13 +1191,21 @@ docker_ensure_started() {
     if [ "$("${DOCKER_CMD[@]}" container inspect --format '{{.State.Running}}' "$NAME")" != true ]; then
         "${DOCKER_CMD[@]}" start "$NAME" >&2
     fi
-    local HOSTENDPOINT
+    local HOSTENDPOINT HOSTPORT
     HOSTENDPOINT="$(docker_endpoint)"
-    if ! wait_for_banner "${HOSTENDPOINT%:*}" "${HOSTENDPOINT##*:}"; then
+    HOSTPORT="${HOSTENDPOINT##*:}"
+    if ! wait_for_banner "${HOSTENDPOINT%:*}" "$HOSTPORT"; then
         "${DOCKER_CMD[@]}" logs --tail 60 "$NAME" >&2 || true
         return 1
     fi
     printf '%s\n' "$HOSTENDPOINT" > "$STATE/container.endpoint"
+    # Docker publishes the container port on an EPHEMERAL host port.  The
+    # node-local SSH endpoint the allocation, the readiness check and the relay
+    # must dial is that published host port, not the requested container port
+    # (which may still be the literal ``0`` asked for an ephemeral mapping).
+    # Publish it as container.port so job.sh and provision.sh read one value.
+    printf '%s\n' "$HOSTPORT" > "$STATE/container.port.tmp.$$"
+    mv -f "$STATE/container.port.tmp.$$" "$STATE/container.port"
 }
 
 # ---------------------------------------------------------------------------
@@ -1116,7 +1276,7 @@ case "$RUNTIME" in
                 fi
                 ;;
             start)      docker_ensure_started ;;
-            stop|close) docker_exists && { docker_check_owner; "${DOCKER_CMD[@]}" stop "$NAME" >&2; }; rm -f "$STATE/container.endpoint" ;;
+            stop|close) docker_exists && { docker_check_owner; "${DOCKER_CMD[@]}" stop "$NAME" >&2; }; rm -f "$STATE/container.endpoint" "$STATE/container.port" ;;
             shell)      docker_ensure_started; exec "${DOCKER_CMD[@]}" exec -it --user "$SSH_USER" --workdir "/home/$SSH_USER" "$NAME" /usr/local/bin/computemcp-shell -l ;;
             fingerprint) docker_ensure_started; exec "${DOCKER_CMD[@]}" exec "$NAME" ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub ;;
             endpoint)
