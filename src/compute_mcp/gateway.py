@@ -71,6 +71,7 @@ from .files import remove as files_remove
 from .files import rename as files_rename
 from .files import stat as files_stat
 from .files import write as files_write
+from .mux import MuxError
 from .sessions import (
     SessionError,
     SessionForbidden,
@@ -96,6 +97,57 @@ RECOVERY_POLL_SECONDS = 5.0
 # is already gone (gateway shutdown after a lost route).  Bound the dial so
 # shutdown cannot hang on an unreachable login node.
 _CLOSE_ROUTE_TIMEOUT = 15.0
+
+# Before that fresh dial, give session channels on a stale outer connection a
+# bounded chance to drain.  This matches the mux bootstrap rule
+# (``ssh_backend._wait_for_no_session_channels``): opening a second
+# authenticated route while the old one still carries a live session channel
+# can be refused by ``MaxSessions=1`` or trip fail2ban/account lockout.
+_CLOSE_CHANNEL_DRAIN_TIMEOUT = 2.0
+
+
+async def _wait_for_no_close_channels(
+    connection: Any, timeout: float | None = None
+) -> bool:
+    """Wait briefly until *connection* has no live session channels.
+
+    Mirrors ``ssh_backend._wait_for_no_session_channels`` but reports the
+    outcome instead of proceeding anyway.  The channel table is private
+    asyncssh state; when it is absent nothing can be inspected, so the drain is
+    treated as complete.  Returns ``False`` only when channels remain at the
+    deadline.
+    """
+    if timeout is None:
+        timeout = _CLOSE_CHANNEL_DRAIN_TIMEOUT
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while True:
+        channels = getattr(connection, "_channels", None)
+        if not isinstance(channels, dict):
+            return True
+        if not channels:
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+
+
+def _connection_closed(connection: Any) -> bool:
+    """Best-effort ``asyncssh`` connection-closed probe."""
+    checker = getattr(connection, "is_closed", None)
+    if callable(checker):
+        with contextlib.suppress(Exception):
+            return bool(checker())
+    return False
+
+
+def _tunnel_alive(tunnel: Any) -> bool:
+    """Best-effort liveness probe for a tunnel-like object."""
+    checker = getattr(tunnel, "is_alive", None)
+    if callable(checker):
+        with contextlib.suppress(Exception):
+            return bool(checker())
+    return True
 
 
 def _configured_state_root(config: GatewayConfig) -> Path:
@@ -1432,6 +1484,15 @@ class Gateway:
 
     # -- mux relay registry -----------------------------------------------
     def _registry_path(self, target_name: str) -> Path:
+        """Path to this target's mux registry under the shared state root.
+
+        The gateway writes this file and ``computemcp-mux.py`` reads it on the
+        login node, so ``state_root`` must be a directory both hosts see at the
+        same absolute path (the bundle's per-job state uses the same shared
+        storage).  There is deliberately no gateway-local temp fallback: a path
+        the login node cannot see would make every ``OPEN(job_id)`` fail with
+        ``registry_unreadable``.
+        """
         self._ensure_jobs()
         directory = self.state_root / "mux"  # type: ignore[operator]
         directory.mkdir(parents=True, exist_ok=True)
@@ -2274,7 +2335,9 @@ class Gateway:
         if not target.close_command and target.bundle is None:
             return
         runtime = self.runtimes[name]
-        connection = runtime.tunnel.connection if runtime.tunnel else None
+        tunnel = runtime.tunnel
+        connection = tunnel.connection if tunnel is not None else None
+        tunnel_alive = tunnel is not None and _tunnel_alive(tunnel)
         route = runtime.active_route or (
             target.transport.ssh_targets[0] if target.transport.ssh_targets else "direct"
         )
@@ -2288,11 +2351,36 @@ class Gateway:
         if provision_env is not None:
             close_kwargs["provision_env"] = provision_env
 
-        if connection is not None:
+        if connection is not None and tunnel_alive:
             await self._run_close_on_connection(
                 name, target, route, connection, close_kwargs
             )
             return
+
+        # No live tunnel connection.  A tunnel object can outlive its liveness
+        # (for example while the mux helper channel is closing), and its outer
+        # connection may still carry a live session channel.  Wait a bounded
+        # time for those channels to drain, matching the mux bootstrap rule
+        # (``ssh_backend._wait_for_no_session_channels``).  While a channel
+        # remains live, skip the advisory close instead of opening a second
+        # authenticated dial that a ``MaxSessions=1`` login node could refuse
+        # or fail2ban could punish.  Once drained we reuse the still-open stale
+        # connection rather than dialing at all.
+        if connection is not None:
+            channels = getattr(connection, "_channels", None)
+            if not await _wait_for_no_close_channels(connection):
+                log.warning(
+                    "target %s: close_command skipped, %d session channel(s) "
+                    "still live on the stale route",
+                    name,
+                    len(channels) if isinstance(channels, dict) else 0,
+                )
+                return
+            if not _connection_closed(connection):
+                await self._run_close_on_connection(
+                    name, target, route, connection, close_kwargs
+                )
+                return
 
         # No live tunnel: at shutdown (or after a lost route) the route
         # connection is gone, but the login node is the only place that can
@@ -4542,6 +4630,11 @@ async def _error_middleware(request: web.Request, handler):
     except InteractiveAuthRequired as exc:
         raise web.HTTPServiceUnavailable(text=str(exc)) from exc
     except (HostKeyError, SSHError, TunnelError) as exc:
+        raise web.HTTPBadGateway(text=str(exc)) from exc
+    except MuxError as exc:
+        # The helper rejected OPEN (for example ``registry_unreadable`` when
+        # the shared state_root is not visible on the login node).  Surface its
+        # text as an upstream failure instead of a generic 500.
         raise web.HTTPBadGateway(text=str(exc)) from exc
     except asyncssh.Error as exc:
         # Defense in depth: an SSH failure that escapes a handler-specific
