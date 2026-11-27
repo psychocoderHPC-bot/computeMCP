@@ -59,15 +59,15 @@ These symptoms apply to a target with both `[targets.X.slurm]` and
 | `target-stop` or `target-refresh` did not cancel a job | Both detach the route on a multi-job target. Cancellation is a separate job operation | Call `job-stop <job_id>` |
 | A private submit is rejected with a quota error | The client reached its per-target private-job limit. Pending and uncertain jobs count | Wait for a job to finish, stop one with `job-stop`, or ask the operator to raise `job_limits`. The shared job consumes no slot |
 | `target-shared` returns the existing `job_id` with `settings_conflict` | The active shared job has different settings. The gateway never replaces it automatically | Use the existing shared job, or ask an operator to stop it and start a new one |
-| A job stays `submission_unknown` | `sbatch` may have been accepted, but the gateway lost the acknowledgement. The record keeps its quota slot | Run `target-open <t>` to reconcile by correlation token and persisted scheduler id. Do not resubmit the same request. If `squeue` still shows nothing, the operator must decide |
+| A job stays `submission_unknown` | `sbatch` may have been accepted, but the gateway lost the acknowledgement. The record keeps its quota slot | Run `target-open <t>` to reconcile. A persisted scheduler id is queried directly. When the bundle adapter supports comment lookup, the `--comment` token recovers a lost id. Otherwise the job stays uncertain for operator reconciliation. Do not resubmit the same request |
 | A stale shared `job_id` reports `terminal` or `job not found` | The shared job terminated, and a replacement has a new `job_id`. A stale id never selects the replacement | Re-run `target-shared <t>` (or `job-list`) and use the current shared id |
 | A private job belongs to another client | Job ids are owner-scoped. A foreign id and an unknown id return the same error | Use your own `job_id`, or the shared job. An operator token can see owners |
-| The dry-run prints `-` for `root_mode`, `home`, `shared_reuse`, `settings_conflict`, or `quota_available` | The gateway preview route does not return these fields yet | Use the input flags you intend to submit, and check quota or the shared job with `job-list` and `job-status` |
+| The preview shows `quota_available: false` | The client reached its per-target private-job limit, or the limit is `0` | Stop one job with `job-stop`, or ask the operator to raise `job_limits`. The shared job consumes no slot |
 | `multi-node not yet supported` | The shipped helper still rejects `nodes > 1` before `sbatch` | Keep `nodes = 1` for a single job. Independent private jobs are separate submissions, not a multi-node container |
 
-`target-open` and `target-connect` may require `--2fa` on an
-`interactive_auth` target. A dry-run never prompts. A refresh reuses a live
-login connection without a new factor.
+`target-open`, `target-shared`, `target-connect`, `target-refresh`, and
+`target-sbatch` may require `--2fa` on an `interactive_auth` target. A dry-run
+never prompts. A refresh reuses a live login connection without a new factor.
 
 ## HPC / dynamic nodes
 

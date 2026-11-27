@@ -154,11 +154,46 @@ target `target-connect` keeps its old ready-container behavior.
 
 A `--dry-run` on `target-open`, `target-shared`, `target-sbatch`,
 `target-connect`, or `target-refresh` renders the allocation and exits. It does
-not authenticate, dial, reserve a slot, start a shared job, or submit. The
-preview currently reports the plan, rendered `sbatch`/`srun` arguments, and
-`needs_refresh`. These preview fields are still pending on the gateway preview
-route and print as `-`: `root_mode`, `home`, `shared_reuse`,
-`settings_conflict`, and `quota_available`.
+not authenticate, dial, reserve a slot, start a shared job, or submit.
+
+The CLI prints a stable block. The gateway preview returns the job-selection
+fields as well as the plan:
+
+```
+settings:
+  root_mode: clean
+  home: benchmarks/run-42
+  shared_reuse: false
+  settings_conflict: false
+  quota_available: true
+planned:
+  mode: gpu-proportional
+  nodes: 1
+  ...
+args:
+  sbatch: ["--nodes=1", "--gres=gpu:1"]
+  srun: []
+COMPUTEMCP_SBATCH_ARGS:
+...
+```
+
+- `root_mode` is the effective request or target-level mode, and `fakeroot`
+  when neither is set.
+- `home` is the resolved private home path from the request or target config,
+  or `-` when neither is set. The JSON body also carries it as `clean_home`.
+- `shared_reuse` is the active shared `job_id`, or `false` when no shared job
+  exists.
+- `settings_conflict` is `true` when the requested settings differ from the
+  active shared job.
+- `quota_available` is `true` when the caller has a free private slot, `false`
+  when the limit is reached or set to `0`, and `-` for a target without
+  private jobs. Before the job registry exists, the configured limit answers
+  this field.
+
+`target-sbatch --dry-run` previews the target-level `root_mode` and
+`clean_home`. The CLI does not forward the submit-only `--root-mode` and
+`--clean-home` flags into the preview body, so a preview that must show those
+request values has to come from the HTTP preview endpoint.
 
 ### Quotas
 
@@ -184,20 +219,21 @@ an `interactive_auth` target needs `--2fa`. The factor is used once for a fresh
 login, never persisted or logged, and never replayed. A dry-run never prompts.
 A refresh that still has a live login connection reuses it without a factor.
 
-The CLI accepts `--2fa` on `target-sbatch` for symmetry, but the current
-gateway does not forward that factor to route opening. On an interactive target,
-open the route first with `target-open --2fa`, then submit with
-`target-sbatch`.
+`target-sbatch --2fa` forwards the factor to route opening, so one call can
+open an interactive route and submit the private job. `target-sbatch` accepts
+the same single-use factor rules as the other connect commands.
 
 ### Submission uncertainty and reconciliation
 
 The gateway persists a correlation token before `sbatch` and passes it as a
 scheduler job comment. If the acknowledgement is lost, the job becomes
 `submission_unknown` and keeps its quota slot. The gateway never resubmits it
-automatically. `target-open` reconciles durable records with `squeue`: it
-adopts a job found by its token or by its persisted scheduler id, and leaves an
-ambiguous record visible for the operator. A missing `squeue` entry alone does
-not prove that the submission failed.
+automatically. `target-open` reconciles durable records with `squeue`: a record
+with a persisted scheduler id is queried directly. When the bundle adapter
+supports comment lookup, a record without an id is recovered by its `--comment`
+token. Without that lookup the job stays `submission_unknown` and holds its
+slot until operator reconciliation. A missing `squeue` entry alone does not
+prove that the submission failed.
 
 ### Detach and cancel
 

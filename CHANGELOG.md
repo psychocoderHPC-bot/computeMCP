@@ -19,10 +19,11 @@ semantic versioning.
   `[clients.<id>.job_limits]` and repeated
   `approve --job-limit TARGET=N` entries. The default is one private job per
   authorized Slurm target. A value of `0` disables private submissions.
-- Root mode selection (`fakeroot` or `clean`) and request-level `clean_home`
-  for private jobs. The `home_base` and target-level `clean_home` keys parse
-  and validate; gateway forwarding to the helper is still pending at this
-  revision.
+- Root mode selection (`fakeroot` or `clean`) and home selection for private
+  jobs. A request-level `clean_home` wins over the target-level default, and
+  both fall back to the private home root. `home_base` and `clean_home` are
+  forwarded to the bundle as `COMPUTEMCP_HOME_BASE` and
+  `COMPUTEMCP_CLEAN_HOME`.
 - Implicit `sbatch` default emissions for calculated fields that no mapping
   names, and the nested `[slurm.sbatch.mapping]` spelling merged with the
   legacy `sbatch-map` table.
@@ -51,5 +52,10 @@ otherwise.
 
 ### Fixed
 
+- `target-sbatch --2fa` forwards the factor to route opening.
+- `gatewayctl approve --job-limit` writes the map into the new client block,
+  reloads, and returns the applied `job_limits`.
+- The preview route returns `root_mode`, `home`, `clean_home`,
+  `shared_reuse`, `settings_conflict`, and `quota_available`.
 - The bundle documentation now names five helper files: provision, container,
   job, relay, and mux.

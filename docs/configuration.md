@@ -259,8 +259,8 @@ infrastructure detail, not an operator hint.
 | `host_key_check` | optional | string | Host key verification policy for this target. `"on"` (default) requires `host_key_sha256` or `known_hosts` and refuses to connect otherwise. `"off"` disables verification; only safe when the forwarded endpoint is trusted. | `"on"` / `"off"` | `"on"` |
 | `connect_mode` | optional | string | How the gateway contacts this target when it is already connected: `"shared"` reuses an existing connection; `"dedicated"` opens a fresh one. | `"shared"` / `"dedicated"` | `"shared"` |
 | `root_mode` | optional | string | Root filesystem mode for private Slurm container jobs. `"fakeroot"` uses the persistent writable sandbox shared by fakeroot jobs. `"clean"` starts an operator-prepared immutable base image and reports its digest. Target-level default; a submission can override it. Non-Slurm Docker targets ignore it. The key alias `root-mode` is also accepted. | `"fakeroot"` / `"clean"` | `"fakeroot"` |
-| `home_base` | optional | string | Host directory under which per-client container homes live. Shared jobs mount `<home_base>/shared/`; a private job of client X mounts `<home_base>/agents/X/`. Unset falls back to the bundle default, normally `<system-dir>/home`. Also accepted as `home-base`. At this revision the gateway parses and validates the key, but does not emit it to the helper yet. | e.g. `"/scratch/USER/computemcp/home"` | not set |
-| `clean_home` | optional | string | Default home subdirectory for a private job, resolved beneath the authenticated client's home. A leading `/` is stripped, so `benchmarks/run-42` and `/benchmarks/run-42` name the same directory. Traversal, the home root, and symlink escapes are rejected. Shared jobs always use the shared home. Also accepted as `clean-home`. The request-level `--clean-home`/MCP `clean_home` value is wired. A target-level default is parsed but not applied to submissions at this revision. | e.g. `"benchmarks/run-42"` | not set |
+| `home_base` | optional | string | Host directory under which per-client container homes live. Shared jobs mount `<home_base>/shared/`; a private job of client X mounts `<home_base>/agents/X/`. The gateway exports it to the bundle as `COMPUTEMCP_HOME_BASE`. Unset falls back to the bundle default, normally `<system-dir>/home`. Also accepted as `home-base`. | e.g. `"/scratch/USER/computemcp/home"` | not set |
+| `clean_home` | optional | string | Default home subdirectory for a private job, resolved beneath the authenticated client's home. The request value (`target-sbatch --clean-home`, MCP `clean_home`, HTTP `clean_home`) wins over this target-level default. With neither set, the job uses the private home root `<home_base>/agents/<client>/`. A leading `/` is stripped, so `benchmarks/run-42` and `/benchmarks/run-42` name the same directory. Traversal, the home root, and symlink escapes are rejected. Shared jobs always use the shared home and reject `clean_home`. Also accepted as `clean-home`. | e.g. `"benchmarks/run-42"` | not set |
 | `sharing` | optional | string | Whether this system is dedicated to this task or shared with other users/jobs. Exposed via `computeMCP_targets()`; benchmark hygiene depends on it. | `"exclusive"` (dedicated), `"shared"`, `"unknown"` | `"unknown"` |
 | `node_info` | optional | array of strings | Free-form operator-authored hints about the system (unstructured; no fixed schema). Exposed to agents via `computeMCP_targets()` / `computeMCP_status()`. Use as a starting hypothesis only; verify actual hardware. | e.g. `["GPU nvidia A30", "x86 CPU", "100GbE"]` | `()` (no hints) |
 | `agent` | optional | array of tables | Ordered list of remote AI agents this target can delegate to. Each entry is an inline table with exactly the keys `agent` and `model`, both non-empty strings. List order is the retry priority order; an empty list means no remote agent. Unrelated to the SSH `user` account. | `[{ agent = "opencode", model = "qwen3.6-27b-fp8" }]` | `()` (no agent) |
@@ -654,16 +654,19 @@ Subcommands: `status`, `targets`, `clients`, `sessions`, `reload`,
 
 `target-sbatch` also accepts `--root-mode {fakeroot,clean}`,
 `--clean-home PATH`, and `--request-id ID` (an idempotency key; reusing it with
-different settings is rejected). Its `--2fa` flag is accepted by the CLI but
-the current gateway does not forward it to route opening. On an interactive
-target, run `target-open --2fa` first.
+different settings is rejected). Its `--2fa` factor is forwarded to route
+opening, so a single `target-sbatch --2fa` call can open an interactive route
+and submit the private job.
 
-`approve` accepts repeatable `--job-limit TARGET=N` entries. A limit of `0`
+`approve` accepts repeatable `--job-limit TARGET=N` entries. The gateway writes
+the map into the new `[clients.<id>.job_limits]` block, reloads the config, and
+returns the applied `job_limits` in the approval response. A limit of `0`
 disables private submissions on that target for the approved client.
 
 The interactive gateway console offers `open`, `shared`, `sbatch`,
 `jobs [target]`, `job <job-id>`, and `job-cancel <job-id>` for the same
-operations.
+operations. The console `approve` does not accept `--job-limit`; use the CLI
+flag or edit the config and reload.
 
 ### `computeMCP-handshake`
 
@@ -747,12 +750,32 @@ The contract, with the condition under which each variable is emitted:
 | `COMPUTEMCP_SSH_PUBLIC_KEY` | Public key derived from `client_key`. Emitted **only** when a bundle block is present **and** the derived public key is non-empty. |
 | `COMPUTEMCP_PROVISION_ENV` | `bundle.provision_env` lines joined by newline. Emitted **only** when a bundle block is present. An empty tuple yields `""`. |
 
+### Job stage environment
+
+For a durable multi-job target, the bundle stage adapter adds these values to
+the same `COMPUTEMCP_*` environment for each job. They are per job and are not
+target-level settings.
+
+| Variable | Value |
+|---|---|
+| `COMPUTEMCP_JOB_ID` | The computeMCP job id, for example `job-<32 hex>`. |
+| `COMPUTEMCP_JOB_KIND` | `shared` or `private`. |
+| `COMPUTEMCP_CLIENT_ID` | The owner client id for a private job; `""` for the shared job. |
+| `COMPUTEMCP_ROOT_MODE` | The effective `fakeroot` or `clean` mode. A job value wins over `target.root_mode`. |
+| `COMPUTEMCP_CLEAN_HOME` | The resolved home path relative to the client's private home; `""` for a shared job or an unset clean home. |
+| `COMPUTEMCP_HOME_BASE` | `target.home_base`, or `""` when unset. The bundle then uses its own default. |
+| `COMPUTEMCP_CORRELATION_TOKEN` | The scheduler-visible token the bundle passes to `sbatch` as a job comment for reconciliation. |
+| `COMPUTEMCP_STATE_DIR` | The per-job state directory `<state_root>/jobs/<job_id>`. |
+
+The `COMPUTEMCP_STATE_DIR` in this job stage environment is the per-job
+directory. The operator-facing `COMPUTEMCP_STATE_DIR` in section 17 is the
+gateway's state root.
+
 Out of the gateway → provisioner contract (managed by the bundle, not the
 gateway, and listed here only to separate responsibilities):
-`COMPUTEMCP_STATE_DIR`, `COMPUTEMCP_SANDBOX_DIR`, `COMPUTEMCP_CONTAINER_PORT`,
+`COMPUTEMCP_SANDBOX_DIR`, `COMPUTEMCP_CONTAINER_PORT`,
 `COMPUTEMCP_SSH_WAIT_SECONDS`, `COMPUTEMCP_FORWARD_PORT`. The bundle derives
-or sets these from what the gateway exports; the gateway never sets them
-directly.
+or sets these from what the gateway exports.
 
 Additionally, SSH exec operations (the remote exec surface used by
 `computeMCP_exec` / session write) inject per-call environment variables into
