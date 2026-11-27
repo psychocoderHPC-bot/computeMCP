@@ -170,10 +170,92 @@ case "$RUNTIME" in
     *) echo "Unsupported container runtime: $RUNTIME" >&2; exit 2 ;;
 esac
 # Apptainer prerequisite probe.  A legacy Singularity (major < 1) or an install
-# whose --fakeroot cannot work (no setuid helper and no unprivileged user
-# namespaces) fails later with an opaque error.  Fail up front with an
-# actionable message instead.  An unknown version output is only a warning: a
+# whose --fakeroot cannot work fails later with an opaque error, so fail up front
+# with an actionable message.  An unknown version output is only a warning: a
 # site wrapper may hide it, and the real operation still reports its own error.
+#
+# The CLI binary is not the setuid component: a setuid Apptainer install puts the
+# bit on the ``starter-suid`` (or legacy ``starter``) helper.  Testing
+# ``[ -u "$BIN" ]`` therefore falsely rejected valid setuid installs on hosts
+# that also restrict unprivileged user namespaces (Ubuntu 24.04).  Probe the
+# capability instead: run a bounded no-op container under ``--fakeroot`` (with
+# the sandbox or clean SIF when one already exists), accept a setuid starter
+# helper as a fallback, and only then report the site policy.
+
+# Run a command with a bounded wall clock.  ``timeout`` is part of coreutils on
+# every supported node; when it is absent run without it rather than fail the
+# probe for a missing utility.
+run_bounded() {
+    local LIMIT="${COMPUTEMCP_APPTAINER_PROBE_TIMEOUT:-20}"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$LIMIT" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Functional --fakeroot probe.  COMPUTEMCP_APPTAINER_PROBE is an operator/test
+# override: when set it is run instead of apptainer and its exit status decides.
+# This keeps tests and site wrappers independent of the host's setuid and
+# user-namespace policy.
+apptainer_fakeroot_works() {
+    local BIN="$1" PROBE_IMAGE=""
+    if [ -n "${COMPUTEMCP_APPTAINER_PROBE:-}" ]; then
+        run_bounded "$COMPUTEMCP_APPTAINER_PROBE" >/dev/null 2>&1
+        return $?
+    fi
+    # ``exec`` needs a container argument.  Use an existing sandbox or clean SIF
+    # when available; on a fresh build none exists yet, so let apptainer reject
+    # the bare no-op quickly and fall through to the other capability checks.
+    if [ -d "$SANDBOX" ]; then
+        PROBE_IMAGE="$SANDBOX"
+    elif [ -r "$CLEAN_IMAGE" ]; then
+        PROBE_IMAGE="$CLEAN_IMAGE"
+    fi
+    if [ -n "$PROBE_IMAGE" ]; then
+        run_bounded "$BIN" exec --fakeroot "$PROBE_IMAGE" true >/dev/null 2>&1 && return 0
+        run_bounded "$BIN" exec --userns "$PROBE_IMAGE" true >/dev/null 2>&1 && return 0
+    else
+        run_bounded "$BIN" exec --fakeroot true >/dev/null 2>&1 && return 0
+        run_bounded "$BIN" exec --userns true >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# True when a setuid starter helper sits beside the CLI or in a standard
+# libexec directory.
+apptainer_setuid_starter_present() {
+    local BIN="$1" DIR CANDIDATE
+    DIR="$(dirname -- "$BIN")"
+    for CANDIDATE in \
+        "$DIR/starter-suid" \
+        "$DIR/starter" \
+        "$DIR/../libexec/apptainer/bin/starter-suid" \
+        "$DIR/../libexec/apptainer/bin/starter" \
+        "$DIR/../lib/apptainer/bin/starter-suid" \
+        /usr/local/libexec/apptainer/bin/starter-suid \
+        /usr/local/libexec/apptainer/bin/starter \
+        /usr/libexec/apptainer/bin/starter-suid \
+        /usr/libexec/apptainer/bin/starter \
+        /usr/local/lib/apptainer/bin/starter-suid \
+        /usr/lib/apptainer/bin/starter-suid; do
+        [ -u "$CANDIDATE" ] && return 0
+    done
+    return 1
+}
+
+# Unprivileged user namespaces.  COMPUTEMCP_APPTAINER_USERNS_PROBE is the same
+# kind of override as above, so a test can force this branch off on a host that
+# allows user namespaces.
+apptainer_userns_works() {
+    if [ -n "${COMPUTEMCP_APPTAINER_USERNS_PROBE:-}" ]; then
+        "$COMPUTEMCP_APPTAINER_USERNS_PROBE" >/dev/null 2>&1
+        return $?
+    fi
+    command -v unshare >/dev/null 2>&1 &&
+        unshare --user --map-root-user true >/dev/null 2>&1
+}
+
 check_apptainer_prerequisites() {
     local BIN VERSION_RAW MAJOR
     BIN="$(command -v apptainer || true)"
@@ -190,16 +272,20 @@ check_apptainer_prerequisites() {
     else
         echo "WARNING: could not determine the Apptainer version from '$BIN --version'; continuing." >&2
     fi
-    # --fakeroot needs either a setuid-root install or unprivileged user
-    # namespaces.  The root user and a setuid binary need no further probe.
-    if [ "$(id -u)" = 0 ] || [ -u "$BIN" ]; then
+    # Root needs no probe.  Otherwise accept the first working capability.
+    if [ "$(id -u)" = 0 ]; then
         return 0
     fi
-    if command -v unshare >/dev/null 2>&1 &&
-        unshare --user --map-root-user true >/dev/null 2>&1; then
+    if apptainer_fakeroot_works "$BIN"; then
         return 0
     fi
-    echo "Apptainer --fakeroot is unavailable: $BIN is not setuid and unprivileged user namespaces are disabled. Enable user namespaces or install a setuid-root Apptainer (see the bundle README)." >&2
+    if apptainer_setuid_starter_present "$BIN"; then
+        return 0
+    fi
+    if apptainer_userns_works; then
+        return 0
+    fi
+    echo "Apptainer --fakeroot is unavailable: '$BIN' cannot start a fakeroot container, no setuid starter-suid/starter helper was found, and unprivileged user namespaces are disabled by site policy. Ask your site administrators to enable unprivileged user namespaces or install the setuid Apptainer package (apptainer-suid); see the bundle README." >&2
     exit 1
 }
 
@@ -241,7 +327,7 @@ if [ -n "$GPU_VENDORS" ]; then
 fi
 has_vendor() {
     local WANTED="$1" VENDOR
-    for VENDOR in "${VENDORS[@]}"; do
+    for VENDOR in ${VENDORS[@]+"${VENDORS[@]}"}; do
         [ "$VENDOR" = "$WANTED" ] && return 0
     done
     return 1
@@ -885,8 +971,8 @@ apptainer_start() {
         --bind "$HOST_HOME:/home/$SSH_USER" \
         --bind "$RUNTIME_DIR:/computemcp-runtime" \
         --bind "$RUNTIME_DIR/run:/run" \
-        "${RESOLV_BIND[@]}" \
-        "${GPU_ARGS[@]}" "$SANDBOX" "$NAME"
+        ${RESOLV_BIND[@]+"${RESOLV_BIND[@]}"} \
+        ${GPU_ARGS[@]+"${GPU_ARGS[@]}"} "$SANDBOX" "$NAME"
     wait_for_banner 127.0.0.1 "$CONTAINER_PORT" || {
         echo 'Apptainer SSH endpoint did not become ready.' >&2
         exit 1
@@ -935,8 +1021,8 @@ clean_start() {
         --bind "$RUNTIME_DIR:/computemcp-runtime" \
         --bind "$RUNTIME_DIR/run:/run" \
         --bind "$RUNTIME_DIR/tmp:/tmp" \
-        "${RESOLV_BIND[@]}" \
-        "${GPU_ARGS[@]}" "$CLEAN_IMAGE" "$NAME"
+        ${RESOLV_BIND[@]+"${RESOLV_BIND[@]}"} \
+        ${GPU_ARGS[@]+"${GPU_ARGS[@]}"} "$CLEAN_IMAGE" "$NAME"
     wait_for_banner 127.0.0.1 "$CONTAINER_PORT" || {
         echo 'Apptainer SSH endpoint did not become ready.' >&2
         exit 1
@@ -1007,17 +1093,21 @@ fix_gpu_groups() {
         [ -c "$DEVICE" ] || continue
         GPU_GROUP_IDS["$(stat -c %g "$DEVICE")"]=1
     done
-    for EXTRA_GID in "${!GPU_GROUP_IDS[@]}"; do
-        [ "$EXTRA_GID" != 0 ] && [ "$EXTRA_GID" != "$AGENT_GID" ] || continue
-        if ! getent group "$EXTRA_GID" >/dev/null; then
-            EXTRA_GROUP="host-gpu-$EXTRA_GID"
-            while getent group "$EXTRA_GROUP" >/dev/null; do
-                EXTRA_GROUP="${EXTRA_GROUP}-extra"
-            done
-            groupadd --gid "$EXTRA_GID" "$EXTRA_GROUP"
-        fi
-        usermod --append --groups "$EXTRA_GID" "$SSH_USER"
-    done
+    # Bash < 4.4 treats "${!map[@]}" on an empty associative array as unset
+    # under ``set -u``; guard the key expansion by the (always safe) count.
+    if [ "${#GPU_GROUP_IDS[@]}" -gt 0 ]; then
+        for EXTRA_GID in "${!GPU_GROUP_IDS[@]}"; do
+            [ "$EXTRA_GID" != 0 ] && [ "$EXTRA_GID" != "$AGENT_GID" ] || continue
+            if ! getent group "$EXTRA_GID" >/dev/null; then
+                EXTRA_GROUP="host-gpu-$EXTRA_GID"
+                while getent group "$EXTRA_GROUP" >/dev/null; do
+                    EXTRA_GROUP="${EXTRA_GROUP}-extra"
+                done
+                groupadd --gid "$EXTRA_GID" "$EXTRA_GROUP"
+            fi
+            usermod --append --groups "$EXTRA_GID" "$SSH_USER"
+        done
+    fi
 }
 fix_gpu_groups
 if [ "${1:-}" = --fix-groups ]; then exit 0; fi
@@ -1165,9 +1255,13 @@ docker_create_container() {
             echo 'AMD/Intel selected but /dev/dri is absent on this host; skipping it.' >&2
         fi
     fi
-    for GID in "${!DEVICE_GROUPS[@]}"; do
-        [ "$GID" = 0 ] || ARGS+=(--group-add "$GID")
-    done
+    # Bash < 4.4 treats "${!map[@]}" on an empty associative array as unset
+    # under ``set -u``; guard the key expansion by the (always safe) count.
+    if [ "${#DEVICE_GROUPS[@]}" -gt 0 ]; then
+        for GID in "${!DEVICE_GROUPS[@]}"; do
+            [ "$GID" = 0 ] || ARGS+=(--group-add "$GID")
+        done
+    fi
     "${DOCKER_CMD[@]}" create "${ARGS[@]}" "$DOCKER_IMAGE" >&2
     docker_install_entrypoint
 }

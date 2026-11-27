@@ -934,7 +934,7 @@ submit_allocation() {
     local HELPER_ARGS=(--parsable --job-name="$NAME")
     sbatch_has() {
         local WANTED="$1" ARG
-        for ARG in "${SBATCH_ARGS[@]}"; do
+        for ARG in ${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"}; do
             case "$ARG" in "$WANTED"|"$WANTED"=*) return 0 ;; esac
         done
         return 1
@@ -946,7 +946,7 @@ submit_allocation() {
     HELPER_ARGS+=(--comment="$CORRELATION_TOKEN")
     write_settings "$SETTINGS"
     local RESULT
-    RESULT="$(sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
+    RESULT="$(sbatch ${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"} "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
     JOBID="${RESULT%%;*}"
     [[ "$JOBID" =~ ^[0-9]+$ ]] || { echo "Invalid sbatch result: $RESULT" >&2; exit 1; }
     CLUSTER=""
@@ -1234,7 +1234,7 @@ if [ "$ACTION" = provision ]; then
         HELPER_ARGS=(--parsable --job-name="$NAME")
         sbatch_has() {
             local WANTED="$1" ARG
-            for ARG in "${SBATCH_ARGS[@]}"; do
+            for ARG in ${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"}; do
                 case "$ARG" in "$WANTED"|"$WANTED"=*) return 0 ;; esac
             done
             return 1
@@ -1244,7 +1244,7 @@ if [ "$ACTION" = provision ]; then
         CORRELATION_TOKEN="$(resolve_correlation_token)"
         HELPER_ARGS+=(--comment="$CORRELATION_TOKEN")
         write_settings "$SETTINGS"
-        RESULT="$(sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
+        RESULT="$(sbatch ${SBATCH_ARGS[@]+"${SBATCH_ARGS[@]}"} "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
         JOBID="${RESULT%%;*}"
         [[ "$JOBID" =~ ^[0-9]+$ ]] || { echo "Invalid sbatch result: $RESULT" >&2; exit 1; }
         CLUSTER=""

@@ -3945,17 +3945,42 @@ def test_relay_cli_rejects_missing_arguments():
     assert "Traceback" not in partial.stderr, partial.stderr
 
 
-def _apptainer_probe_env(tmp_path: Path, version: str) -> dict:
+def _apptainer_probe_env(
+    tmp_path: Path,
+    version: str,
+    *,
+    exec_rc: int = 0,
+    starter: str | None = None,
+    userns_probe: str | None = None,
+) -> dict:
+    """Write a stub ``apptainer`` for the prerequisite probe and build its env.
+
+    ``exec_rc`` is the functional ``apptainer exec`` result, ``starter`` names a
+    setuid helper to create beside the CLI, and ``userns_probe`` overrides the
+    unprivileged-user-namespace check so a test never depends on the host's
+    policy.  The probe timeout is kept short because every stub returns at once.
+    """
     root = tmp_path / "appprobe"
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True)
     stub = bin_dir / "apptainer"
     stub.write_text(
         "#!/usr/bin/env bash\n"
-        f"printf 'apptainer version {version}\\n'\n",
+        'if [ "${1:-}" = --version ]; then\n'
+        f"    printf 'apptainer version {version}\\n'\n"
+        "    exit 0\n"
+        "fi\n"
+        'if [ "${1:-}" = exec ]; then exit '
+        f"{exec_rc}\n"
+        "fi\n"
+        "exit 0\n",
         encoding="utf-8",
     )
     stub.chmod(0o755)
+    if starter:
+        helper = bin_dir / starter
+        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o4755)
     env = dict(os.environ)
     env.update(
         {
@@ -3965,8 +3990,11 @@ def _apptainer_probe_env(tmp_path: Path, version: str) -> dict:
             "COMPUTEMCP_SANDBOX_DIR": str(root / "sandbox"),
             "COMPUTEMCP_HOST_HOME": str(root / "home"),
             "COMPUTEMCP_CONTAINER_PORT": str(_free_port()),
+            "COMPUTEMCP_APPTAINER_PROBE_TIMEOUT": "2",
         }
     )
+    if userns_probe is not None:
+        env["COMPUTEMCP_APPTAINER_USERNS_PROBE"] = userns_probe
     env["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
     return env
 
@@ -4001,6 +4029,76 @@ def test_apptainer_prerequisites_accept_modern_version(tmp_path):
     # No sandbox exists, so configure stops there; the prerequisite check did
     # not reject the version.
     assert "1.x or newer is required" not in result.stderr, result.stderr
+    assert "Missing sandbox" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_accept_setuid_starter_fallback(tmp_path):
+    """A setuid install is accepted when the functional probe cannot run.
+
+    Regression: the probe tested ``[ -u "$BIN" ]``, but a setuid Apptainer
+    install puts the bit on ``starter-suid``.  On Ubuntu 24.04, where
+    unprivileged user namespaces are restricted, that falsely rejected a valid
+    install.  The fake ``starter-suid`` is setuid and the userns check is forced
+    off, so this passes on a locked-down host.
+    """
+    env = _apptainer_probe_env(
+        tmp_path,
+        "1.3.3",
+        exec_rc=1,
+        starter="starter-suid",
+        userns_probe="false",
+    )
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert "fakeroot is unavailable" not in result.stderr, result.stderr
+    assert "Missing sandbox" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_reject_without_fakeroot_capability(tmp_path):
+    """No probe, no setuid starter and no userns rejects with the site policy.
+
+    The userns check is forced off, so the rejection is independent of whether
+    the test host allows unprivileged user namespaces.
+    """
+    env = _apptainer_probe_env(
+        tmp_path, "1.3.3", exec_rc=1, userns_probe="false"
+    )
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0, (result.returncode, result.stderr)
+    assert "fakeroot is unavailable" in result.stderr, result.stderr
+    assert "site policy" in result.stderr, result.stderr
+    assert "starter-suid" in result.stderr, result.stderr
+    assert "user namespaces" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_probe_override_is_honored(tmp_path):
+    """``COMPUTEMCP_APPTAINER_PROBE`` decides the functional probe for stubs."""
+    env = _apptainer_probe_env(
+        tmp_path, "1.3.3", exec_rc=1, userns_probe="false"
+    )
+    env["COMPUTEMCP_APPTAINER_PROBE"] = "true"
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert "fakeroot is unavailable" not in result.stderr, result.stderr
     assert "Missing sandbox" in result.stderr, result.stderr
 
 
