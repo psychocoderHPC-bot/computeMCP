@@ -190,10 +190,10 @@ COMPUTEMCP_SBATCH_ARGS:
   private jobs. Before the job registry exists, the configured limit answers
   this field.
 
-`target-sbatch --dry-run` previews the target-level `root_mode` and
-`clean_home`. The CLI does not forward the submit-only `--root-mode` and
-`--clean-home` flags into the preview body, so a preview that must show those
-request values has to come from the HTTP preview endpoint.
+`target-shared --dry-run` and `target-sbatch --dry-run` forward their
+`--root-mode` and `--clean-home` values into the preview body through
+`_preview_body`, so the preview shows the requested values. Only the 2FA factor
+and the submit `--request-id` are omitted from a preview.
 
 ### State root
 

@@ -653,6 +653,10 @@ Subcommands: `status`, `targets`, `clients`, `sessions`, `reload`,
 - `--dry-run`: preview the allocation without connecting, opening the route,
   starting a shared job, or submitting a private job.
 
+`target-shared` also accepts `--root-mode {fakeroot,clean}` and
+`--clean-home PATH`. A shared job always mounts the shared home, so
+`--clean-home` changes the recorded request, not the shared-home mount.
+
 `target-sbatch` also accepts `--root-mode {fakeroot,clean}`,
 `--clean-home PATH`, and `--request-id ID` (an idempotency key; reusing it with
 different settings is rejected). Its `--2fa` factor is forwarded to route
