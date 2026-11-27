@@ -269,8 +269,9 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # (and the plan/container variables) around the provisioning command.
 #
 # With a [targets.X.bundle] block the gateway deploys the bundle itself.  It
-# opens the route connection, uploads the four helper files into deploy-dir over
-# SFTP only when the remote content marker differs, derives the container's
+# opens the route connection, uploads the five helper files (provision,
+# container, job, relay, mux) into deploy-dir over SFTP only when the remote
+# content marker differs, derives the container's
 # authorized public key from client_key, and runs the deployed helper.  The
 # copy is versioned: after a gateway upgrade the changed bundle is re-deployed
 # on the next connect.  The deploy directory must be on storage visible to the

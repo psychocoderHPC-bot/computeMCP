@@ -110,6 +110,19 @@ When the gateway deploys and runs `computemcp-provision.sh`:
 5. **Print `ENDPOINT host:port`** to stdout. The gateway follows the
    endpoint through `ssh_targets` and dials into the container's sshd.
 
+For a durable multi-job Slurm target the same provisioner exposes the
+`submit`, `observe`, `attach`, `cancel`, and `detach` actions. The gateway calls
+`submit` for `target-sbatch` and `target-shared`, polls `observe`, calls
+`attach` when the allocation runs, and calls `cancel` only for an explicit
+`job-stop`. Teardown calls `detach`, which never signals the scheduler. Each
+job gets its own `state/jobs/<job_id>/` directory, relay, container instance,
+and runtime files. A login-node `computemcp-mux.py` multiplexes those per-job
+relays over the single outer channel.
+
+The bundle ships five code files: `computemcp-provision.sh`,
+`computemcp-container.sh`, `computemcp-job.sh`, `computemcp-relay.py`, and
+`computemcp-mux.py`. Deploy them side by side.
+
 ### 1.4 Sensible defaults
 
 - **GPU default** on a Slurm allocation is **one GPU per node** in
@@ -134,8 +147,11 @@ cluster. Their full semantics are documented in
   (`single-node`, `multi-node`, `default-cpus`, `max-nodes`).
 - `[targets.X.slurm.sbatch]` / `.srun` — free-form manual scheduler options
   plus `account`.
-- `[targets.X.slurm.sbatch-map]` / `.srun-map` — mappings from the
-  gateway-computed plan to scheduler flags (see
+- `[targets.X.slurm.sbatch.mapping]` / `.srun.mapping` (preferred) or the
+  legacy `[targets.X.slurm.sbatch-map]` / `.srun-map` for mappings from the
+  gateway-computed plan to scheduler flags. Both spellings merge per key, and
+  a key with different values in both is a load error. The `sbatch` stage also
+  emits implicit defaults for fields the mapping does not name (see
   [`../examples/slurm-gpu-apptainer.toml`](../examples/slurm-gpu-apptainer.toml)
   for a concrete combination, and
   [`../examples/non-slurm-docker-host.toml`](../examples/non-slurm-docker-host.toml)
