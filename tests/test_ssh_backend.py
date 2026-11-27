@@ -1055,3 +1055,122 @@ async def test_channel_open_retry_does_not_retry_other_errors(monkeypatch):
     with pytest.raises(ValueError):
         await with_channel_open_retry(operation)
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Job-keyed connection cache (Slurm/mux path)
+# ---------------------------------------------------------------------------
+
+def _job_cache_backend(monkeypatch):
+    """Return a backend with a recording fake container dial."""
+    from compute_mcp.ssh_backend import SSHBackend
+
+    dialed = []
+    conns = []
+
+    async def fake_dial(
+        self, tgt, host, port, prompter=None, passphrase=None,
+        username=None, sock=None,
+    ):
+        dialed.append((host, port))
+        conn = _FakeSessionConn()
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(SSHBackend, "_dial", fake_dial)
+    return SSHBackend(), dialed, conns
+
+
+async def test_job_connection_keyed_by_job_and_generation(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend  # noqa: F401
+
+    target = _tunnel_target_for_cache()
+    backend, dialed, conns = _job_cache_backend(monkeypatch)
+
+    a1 = await backend.job_connection(
+        target, "A", "127.0.0.1", 2222, generation=1
+    )
+    again = await backend.job_connection(
+        target, "A", "127.0.0.1", 2222, generation=1
+    )
+    b1 = await backend.job_connection(
+        target, "B", "127.0.0.1", 2222, generation=1
+    )
+    assert a1 is again
+    assert a1 is not b1
+    assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 2222)]
+    # Legacy/target-keyed state is untouched by the job path.
+    assert backend.known_targets() == []
+    assert sorted(backend.known_jobs()) == [("A", 1), ("B", 1)]
+
+
+async def test_job_generation_fence_closes_old_and_keeps_other_jobs(
+    monkeypatch,
+):
+    from compute_mcp.ssh_backend import SSHBackend  # noqa: F401
+
+    target = _tunnel_target_for_cache()
+    backend, _dialed, conns = _job_cache_backend(monkeypatch)
+    a1 = await backend.job_connection(
+        target, "A", "127.0.0.1", 2222, generation=1
+    )
+    b1 = await backend.job_connection(
+        target, "B", "127.0.0.1", 2222, generation=1
+    )
+    a2 = await backend.job_connection(
+        target, "A", "127.0.0.1", 2222, generation=2
+    )
+    assert a2 is not a1
+    assert a1.is_closed() is True
+    assert b1.is_closed() is False
+    assert sorted(backend.known_jobs()) == [("A", 2), ("B", 1)]
+
+    # A stale generation request is refused instead of resurrecting old state.
+    with pytest.raises(Exception, match="stale"):
+        await backend.job_connection(
+            target, "A", "127.0.0.1", 2222, generation=1
+        )
+    assert sorted(backend.known_jobs()) == [("A", 2), ("B", 1)]
+
+
+async def test_disconnect_job_b_keeps_a_connection_and_sftp_state(monkeypatch):
+    from compute_mcp.ssh_backend import SSHBackend  # noqa: F401
+
+    target = _tunnel_target_for_cache()
+    backend, _dialed, _conns = _job_cache_backend(monkeypatch)
+    a1 = await backend.job_connection(
+        target, "A", "127.0.0.1", 2222, generation=7
+    )
+    b1 = await backend.job_connection(
+        target, "B", "127.0.0.1", 2222, generation=7
+    )
+    backend._sftp_sem(a1, 4)
+    backend._sftp_sem(b1, 4)
+    backend._sftp_open_lock(a1)
+    backend._sftp_open_lock(b1)
+    assert ("A", 7) in backend._sftp_locks
+    assert ("B", 7) in backend._sftp_locks
+
+    await backend.disconnect_job("B")
+    assert b1.is_closed() is True
+    assert a1.is_closed() is False
+    assert ("A", 7) in backend._sftp_locks
+    assert ("A", 7) in backend._sftp_sems
+    assert ("B", 7) not in backend._sftp_locks
+    assert ("B", 7) not in backend._sftp_sems
+    assert backend.known_jobs() == [("A", 7)]
+
+
+async def test_job_endpoint_change_redials_only_that_job(monkeypatch):
+    target = _tunnel_target_for_cache()
+    backend, dialed, _conns = _job_cache_backend(monkeypatch)
+    a1 = await backend.job_connection(
+        target, "A", "127.0.0.1", 2222, generation=3
+    )
+    a2 = await backend.job_connection(
+        target, "A", "127.0.0.1", 3001, generation=3
+    )
+    assert a2 is not a1
+    assert a1.is_closed() is True
+    assert dialed == [("127.0.0.1", 2222), ("127.0.0.1", 3001)]
+    assert backend.known_jobs() == [("A", 3)]
