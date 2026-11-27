@@ -182,6 +182,9 @@ Rules:
   does not replace it.
 - `kind="private"` submits a private Slurm job owned by your client and
   consumes one quota slot. It is rejected on a non-Slurm Docker target.
+- `clean_home` selects the private job's home. Your value wins over the
+  target's configured default. With neither set, the job uses the client's
+  private home root. A leading `/` is accepted and stripped.
 - A successful submit can return `pending`. Keep the `job_id` and call
   `computeMCP_job_wait` with the same id. Do not submit again because the job
   is queued.

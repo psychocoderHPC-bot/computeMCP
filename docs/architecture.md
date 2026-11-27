@@ -237,12 +237,14 @@ A gateway restart rebuilds the job manager from disk and reconciles before it
 accepts new submissions. Reconciliation never calls `sbatch`.
 
 - A record that already has a scheduler id is queried with `squeue`.
-- A record without a scheduler id is looked up by its persisted correlation
-  token, which the gateway passes to `sbatch` as a job comment.
+- A record without a scheduler id is matched by its persisted correlation
+  token, which the gateway passes to `sbatch` as a job comment, when the
+  bundle adapter supports comment lookup.
 - A recovered scheduler id moves `submitting` or `submission_unknown` to
   `pending` and keeps the quota slot.
-- An ambiguous submission stays `submission_unknown` and keeps its slot. The
-  gateway never resubmits it automatically.
+- Without comment lookup, an ambiguous submission stays `submission_unknown`
+  and keeps its slot until operator reconciliation. The gateway never
+  resubmits it automatically.
 - A missing `squeue` entry alone does not prove that a submission failed.
 
 After the restart, `target-open` restores the shared-job view and `job-list`
