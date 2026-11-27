@@ -591,25 +591,36 @@ raw_job_state() {
     squeue "${SQUEUE_ARGS[@]}" 2>/dev/null |
         awk -F '|' -v job="$JOBID" '$1 == job {print $2}'
 }
-# A terminal job leaves the default squeue view.  Query the terminal states
-# explicitly so `observe` can tell "finished" from "not yet visible".
-terminal_job_state() {
+# A terminal job leaves the default squeue view.  `sacct` keeps a record after
+# that (and after an active query was purged), so use it as the fallback when
+# squeue cannot see the tracked id.  The allocation row is selected (`-X`) so
+# job steps are ignored.
+sacct_job_state() {
     [ -n "$JOBID" ] || return 1
-    local TERM_ARGS=(--noheader --user "$(id -un)" --format '%i|%T'
-        --states=COMPLETED,CANCELLED,FAILED,TIMEOUT,NODE_FAIL)
-    [ -z "$CLUSTER" ] || TERM_ARGS+=(--clusters="$CLUSTER")
-    squeue "${TERM_ARGS[@]}" 2>/dev/null |
-        awk -F '|' -v job="$JOBID" '$1 == job {print $2; exit}'
+    command -v sacct >/dev/null 2>&1 || return 1
+    local SARGS=(-X -n -P -j "$JOBID" --format=JobID,State)
+    [ -z "$CLUSTER" ] || SARGS+=(--clusters="$CLUSTER")
+    sacct "${SARGS[@]}" 2>/dev/null |
+        awk -F '|' -v job="$JOBID" '
+            $1 == job {
+                # sacct may append a reason ("CANCELLED by 1234").
+                state = $2
+                sub(/[[:space:]].*$/, "", state)
+                print state
+                exit
+            }'
 }
-# Map a Slurm state plus the per-job readiness publication to the small
-# computeMCP vocabulary used by the gateway.
-mapped_state() {
-    local RAW NODE=""
-    [ -s "$STATE/ready" ] && { read -r NODE < "$STATE/ready" || true; }
-    RAW="$(raw_job_state || true)"
+# Translate a native Slurm state plus the per-job readiness publication to the
+# small computeMCP vocabulary the gateway understands.  PENDING, CONFIGURING
+# and RUNNING stay distinct; every real terminal state (and any unknown future
+# one) maps to terminal so a quota slot never sticks.
+state_vocab() {
+    local RAW="$1" NODE="$2"
     case "$RAW" in
         PENDING) printf 'pending\n' ;;
-        CONFIGURING) printf 'starting\n' ;;
+        CONFIGURING|REQUEUED|RESIZING|COMPLETING|SUSPENDED|STOPPED)
+            printf 'starting\n'
+            ;;
         RUNNING)
             if [ -n "$NODE" ]; then
                 printf 'ready\n'
@@ -617,22 +628,88 @@ mapped_state() {
                 printf 'starting\n'
             fi
             ;;
-        COMPLETING|SUSPENDED|STOPPED) printf 'terminal\n' ;;
-        COMPLETED|CANCELLED|FAILED|TIMEOUT|NODE_FAIL) printf 'terminal\n' ;;
-        "")
-            # The default squeue view hides terminal jobs.  Ask explicitly
-            # before deciding; a persisted id with a stale readiness file but no
-            # scheduler entry is terminal, and a fully unknown id is absent.
-            if [ -n "$(terminal_job_state || true)" ]; then
-                printf 'terminal\n'
-            elif [ -n "$JOBID" ]; then
-                if [ -n "$NODE" ]; then printf 'ready\n'; else printf 'terminal\n'; fi
-            else
-                printf 'absent\n'
-            fi
+        COMPLETED|CANCELLED|FAILED|TIMEOUT|NODE_FAIL|PREEMPTED|OUT_OF_MEMORY|BOOT_FAIL|DEADLINE|REVOKED|SPECIAL_EXIT)
+            printf 'terminal\n'
             ;;
+        "") printf '\n' ;;
         *) printf 'terminal\n' ;;
     esac
+}
+mapped_state() {
+    local RAW NODE=""
+    [ -s "$STATE/ready" ] && { read -r NODE < "$STATE/ready" || true; }
+    RAW="$(raw_job_state || true)"
+    [ -n "$RAW" ] || RAW="$(sacct_job_state || true)"
+    if [ -n "$RAW" ]; then
+        state_vocab "$RAW" "$NODE"
+        return 0
+    fi
+    # The default squeue view hides terminal jobs and sacct had nothing.  A
+    # tracked id that neither tool knows is purged/unknown and must be
+    # terminal so a quota slot does not stick; no id at all is absent.
+    if [ -n "$JOBID" ]; then
+        printf 'terminal\n'
+    else
+        printf 'absent\n'
+    fi
+}
+
+# --- Correlation token (crash-window recovery) -----------------------------
+# The token is persisted BEFORE sbatch runs and passed as --comment.  If the
+# helper dies between sbatch acceptance and writing state/jobid, observe and
+# attach can find the allocation again by its comment instead of leaking it.
+correlation_token() {
+    [ -s "$STATE/correlation_token" ] || return 1
+    head -n 1 "$STATE/correlation_token"
+}
+resolve_correlation_token() {
+    local TOKEN="${COMPUTEMCP_CORRELATION_TOKEN:-}"
+    if [ -z "$TOKEN" ]; then
+        TOKEN="computemcp-${JOB_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+    fi
+    [[ "$TOKEN" =~ ^[A-Za-z0-9._:-]+$ ]] || {
+        echo "Invalid correlation token: $TOKEN" >&2
+        exit 2
+    }
+    printf '%s\n' "$TOKEN" > "$STATE/correlation_token.tmp.$$"
+    mv -f "$STATE/correlation_token.tmp.$$" "$STATE/correlation_token"
+    printf '%s\n' "$TOKEN"
+}
+# Find a tracked job by its comment token: squeue for active jobs, then sacct
+# for jobs that already left the default view (or were purged from it).
+recover_jobid_by_token() {
+    local TOKEN="$1" ID=""
+    [ -n "$TOKEN" ] || return 1
+    if command -v squeue >/dev/null 2>&1; then
+        local QARGS=(--noheader --user "$(id -un)" --format '%i|%T|%k')
+        [ -z "$CLUSTER" ] || QARGS+=(--clusters="$CLUSTER")
+        ID="$(squeue "${QARGS[@]}" 2>/dev/null |
+            awk -F '|' -v token="$TOKEN" '$3 == token {print $1; exit}')"
+    fi
+    if [ -z "$ID" ] && command -v sacct >/dev/null 2>&1; then
+        local SARGS=(--noheader --parsable2 --allocations
+            --format=JobID,State,Comment)
+        [ -z "$CLUSTER" ] || SARGS+=(--clusters="$CLUSTER")
+        ID="$(sacct "${SARGS[@]}" -u "$(id -un)" -S now-30days 2>/dev/null |
+            awk -F '|' -v token="$TOKEN" '
+                $3 == token {sub(/\..*$/, "", $1); print $1; exit}')"
+    fi
+    [[ "$ID" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$ID"
+}
+# Recover and persist the numeric id when it was lost after sbatch accepted
+# the allocation.  A no-op when the id is already tracked.
+ensure_jobid() {
+    [ -n "$JOBID" ] && return 0
+    local TOKEN RECOVERED
+    TOKEN="$(correlation_token || true)"
+    [ -n "$TOKEN" ] || return 1
+    RECOVERED="$(recover_jobid_by_token "$TOKEN" || true)"
+    [ -n "$RECOVERED" ] || return 1
+    JOBID="$RECOVERED"
+    printf '%s\n' "$JOBID" > "$STATE/jobid"
+    echo "Recovered Slurm job $JOBID from correlation token." >&2
+    return 0
 }
 
 relay_running() {
@@ -835,6 +912,9 @@ submit_allocation() {
     }
     sbatch_has --output || sbatch_has -o || HELPER_ARGS+=(--output="$STATE/slurm-%j.log")
     sbatch_has --error  || sbatch_has -e || HELPER_ARGS+=(--error="$STATE/slurm-%j.log")
+    local CORRELATION_TOKEN
+    CORRELATION_TOKEN="$(resolve_correlation_token)"
+    HELPER_ARGS+=(--comment="$CORRELATION_TOKEN")
     write_settings "$SETTINGS"
     local RESULT
     RESULT="$(sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
@@ -842,23 +922,29 @@ submit_allocation() {
     [[ "$JOBID" =~ ^[0-9]+$ ]] || { echo "Invalid sbatch result: $RESULT" >&2; exit 1; }
     CLUSTER=""
     if [[ "$RESULT" == *';'* ]]; then CLUSTER="${RESULT#*;}"; fi
-    # Persist the native id immediately: a later crash must not lose it.
+    # Persist the native id immediately: a later crash must not lose it.  The
+    # token was persisted before sbatch, so even this window is recoverable.
     printf '%s\n' "$JOBID" > "$STATE/jobid"
     printf '%s\n' "$CLUSTER" > "$STATE/cluster"
     echo "Submitted job $JOB_ID as Slurm $JOBID (cluster ${CLUSTER:-default})." >&2
     printf 'JOB_ID %s\n' "$JOB_ID"
     printf 'SLURM_JOB_ID %s\n' "$JOBID"
     printf 'CLUSTER %s\n' "${CLUSTER:-default}"
+    printf 'CORRELATION_TOKEN %s\n' "$CORRELATION_TOKEN"
     printf 'STATE pending\n'
 }
 
 # --- Observe stage ----------------------------------------------------------
 observe_job() {
+    ensure_jobid || true
     local STATE_NAME
     STATE_NAME="$(mapped_state)"
     printf 'STATE %s\n' "$STATE_NAME"
     [ -z "$JOBID" ] || printf 'SLURM_JOB_ID %s\n' "$JOBID"
     [ -z "$CLUSTER" ] || printf 'CLUSTER %s\n' "$CLUSTER"
+    local TOKEN
+    TOKEN="$(correlation_token || true)"
+    [ -z "$TOKEN" ] || printf 'CORRELATION_TOKEN %s\n' "$TOKEN"
     if [ -s "$STATE/ready" ]; then
         printf 'NODE %s\n' "$(head -n 1 "$STATE/ready")"
     fi
@@ -871,6 +957,7 @@ observe_job() {
 
 # --- Attach stage -----------------------------------------------------------
 attach_job() {
+    ensure_jobid || true
     [ -n "$JOBID" ] || { echo 'No tracked job; submit first.' >&2; exit 1; }
     local END=$((SECONDS + WAIT_SECONDS))
     local NODE="" RAW=""
@@ -985,6 +1072,7 @@ cancel_job() {
         echo "Stopped direct container ${SYSTEM}; files remain." >&2
         return 0
     fi
+    ensure_jobid || true
     if [ -n "$JOBID" ] && [ -n "$(raw_job_state || true)" ]; then
         local SCANCEL_ARGS=("$JOBID")
         [ -z "$CLUSTER" ] || SCANCEL_ARGS=(--clusters="$CLUSTER" "$JOBID")
@@ -1035,6 +1123,7 @@ case "$ACTION" in
                 "$ENDPOINT"
             exit 0
         fi
+        ensure_jobid || true
         printf 'job_id: %s\njobid: %s\ncluster: %s\nstate: %s\n' \
             "$JOB_ID" "${JOBID:-none}" "${CLUSTER:-none}" "$(mapped_state)"
         if [ -s "$STATE/ready" ]; then
@@ -1087,6 +1176,9 @@ if [ "$ACTION" = provision ]; then
     fi
     printf '%s\n' slurm > "$STATE/mode"
 
+    # A prior submit may have died before persisting the id; recover it by the
+    # correlation token instead of submitting a second allocation.
+    ensure_jobid || true
     case "$(raw_job_state || true)" in
         PENDING|RUNNING|CONFIGURING) echo "Reusing tracked job $JOBID ($(raw_job_state))." >&2 ;;
         COMPLETING|SUSPENDED|STOPPED) echo "Job $JOBID cannot be reused; stop it first." >&2; exit 1 ;;
@@ -1112,6 +1204,8 @@ if [ "$ACTION" = provision ]; then
         }
         sbatch_has --output || sbatch_has -o || HELPER_ARGS+=(--output="$STATE/slurm-%j.log")
         sbatch_has --error  || sbatch_has -e || HELPER_ARGS+=(--error="$STATE/slurm-%j.log")
+        CORRELATION_TOKEN="$(resolve_correlation_token)"
+        HELPER_ARGS+=(--comment="$CORRELATION_TOKEN")
         write_settings "$SETTINGS"
         RESULT="$(sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS")"
         JOBID="${RESULT%%;*}"

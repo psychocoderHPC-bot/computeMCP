@@ -14,7 +14,12 @@ from __future__ import annotations
 import base64
 import contextlib
 import posixpath
+import shutil
 import stat as stat_module
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -523,3 +528,76 @@ def test_bundle_ships_stage_helpers_and_relay_job_options():
     container = files["computemcp-container.sh"].decode("utf-8")
     assert "--writable-tmpfs" in container
     assert "container.port" in container
+
+
+_REPO = Path(__file__).resolve().parent.parent
+_BUNDLE_FILES = (
+    "computemcp-provision.sh",
+    "computemcp-container.sh",
+    "computemcp-job.sh",
+    "computemcp-relay.py",
+    "computemcp-mux.py",
+)
+
+
+@pytest.fixture(scope="module")
+def built_wheel(tmp_path_factory):
+    """Build the project wheel from a throwaway copy of the source tree.
+
+    Building in a copy keeps ``build/`` and ``*.egg-info`` out of the checkout.
+    The build is offline: dependencies are skipped and isolation is disabled.
+    """
+    pytest.importorskip("setuptools")
+    pytest.importorskip("wheel")
+
+    root = tmp_path_factory.mktemp("wheel-src")
+    shutil.copy2(_REPO / "pyproject.toml", root / "pyproject.toml")
+    shutil.copytree(
+        _REPO / "src",
+        root / "src",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    wheel_dir = root / "dist"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            str(root),
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(wheel_dir),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"wheel build unavailable: {result.stderr.strip()[-500:]}")
+    wheels = sorted(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1, wheels
+    return wheels[0]
+
+
+def test_package_data_ships_mux_helper_in_built_wheel(built_wheel):
+    """Every bundle helper, including computemcp-mux.py, is in the wheel.
+
+    The gateway deploys the wheel's own package data; a helper missing from
+    the wheel cannot be uploaded, so the mux has to be asserted explicitly
+    rather than inferred from the source tree listing.
+    """
+    with zipfile.ZipFile(built_wheel) as archive:
+        names = set(archive.namelist())
+    for helper in _BUNDLE_FILES:
+        member = f"compute_mcp/bundles/computemcp-slurm/{helper}"
+        assert member in names, (member, sorted(names))
+
+
+def test_load_bundle_exposes_mux_helper():
+    """The runtime bundle loader returns the mux alongside the other helpers."""
+    contents = load_bundle("computemcp-slurm")
+    files = dict(contents.files)
+    for helper in _BUNDLE_FILES:
+        assert helper in files, sorted(files)
