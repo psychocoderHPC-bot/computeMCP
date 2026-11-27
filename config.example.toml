@@ -27,6 +27,11 @@
 #     "/opt/computeMCP-gateway/systems/other.toml",
 # ]
 
+# Durable job state root (not a TOML key). The gateway uses --state-dir, then
+# COMPUTEMCP_STATE_DIR, then <config-dir>/state. There is no temporary fallback.
+# For a Slurm target the root must be on storage that the gateway and the login
+# and compute nodes see at the same absolute path, because the login-node mux
+# helper reads <state_root>/mux/<target>.json.
 [server]
 # Bind address. On the host that Terok/Podman reaches via
 # host.containers.internal this is typically the host-side gateway address
@@ -78,10 +83,20 @@ output_buffer_bytes = 4194304
 # to bootstrap a quick test and is hashed on load.  Once you enable token_file,
 # DELETE these inline tokens or they silently take precedence and every request
 # fails with "invalid token".  Never reuse an SSH key or a GitHub token here.
+#
+# Optional per-client, per-target private-job quotas:
+#   * an omitted target defaults to ONE private Slurm job per authorized target;
+#   * 0 disables private submissions for that target;
+#   * the shared job and PTY/exec/file operations never consume a slot;
+#   * non-Slurm/Docker targets are not quota'd (a stored value is ignored).
+# An operator sets the same map on enrollment approval with repeated flags:
+#   computeMCP-gatewayctl approve <request-id> \
+#       --job-limit myTargetHost=2 --job-limit secondTarget=0
 # ---------------------------------------------------------------------------
 [clients.alpaka]
 token = "REPLACE_WITH_PROJECT_TOKEN"
 targets = ["myTargetHost", "secondTarget"]
+job_limits = { myTargetHost = 2, secondTarget = 0 }
 
 [clients.admin]
 token = "REPLACE_WITH_ADMIN_TOKEN"
@@ -259,8 +274,9 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # (and the plan/container variables) around the provisioning command.
 #
 # With a [targets.X.bundle] block the gateway deploys the bundle itself.  It
-# opens the route connection, uploads the four helper files into deploy-dir over
-# SFTP only when the remote content marker differs, derives the container's
+# opens the route connection, uploads the five helper files (provision,
+# container, job, relay, mux) into deploy-dir over SFTP only when the remote
+# content marker differs, derives the container's
 # authorized public key from client_key, and runs the deployed helper.  The
 # copy is versioned: after a gateway upgrade the changed bundle is re-deployed
 # on the next connect.  The deploy directory must be on storage visible to the
@@ -291,6 +307,17 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # auto_connect = true
 # # The operator CLI wait for connect/refresh is provision_timeout + margin.
 # provision_timeout = 960.0
+#
+# # Root-mode contract and home selection for private container jobs.  These
+# # are target-level defaults; a submission may override them.  root_mode is
+# # "fakeroot" (default, current behaviour) or "clean".  home_base is the host
+# # directory under which per-client homes live (shared/ and agents/<client>/).
+# # clean_home is a default sub-path for a private job's clean home; it is
+# # resolved beneath the authenticated client's home and may be given with or
+# # without a leading "/".  Non-Slurm/Docker targets ignore these.
+# root_mode = "fakeroot"
+# home_base = "/scratch/USER/computemcp/home"
+# clean_home = "benchmarks/run-42"
 #
 # # Let the gateway deploy and run the shipped bundle.  deploy-dir is optional
 # # and defaults to <container.storage-root>/bundle.  auto-deploy = true
@@ -348,13 +375,22 @@ client_key = "/home/USER/.ssh/computemcp_container"
 # # memory-per-node maps to mem (whole MiB, M unit); exclusive maps to exclusive
 # # (emitted only when the plan is exclusive).  Omit a mapping to leave the
 # # scheduler default.  The `sbatch`/`srun` stages are rendered independently;
-# # nothing is copied between them.
+# # nothing is copied between them.  Two equivalent mapping spellings are
+# # accepted: the legacy sibling `sbatch-map` table (used here) and the nested
+# # `[slurm.sbatch.mapping]` table.  Keys from both merge; an identical
+# # duplicate is fine, and a key defined by both with different values is a
+# # configuration error.
 # [targets.myTargetHost-slurm.slurm.sbatch-map]
 # nodes = "nodes"
 # gpus-per-node = "gres"
 # cpus-per-node = "cpus-per-task"
 # exclusive = "exclusive"
 # # No memory mapping: the manual mem option above is authoritative.
+#
+# # Nested spelling (identical semantics; accepted instead of or alongside the
+# # sibling table above):
+# # [targets.myTargetHost-slurm.slurm.sbatch.mapping]
+# # gpus-per-node = "gres"
 #
 # # Manual job-step options and their mappings (independent from sbatch).
 # [targets.myTargetHost-slurm.slurm.srun]

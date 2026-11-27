@@ -110,6 +110,43 @@ When the gateway deploys and runs `computemcp-provision.sh`:
 5. **Print `ENDPOINT host:port`** to stdout. The gateway follows the
    endpoint through `ssh_targets` and dials into the container's sshd.
 
+For a durable multi-job Slurm target the same provisioner exposes the
+`submit`, `observe`, `attach`, `cancel`, and `detach` actions. The gateway calls
+`submit` for `target-sbatch` and `target-shared`, polls `observe`, calls
+`attach` when the allocation runs, and calls `cancel` only for an explicit
+`job-stop`. Teardown calls `detach`, which never signals the scheduler. Each
+job gets its own `state/jobs/<job_id>/` directory, relay, container instance,
+and runtime files. A login-node `computemcp-mux.py` multiplexes those per-job
+relays over the single outer channel.
+
+The bundle ships five code files: `computemcp-provision.sh`,
+`computemcp-container.sh`, `computemcp-job.sh`, `computemcp-relay.py`, and
+`computemcp-mux.py`. Deploy them side by side. The mux registry lives under the
+gateway state root, so that root must be shared with the login node at the same
+absolute path; see [operations.md](operations.md).
+
+### 1.3.1 Apptainer prerequisites
+
+`computemcp-container.sh` probes Apptainer before `build`, `configure`, or
+`start`, so a broken install fails with a direct message instead of an opaque
+later error.
+
+- **Apptainer 1.x or newer.** The helper rejects legacy Singularity (major
+  version `0`). If `apptainer --version` is unparseable it logs a warning and
+  continues, because a site wrapper may hide the real output.
+- **Working `--fakeroot`.** This needs one of: the root user, a setuid-root
+  Apptainer install (`starter-suid`), or unprivileged user namespaces
+  (`unshare --user --map-root-user true`). When none works the helper names
+  both remedies.
+- **A non-root SSH account in the image.** Some base images ship no `ubuntu`
+  account. The build's `%post` creates one when the shadow tools are present.
+  `configure` creates a non-root account with a free UID/GID when the image
+  still has none.
+
+For immutable `clean` root mode, `COMPUTEMCP_IMAGE_DIGEST` pins the expected
+base-image SHA-256. A mismatch aborts the run. Without a pin, the first digest
+is recorded and a later change is reported as a warning.
+
 ### 1.4 Sensible defaults
 
 - **GPU default** on a Slurm allocation is **one GPU per node** in
@@ -134,8 +171,11 @@ cluster. Their full semantics are documented in
   (`single-node`, `multi-node`, `default-cpus`, `max-nodes`).
 - `[targets.X.slurm.sbatch]` / `.srun` — free-form manual scheduler options
   plus `account`.
-- `[targets.X.slurm.sbatch-map]` / `.srun-map` — mappings from the
-  gateway-computed plan to scheduler flags (see
+- `[targets.X.slurm.sbatch.mapping]` / `.srun.mapping` (preferred) or the
+  legacy `[targets.X.slurm.sbatch-map]` / `.srun-map` for mappings from the
+  gateway-computed plan to scheduler flags. Both spellings merge per key, and
+  a key with different values in both is a load error. The `sbatch` stage also
+  emits implicit defaults for fields the mapping does not name (see
   [`../examples/slurm-gpu-apptainer.toml`](../examples/slurm-gpu-apptainer.toml)
   for a concrete combination, and
   [`../examples/non-slurm-docker-host.toml`](../examples/non-slurm-docker-host.toml)

@@ -8,9 +8,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from .config import ClientConfig, ConfigError
+from .config import DEFAULT_JOB_LIMIT, ClientConfig, ConfigError
 
 TOKEN_PREFIX = "sha256:"
 
@@ -29,10 +29,24 @@ class Client:
     allow_all: bool
     targets: frozenset[str]
     label: str | None = None
+    # Effective per-target private-job limits (see ``ClientConfig``).  Only the
+    # accessor below is the public contract for quota code.
+    job_limits: dict[str, int] = field(default_factory=dict)
 
     @property
     def is_admin(self) -> bool:
         return self.allow_all
+
+    def job_limit(self, target: str) -> int:
+        """Effective private-job limit for ``target``.
+
+        A configured value wins; an absent key resolves to the documented
+        default of one private Slurm job per authorized target.  ``0`` disables
+        private submissions.  Shared jobs and PTY/exec/file operations are not
+        quota'd, so quota code applies the target-kind rule before calling
+        this.
+        """
+        return self.job_limits.get(target, DEFAULT_JOB_LIMIT)
 
     def require_admin(self) -> None:
         if not self.allow_all:
@@ -107,6 +121,7 @@ class Authenticator:
             allow_all=client.allow_all,
             targets=frozenset(client.targets),
             label=client.label,
+            job_limits=dict(client.job_limits),
         )
 
     def known_client(self, token: str) -> Client | None:
@@ -118,4 +133,5 @@ class Authenticator:
             allow_all=client.allow_all,
             targets=frozenset(client.targets),
             label=client.label,
+            job_limits=dict(client.job_limits),
         )

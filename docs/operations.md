@@ -25,13 +25,17 @@ computeMCP-gateway --config /path/to/config.toml
 
 The console is enabled automatically on a TTY and disabled with `--no-console`
 (or when standard input is not a TTY). Console commands: `targets`,
-`status [target]`, `connect`, `refresh`, `reconnect`, `stop`, `connect-all`,
-`stop-all`, `reload`, `clients`, `client <name>`,
+`status [target]`, `connect`, `refresh`, `reconnect`, `stop`, `open`,
+`shared`, `sbatch`, `jobs [target]`, `job <job-id>`, `job-cancel <job-id>`,
+`connect-all`, `stop-all`, `reload`, `clients`, `client <name>`,
 `client-refresh|connect|stop <name> [target]`, `client-kill <name>`,
 `sessions [target]`, `close-session <id>`, `enrollments`,
 `approve <request-id>`, `deny <request-id>`, `quit`. `connect` and `refresh`
 accept `--2fa` for an interactive target; the token is prompted on the
 terminal with hidden input, for example `connect --2fa myTargetHost`.
+
+The console `approve` does not accept `--job-limit`. Set job limits on the
+operator CLI instead, or edit `[clients.<id>.job_limits]` and reload.
 
 Every configuration change, new target, or token rotation is applied with
 `reload`: the full include graph is re-parsed and validated, the token file is
@@ -115,6 +119,176 @@ running gateway then needs to see the new file.
 The interactive console of a running `computeMCP-gateway` offers the same verbs
 without a separate CLI call.
 
+## Multi-job Slurm workflow
+
+A target that has both `[targets.X.slurm]` and `[targets.X.bundle]` uses the
+durable multi-job path. The target's route and its jobs are separate: opening
+the route never submits a job and never starts a container.
+
+```bash
+# 1. Open or reuse the login route. This authenticates once, starts nothing,
+#    and reconciles surviving jobs. Auto-connect does the same at startup.
+computeMCP-gatewayctl target-open frontier --2fa
+
+# 2. Use the target-wide shared job. Any authorized client may start it.
+computeMCP-gatewayctl target-shared frontier
+
+# 3. Submit one private job owned by the calling client. This returns as soon
+#    as Slurm accepts the submission, often with state "pending".
+computeMCP-gatewayctl target-sbatch frontier \
+  --root-mode clean --clean-home /benchmarks/run-42 \
+  --set gpus-per-node=1
+
+# 4. Inspect, wait for, or cancel jobs.
+computeMCP-gatewayctl job-list --target frontier
+computeMCP-gatewayctl job-status job-<id>
+computeMCP-gatewayctl job-wait job-<id> --timeout 3600
+computeMCP-gatewayctl job-stop job-<id>
+```
+
+`target-connect frontier` composes steps 1 and 2. On a multi-job Slurm target
+the response can be `pending`; it does not promise that container SSH answers
+immediately. The response reports `state` and `route_state` for the route and
+`job_state` (with the nested `job`) for the shared job. On a non-Slurm Docker
+target `target-connect` keeps its old ready-container behavior.
+
+A `--dry-run` on `target-open`, `target-shared`, `target-sbatch`,
+`target-connect`, or `target-refresh` renders the allocation and exits. It does
+not authenticate, dial, reserve a slot, start a shared job, or submit.
+
+The CLI prints a stable block. The gateway preview returns the job-selection
+fields as well as the plan:
+
+```
+settings:
+  root_mode: clean
+  home: benchmarks/run-42
+  shared_reuse: false
+  settings_conflict: false
+  quota_available: true
+planned:
+  mode: gpu-proportional
+  nodes: 1
+  ...
+args:
+  sbatch: ["--nodes=1", "--gres=gpu:1"]
+  srun: []
+COMPUTEMCP_SBATCH_ARGS:
+...
+```
+
+- `root_mode` is the effective request or target-level mode, and `fakeroot`
+  when neither is set.
+- `home` is the resolved private home path from the request or target config,
+  or `-` when neither is set. The JSON body also carries it as `clean_home`.
+- `shared_reuse` is the active shared `job_id`, or `false` when no shared job
+  exists.
+- `settings_conflict` is `true` when the requested settings differ from the
+  active shared job.
+- `quota_available` is `true` when the caller has a free private slot, `false`
+  when the limit is reached or set to `0`, and `-` for a target without
+  private jobs. Before the job registry exists, the configured limit answers
+  this field.
+
+`target-shared --dry-run` and `target-sbatch --dry-run` forward their
+`--root-mode` and `--clean-home` values into the preview body through
+`_preview_body`, so the preview shows the requested values. Only the 2FA factor
+and the submit `--request-id` are omitted from a preview.
+
+### State root
+
+A multi-job target needs a durable state root. The gateway resolves it from
+`--state-dir`, then `COMPUTEMCP_STATE_DIR`, then `<config-dir>/state`. There is
+no temporary fallback; without one of the three, startup fails with
+`no durable job state root`.
+
+```bash
+computeMCP-gateway --state-dir /scratch/agent/computemcp/state
+# or
+export COMPUTEMCP_STATE_DIR=/scratch/agent/computemcp/state
+```
+
+For a Slurm target the state root MUST be on storage that the gateway and the
+login and compute nodes see at the same absolute path. The gateway writes
+`<state_root>/mux/<target>.json`; the login-node mux helper reads that exact
+path. A gateway-local or per-node `/tmp` breaks every job open.
+
+If the helper cannot read the registry it rejects the stream with
+`registry_unreadable: cannot read <path> ...`. The gateway returns that as HTTP
+502. The fix is to put the state root on shared storage at the same path on
+both hosts. Retrying the request does not fix it.
+
+### Quotas
+
+Each client gets one private job per authorized Slurm target by default.
+`[clients.<id>.job_limits]` raises or lowers that limit per target. A value of
+`0` disables private submissions for that target. The shared job, exec, PTY,
+and file operations consume no slot. The slot is reserved before `sbatch` and
+released only after a definitive submission failure or a scheduler-confirmed
+terminal state. A disconnected client or a lost route does not free a slot.
+
+Lowering a limit on reload keeps existing jobs and blocks new submissions until
+usage permits. Set limits at enrollment time with repeated `--job-limit`
+entries:
+
+```bash
+computeMCP-gatewayctl approve <request-id> --job-limit frontier=2 --job-limit juwels=0
+```
+
+### Second factor
+
+A `target-open`, `target-shared`, `target-connect`, or `target-refresh` against
+an `interactive_auth` target needs `--2fa`. The factor is used once for a fresh
+login, never persisted or logged, and never replayed. A dry-run never prompts.
+A refresh that still has a live login connection reuses it without a factor.
+
+`target-sbatch --2fa` forwards the factor to route opening, so one call can
+open an interactive route and submit the private job. `target-sbatch` accepts
+the same single-use factor rules as the other connect commands.
+
+### Submission uncertainty and reconciliation
+
+The bundle persists a correlation token before `sbatch` and passes it as
+`--comment=<token>`. If the acknowledgement is lost, the job becomes
+`submission_unknown` and keeps its quota slot. The gateway never resubmits it
+automatically.
+
+`target-open` runs reconciliation. A record with a persisted scheduler id is
+queried directly. A record without an id is passed to the bundle adapter's
+`find_by_token`, which runs the helper recovery path: it compares the token
+against `squeue %k` and, when the job has left the active view, `sacct`
+`Comment` over the last 30 days, with a bounded timeout. A found id moves the
+record to `pending` and keeps the slot.
+
+Operator action when a job stays uncertain:
+
+1. Run `computeMCP-gatewayctl target-open <target>` to trigger reconciliation.
+   It runs once per gateway process. If that process already reconciled,
+   restart the gateway so it runs again.
+2. If recovery still finds nothing, read the token from
+   `<state_root>/jobs/<job_id>/correlation_token`, then check the scheduler:
+   `squeue --format '%i %T %k'` and
+   `sacct -o JobID,State,Comment -S now-30days`.
+3. If the job exists, restart the gateway so the next reconciliation pass
+   adopts it. If it is definitely gone, do not resubmit the same request. The
+   record stays `submission_unknown`, holds its slot, and there is no automatic
+   release at this revision. Escalate with the target, `job_id`, token, and
+   scheduler evidence.
+
+A missing `squeue` entry alone does not prove that the submission failed.
+
+### Detach and cancel
+
+Gateway shutdown, route loss, `target-stop`, and `target-refresh` detach a
+Slurm target. They close the route, job connections, and PTY sessions and leave
+the scheduler alone. No `scancel` is sent. Only `job-stop` cancels a job.
+`target-stop` and `target-refresh` are operator-only on a multi-job target.
+
+After a restart, `target-open` restores the shared-job view and `job-list`
+returns surviving private jobs under their original `job_id`s. A shared job
+that terminated during the outage is replaced only by an explicit new
+`target-shared` call, which gets a new `job_id`.
+
 ## The operator CLI (`computeMCP-gatewayctl`)
 
 The CLI talks to the running gateway's authenticated API; nothing is stopped or
@@ -148,9 +322,16 @@ plaintext token in the tokens file).
 | `client-refresh <name> [target]` | Re-run route failover for a client's targets |
 | `client-stop <name> [target]` | Stop a client's targets |
 | `client-kill <name>` | Close all of a client's sessions |
-| `target-connect <target>` | Connect a target (allocation defaults, or `--set` overrides) |
-| `target-refresh <target>` | Re-apply retained/`--set` settings, recreating the allocation |
-| `target-stop <target>` | Stop a target and release its allocation (`close_command`) |
+| `target-connect <target>` | Connect a target (allocation defaults, or `--set` overrides). On a multi-job Slurm target this opens the route and gets or creates the shared job |
+| `target-refresh <target>` | Re-apply retained/`--set` settings, recreating the allocation. On a multi-job Slurm target this reopens the route and never cancels jobs |
+| `target-stop <target>` | Stop a target and release its allocation (`close_command`). On a multi-job Slurm target this detaches and never cancels jobs |
+| `target-open <target>` | Open or reuse the login route, reconcile jobs, never submit |
+| `target-shared <target>` | Get or create the target's shared job |
+| `target-sbatch <target>` | Submit one private Slurm job for the caller |
+| `job-list [--target T]` | List the caller's private jobs plus each shared job |
+| `job-status <job_id>` | Show one job, its scheduler state, and effective settings |
+| `job-wait <job_id>` | Wait until ready or terminal, or the timeout; the job stays intact |
+| `job-stop <job_id>` | Cancel one job; repeated requests are safe |
 | `reload` | Re-read the full config + token graph (admin) |
 | `enrollments` | List pending enrollment requests (admin) |
 | `approve <request-id>` | Approve an enrollment (admin) |
@@ -225,9 +406,11 @@ Lifecycle semantics:
 - **Connected connect with differing settings**: reports a mismatch
   (`needs_refresh: true`); nothing is torn down, the existing allocation
   continues.
-- **Refresh** (`target-refresh <t> --set …`): applies overrides to the retained
-  resolved settings and recreates the allocation (releases the old one via
-  `close_command`, then provisions a new one).
+- **Refresh** (`target-refresh <t> --set …`): on the non-Slurm path, applies
+  overrides to the retained resolved settings and recreates the allocation
+  (releases the old one via `close_command`, then provisions a new one). On a
+  multi-job Slurm target, refresh reopens the route only and leaves every job
+  running.
 - **Recovery without overrides**: `target-refresh <t>` re-applies the target's
   retained resolved settings, not the configured defaults, so a previous `--set`
   request survives route loss or a restart.
@@ -436,6 +619,12 @@ shield:
   name a configured target.
 - Sessions are owned by the client that created them; another client's
   session id maps to `404`.
+- A private job is owned by the client that submitted it. A foreign job id and
+  an unknown job id return the same error. Only an operator may stop the shared
+  job.
+- A client-supplied `job_id` is only an identifier. The gateway resolves the
+  owner, target, and endpoint itself; relay ports and SSH destinations stay
+  internal.
 - Tokens are compared in constant time and stored as `sha256:` hashes.
 - A second factor entered at the `--2fa` prompt (or the JSON `factor` field) is
   used once per request and is never persisted or logged.
@@ -457,7 +646,10 @@ unauthenticated.
 GET    /v1/health
 GET    /v1/targets
 GET    /v1/targets/{target}
+POST   /v1/targets/{target}/open | /shared | /sbatch
 POST   /v1/targets/{target}/connect | /refresh | /stop | /preview
+GET    /v1/jobs ; GET /v1/jobs/{job_id}
+POST   /v1/jobs/{job_id}/cancel
 POST   /v1/exec
 POST   /v1/sessions ; GET /v1/sessions
 GET|DELETE /v1/sessions/{session}
@@ -484,6 +676,15 @@ support large files.
 second factor and allocation overrides. The factor is used once, never
 persisted or logged. `POST /v1/targets/{target}/preview` accepts the same
 override body and returns the rendered plan with no connection state change.
+
+`POST /v1/targets/{target}/open` accepts `{"factor": "..."}`.
+`POST /v1/targets/{target}/shared` accepts `{"factor": "...", "set": {...},
+"root_mode": "fakeroot|clean"}`. `POST /v1/targets/{target}/sbatch` accepts
+`{"factor": "...", "set": {...}, "root_mode": "...", "clean_home": "...",
+"request_id": "..."}`. `GET /v1/jobs/{job_id}?wait=true&timeout=SECONDS`
+waits for ready or terminal; a timeout returns the current state. Exec and
+every file/session endpoint accept an optional `job_id`; omitting it addresses
+only the target's current shared job.
 
 `GET /v1/targets` and `GET /v1/targets/{target}` return only targets allowed by
 the caller's ACL. `GET /v1/sessions` lists only the caller's sessions; admins

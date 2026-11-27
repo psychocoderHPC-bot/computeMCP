@@ -12,10 +12,11 @@ and starts the container directly on the route node.
 
 | File | Role |
 | --- | --- |
-| `computemcp-provision.sh` | Login-node entry point: `provision` (default), `stop`, `close`, `shell`, `status` |
+| `computemcp-provision.sh` | Login-node entry point: `submit`, `observe`, `attach`, `cancel`, `detach`, `teardown`, legacy `provision`, `stop`, `close`, `shell`, `status` |
 | `computemcp-container.sh` | Runtime dispatcher for `apptainer` and `docker` |
 | `computemcp-job.sh` | Batch script that runs on the compute node and keeps the allocation alive |
 | `computemcp-relay.py` | Loopback relay that carries SSH over `srun` steps |
+| `computemcp-mux.py` | Login-node multiplexer for the single-channel proxy; dials the relay registered for a `job_id` |
 
 The gateway ships this bundle as package data and can deploy it for you: a
 `[targets.X.bundle]` block in the gateway config makes the gateway upload the
@@ -28,7 +29,7 @@ Set `auto-deploy = false` to pin the copy already on the login node.
 `deploy-dir` is optional and defaults to `<container.storage-root>/bundle`.  It
 must be on storage visible to the login node and to the compute nodes: the batch
 step runs `computemcp-job.sh` and `computemcp-container.sh` there, so a per-node
-`/tmp` breaks multi-node and most batch setups.  Place the four code files side
+`/tmp` breaks multi-node and most batch setups.  Place the five code files side
 by side only when you manage deployment by hand (the manual
 `provision_command`/`close_command` path).  No site name, account, partition,
 image, or path is hardcoded either way.
@@ -36,10 +37,37 @@ image, or path is hardcoded either way.
 ## Login-node requirements
 
 Slurm client tools (`sbatch`, `squeue`, `scancel`, `srun`), Bash, `flock`,
-`python3`, and the selected runtime (`apptainer` or `docker`).  The Apptainer
-configure step uses `python3` on the login node, so Python 3 remains a login
-node requirement even though the argument bridge itself is pure Bash.  Compute
-nodes need the same runtime and `python3`.
+`python3` (3.8 or newer), and the selected runtime (`apptainer` or `docker`).
+The Apptainer configure step uses `python3` on the login node, so Python 3
+remains a login node requirement even though the argument bridge itself is pure
+Bash.  Compute nodes need the same runtime and `python3`.
+
+### Apptainer prerequisites
+
+`computemcp-container.sh` probes Apptainer before `build`/`configure`/`start`
+and fails with an actionable message instead of letting a later step emit an
+opaque error:
+
+* **Apptainer 1.x or newer.**  Legacy Singularity (major version `0`) is
+  rejected.  An unparseable `apptainer --version` output is only a warning,
+  because a site wrapper may hide it.
+* **Working `--fakeroot`.**  The probe runs a bounded
+  `apptainer exec --fakeroot ... true` no-op, using the existing sandbox or
+  clean SIF when one is present.  When that fails, a setuid install is accepted
+  if a setuid `starter-suid` (or legacy `starter`) helper is present, and
+  otherwise unprivileged user namespaces are checked with
+  `unshare --user --map-root-user true`.  Running as root also satisfies it.
+  The CLI binary itself is not setuid on a setuid install, so its mode is never
+  used as the test.  When none of these work the helper names the site policy:
+  enable unprivileged user namespaces or install the setuid package
+  (`apptainer-suid`).
+* **A writable sandbox account.**  Some base images ship no `ubuntu` account.
+  `%post` creates one when the shadow tools are present, and `configure` creates
+  a non-root account with a free UID/GID when the image still has none.
+
+For immutable `clean` root mode, `COMPUTEMCP_IMAGE_DIGEST` pins the expected
+base-image SHA-256.  A mismatch aborts the run; without a pin, the first digest
+is recorded and a later change is reported as a warning.
 
 ## Gateway configuration
 
@@ -132,9 +160,83 @@ By default the helper uses
 
 | Path | Contents |
 | --- | --- |
-| `sandbox/` | Writable Apptainer sandbox (Apptainer runtime) |
-| `home/` | Persistent container home and `.ssh/authorized_keys` |
-| `state/` | Job ID, cluster, readiness files, per-job settings, locks, logs, relay state |
+| `sandbox/` | Writable Apptainer sandbox for fakeroot jobs (Apptainer runtime) |
+| `home/` | Default home base (see "Homes" below) |
+| `state/` | Target-level state root |
+| `state/jobs/<job_id>/` | Per-job record: Slurm id, cluster, mode, root mode, home, instance name, readiness node, container port, per-job settings, locks, logs and relay files |
+| `state/jobs/<job_id>/runtime/` | Per-job writable runtime directory bound into the instance (port file, Dropbear PID, `/run`, `/tmp`) |
+
+Slurm jobs always use `state/jobs/<job_id>/`; the legacy single-job id of an
+older gateway is `default`.  Direct (non-Slurm) Docker targets keep the
+target-level `state/` directory, so their shared-container workflow is
+unchanged.  There is no global `state/jobid` or `state/relay.ready`: two jobs
+never share a numeric id, a relay port, a PID file or a readiness marker.
+
+## Homes
+
+The host directory mounted as the container home comes from
+`COMPUTEMCP_HOME_BASE` (default `<system-dir>/home`):
+
+| Job | Host directory |
+| --- | --- |
+| Shared job (`COMPUTEMCP_JOB_KIND=shared`, default) | `<home-base>/shared/` |
+| Private job (`COMPUTEMCP_JOB_KIND=private`) of client X | `<home-base>/agents/X/` |
+| Private job with `COMPUTEMCP_CLEAN_HOME=/benchmarks/run-42` | `<home-base>/agents/X/benchmarks/run-42/` |
+
+`COMPUTEMCP_CLIENT_ID` identifies the authenticated client for a private job.
+The helper strips a leading `/` from `COMPUTEMCP_CLEAN_HOME`, so
+`benchmarks/run-42` and `/benchmarks/run-42` name the same directory.  It
+rejects an empty path, the home root, `..` traversal, client ids containing a
+path separator, and symlinks anywhere below the resolved home base.  Missing
+directories are created; existing content is preserved.  Shared jobs always use
+the shared home, so `COMPUTEMCP_CLEAN_HOME` on a shared job is rejected.
+
+## Root modes
+
+`COMPUTEMCP_ROOT_MODE` selects `fakeroot` (default) or `clean`.
+
+* **fakeroot** keeps one persistent writable Apptainer sandbox per target.
+  Running fakeroot jobs on one node see packages installed by another, and
+  changes survive job termination.
+* **clean** starts an operator-prepared immutable SIF named by
+  `COMPUTEMCP_CLEAN_IMAGE`.  The helper records its SHA-256 in
+  `state/jobs/<job_id>/image.digest` and prints the digest; the base is never
+  modified.  Each job gets ephemeral writable `/run` and `/tmp` plus its own
+  runtime directory.  A prepared clean base must install the gateway SSH
+  account/key bootstrap and a start script that reads
+  `/computemcp-runtime/container.port`.  Clean mode requires Apptainer.
+
+## Stages
+
+* `submit` builds/configures the container when needed, calls
+  `sbatch --parsable`, persists the numeric id and cluster immediately, and
+  returns.  It never waits in the queue and never starts a relay.  Before
+  `sbatch` it persists a correlation token (from `COMPUTEMCP_CORRELATION_TOKEN`
+  or generated) and passes it as `--comment=<token>`, so a crash between
+  acceptance and id persistence is recoverable.
+* `observe` reads `squeue` and the job's readiness file and prints
+  `STATE pending|starting|ready|terminal` without blocking.  It falls back to
+  `sacct` when `squeue` no longer shows the id; a purged or unknown id is
+  `terminal` so a quota slot cannot stick.
+* `attach` polls until the job publishes readiness, starts (or reuses) this
+  job's login-node relay, verifies the endpoint and prints
+  `ENDPOINT 127.0.0.1:<port>`.  If the persisted id was lost, `observe`,
+  `attach` and `cancel` recover it from the token via `squeue`/`sacct`
+  comments before doing anything else.
+* `cancel` runs an explicit `scancel` for the tracked job and stops its relay.
+* `detach` / `teardown` stop only the relay.  They never call `scancel`; the
+  Slurm job and its durable files keep running.
+* `provision` is the legacy synchronous `submit` + `attach` used by the current
+  gateway.  `stop`/`close` stop a direct container and detach (never cancel) a
+  Slurm job.
+
+The job id can be passed as the second argument or in `COMPUTEMCP_JOB_ID`; it
+is an opaque computeMCP identity, not the numeric Slurm id.  Each job gets a
+distinct instance name (`computemcp-<uid>-<system>-<job_id>` unless
+`COMPUTEMCP_CONTAINER_NAME` is pinned) and, when
+`COMPUTEMCP_CONTAINER_PORT` is `0` or unset, a free dropbear port chosen on the
+compute node and published in its own state directory.  Two jobs on one compute
+node therefore get distinct instance names, ports and runtime files.
 
 Set `storage-root` on a filesystem reachable from login and compute nodes.
 Avoid a small home quota when building images.
@@ -158,8 +260,8 @@ writes are preserved from the reference scripts.
 ## SBATCH and SRUN argument transport
 
 The helper parses `COMPUTEMCP_SBATCH_ARGS` into `SBATCH_ARGS` and appends only
-protocol options it owns (`--parsable`, `--job-name`, and output/error when the
-deck has none).  It submits with:
+protocol options it owns (`--parsable`, `--job-name`, `--comment=<correlation
+token>`, and output/error when the deck has none).  It submits with:
 
 ```bash
 sbatch "${SBATCH_ARGS[@]}" "${HELPER_ARGS[@]}" "$JOB_SCRIPT" "$SETTINGS"
@@ -203,29 +305,46 @@ login-node relay port; by default the port is chosen dynamically, see below),
 `COMPUTEMCP_WAIT_SECONDS` (job wait, default 900), and
 `COMPUTEMCP_SSH_WAIT_SECONDS` (banner wait, default 120).
 
+## Environment bootstrap
+
+`computemcp-job.sh` sources the per-job settings file first, so the container
+start survives `--export=NONE` or a custom export policy.  The settings file
+carries the resolved absolute paths and the site hook
+`COMPUTEMCP_PROVISION_ENV` (one `source`/`module load` line per newline).  The
+helper applies the same lines on the login node before the first Python/runtime
+operation and the batch script applies them again on the compute node, where
+the login-node module environment does not propagate.  The batch script uses no
+PTY, and the relay's `srun --connect` steps use no PTY either.
+
 ## Relay port allocation
 
 The helper runs on the login/route node and is the authority for what is free
-there, so it lets the relay bind an ephemeral loopback port by default (binding
-port `0` and reading the concrete port back from `state/relay.ready`).  Two
-bundle targets that share one login node therefore never collide, which a fixed
-default port would.  The resolved concrete port is persisted to
-`state/relay.port`; a reconnect against the same state directory reuses it as
-long as the tracked relay is still running, so the endpoint does not move and
-the relay is not restarted.  `stop`/`close` remove `state/relay.port` with the
-other relay state, so a fresh provision after a stop picks a new port.
-Setting `COMPUTEMCP_FORWARD_PORT` to an integer `1..65535` overrides this
-dynamic choice and is used verbatim; any other value fails with exit 2.
+there, so it lets each relay bind an ephemeral loopback port by default (binding
+port `0` and reading the concrete port back from its own
+`state/jobs/<job_id>/relay.ready`).  Relay starts pass the job id and an
+explicit endpoint file, and publish the ready record atomically, so several
+relays can run concurrently on one login node and concurrent starts do not
+clobber a shared registry.  Two bundle targets that share one login node
+therefore never collide, which a fixed default port would.  The resolved
+concrete port is persisted to `state/jobs/<job_id>/relay.port`; a reconnect
+against the same job reuses it as long as the tracked relay is still running,
+so the endpoint does not move and the relay is not restarted.  `detach`,
+`teardown` and `stop`/`close` remove the relay files, so a fresh attach after a
+detach picks a new port.  Setting `COMPUTEMCP_FORWARD_PORT` to an integer
+`1..65535` overrides this dynamic choice and is used verbatim; any other value
+fails with exit 2.
 
 ## Lifecycle
 
-`provision` reuses a tracked `PENDING`, `RUNNING`, or `CONFIGURING` job.
-`stop` and `close` run `scancel` for the exact tracked job ID and stop the
-relay; container files remain.  On a timeout the job stays tracked so the next
-call can reuse it.  When a run fails after submission, the helper prints the
-job ID and cluster so a half-started allocation is never silent.  `status`
-reports the tracked job, its state, the ready node, and the relay endpoint.
-Multi-node requests fail with `multi-node not yet supported`.
+`provision` reuses a tracked `PENDING`, `RUNNING`, or `CONFIGURING` job and
+otherwise submits one.  `cancel` is the only operation that runs `scancel`;
+`detach`, `teardown` and Slurm `stop`/`close` leave the allocation alive.
+Container homes and immutable base images are preserved by every teardown.  On
+a timeout the job stays tracked so the next `attach` can reuse it.  When a run
+fails after submission, the helper prints the job ID and cluster so a
+half-started allocation is never silent.  `status` reports the job id, numeric
+Slurm id, state, ready node and relay endpoint.  Multi-node requests fail with
+`multi-node not yet supported`.
 
 ## Connect-time overrides
 

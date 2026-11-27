@@ -27,7 +27,7 @@ if [ -n "$SETTINGS" ] && [ -r "$SETTINGS" ]; then
 fi
 
 STATE="${COMPUTEMCP_STATE_DIR:?COMPUTEMCP_STATE_DIR is required}"
-CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-2222}"
+CONTAINER_PORT="${COMPUTEMCP_CONTAINER_PORT:-0}"
 SSH_WAIT_SECONDS="${COMPUTEMCP_SSH_WAIT_SECONDS:-120}"
 
 # Resolve the bundle directory.  Slurm may copy this batch script into its spool
@@ -62,7 +62,9 @@ mkdir -p "$STATE"
 exec 8>"$STATE/job-run.lock"
 flock -n 8 || { echo 'Another job is already using this state directory.' >&2; exit 1; }
 
-READY="$STATE/ready-$SLURM_JOB_ID"
+# Per-job readiness marker.  The batch job owns one state directory, so the
+# name need not carry the Slurm id (and must not collide across co-located jobs).
+READY="$STATE/ready"
 STARTED=0
 cleanup() {
     rm -f "$READY"
@@ -110,8 +112,44 @@ fi
 bash "$CONTAINER_SCRIPT" start
 STARTED=1
 
+# The container script picks the actual reachable port at start time and
+# publishes it in the per-job state directory.  Apptainer publishes the node
+# loopback port; Docker publishes the concrete EPHEMERAL HOST port its
+# ``127.0.0.1::<container-port>`` mapping was assigned, because that host port
+# (not the in-container port) is what a process on the compute node can dial.
+# Wait for the banner on THAT port, never on the raw request value: the Slurm
+# default request is 0 (\"pick an ephemeral port\"), which is not a readiness
+# value and must be rejected rather than waited on.
+ACTUAL_CONTAINER_PORT=""
+if [ -s "$STATE/container.port" ]; then
+    ACTUAL_CONTAINER_PORT="$(head -n 1 "$STATE/container.port" || true)"
+fi
+if ! { [[ "$ACTUAL_CONTAINER_PORT" =~ ^[0-9]+$ ]] &&
+       (( ACTUAL_CONTAINER_PORT >= 1 && ACTUAL_CONTAINER_PORT <= 65535 )); }; then
+    ACTUAL_CONTAINER_PORT=""
+fi
+# Fall back to the published endpoint host port when container.port is missing
+# (older container script, or a Docker run that only wrote container.endpoint).
+if [ -z "$ACTUAL_CONTAINER_PORT" ] && [ -s "$STATE/container.endpoint" ]; then
+    ENDPOINT_VALUE="$(head -n 1 "$STATE/container.endpoint" || true)"
+    ENDPOINT_PORT="${ENDPOINT_VALUE##*:}"
+    if [[ "$ENDPOINT_PORT" =~ ^[0-9]+$ ]] &&
+        (( ENDPOINT_PORT >= 1 && ENDPOINT_PORT <= 65535 )); then
+        ACTUAL_CONTAINER_PORT="$ENDPOINT_PORT"
+    fi
+fi
+# Last resort: a concrete nonzero request (direct/legacy calls only).
+if [ -z "$ACTUAL_CONTAINER_PORT" ] && [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] &&
+    (( CONTAINER_PORT >= 1 && CONTAINER_PORT <= 65535 )); then
+    ACTUAL_CONTAINER_PORT="$CONTAINER_PORT"
+fi
+if [ -z "$ACTUAL_CONTAINER_PORT" ]; then
+    echo "Container port was not published in $STATE/container.port (or $STATE/container.endpoint), and the request value '$CONTAINER_PORT' is not a usable port (0 means ephemeral)." >&2
+    exit 1
+fi
+
 # Publish the node only after the container serves an SSH banner.
-python3 - "$CONTAINER_PORT" "$SSH_WAIT_SECONDS" <<'PY'
+python3 - "$ACTUAL_CONTAINER_PORT" "$SSH_WAIT_SECONDS" <<'PY'
 import socket
 import time
 import sys
@@ -135,10 +173,10 @@ raise SystemExit(f"Container SSH server did not become ready on port {sys.argv[1
 PY
 
 NODE="$(hostname -s)"
-TEMP_READY="$(mktemp "$STATE/ready-$SLURM_JOB_ID.XXXXXX")"
+TEMP_READY="$(mktemp "$STATE/ready.XXXXXX")"
 printf '%s\n' "$NODE" > "$TEMP_READY"
 mv -- "$TEMP_READY" "$READY"
-echo "Container ready on $NODE, port $CONTAINER_PORT." >&2
+echo "Container ready on $NODE, port $ACTUAL_CONTAINER_PORT." >&2
 
 # Keep the allocation alive; the EXIT trap stops the container on termination.
 while :; do

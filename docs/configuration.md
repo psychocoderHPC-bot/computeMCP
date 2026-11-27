@@ -198,6 +198,24 @@ is the table name and must match the target name grammar:
 | `token_hash` | optional (same condition) | string | Precomputed token hash. Must start with `sha256:`. Highest precedence in the token resolution chain. | `sha256:<64 hex chars>` | not set |
 | `targets` | optional | array of strings | ACL: target names this client may access. `"*"` means all targets. Every listed name except `"*"` must exist in `[targets]` or loading fails. | `["myTargetHost", "secondTarget"]`, `["*"]` | `()` (no targets) |
 | `label` | optional | string | Free-form human-readable label for this client (shown in list output). | e.g. `"opencode for issue 42"` | not set |
+| `job_limits` | optional | table (target name to integer) | Per-target private Slurm job limit. An omitted target defaults to **one** private job. `0` disables private submissions on that target. The target must exist and be in the client's `targets` ACL unless the client has `"*"`. Values must be non-negative integers; booleans, floats, and strings are rejected. The shared job and exec/PTY/file operations consume no slot. | `{ myTargetHost = 2, secondTarget = 0 }` | `{}` (every authorized target defaults to 1) |
+
+The `job_limits` table can use TOML's inline form in `[clients.<id>]`:
+
+```toml
+[clients.alpaka]
+token = "..."
+targets = ["frontier", "juwels", "hal"]
+job_limits = { frontier = 2, juwels = 1 }
+```
+
+Lowering a limit on reload keeps existing jobs. New submissions are blocked
+until usage falls below the new limit. Non-Slurm Docker targets do not consume
+a private-job slot, so a stored value for them has no effect.
+
+An operator can set the same map on enrollment approval with repeated
+`computeMCP-gatewayctl approve <request-id> --job-limit TARGET=N` entries, for
+example `--job-limit frontier=2 --job-limit juwels=0`.
 
 Uniqueness: two clients must not resolve to the same token hash. The loader
 checks this explicitly (ordering is insertion order, so the error names the
@@ -240,6 +258,9 @@ infrastructure detail, not an operator hint.
 | `host_key_algorithms` | optional | array of strings | Offered host key algorithms (asyncssh negotiation order). Restrict listing changes negotiation; leave unset for the library default. | e.g. `["ssh-ed25519"]` | `()` (library default) |
 | `host_key_check` | optional | string | Host key verification policy for this target. `"on"` (default) requires `host_key_sha256` or `known_hosts` and refuses to connect otherwise. `"off"` disables verification; only safe when the forwarded endpoint is trusted. | `"on"` / `"off"` | `"on"` |
 | `connect_mode` | optional | string | How the gateway contacts this target when it is already connected: `"shared"` reuses an existing connection; `"dedicated"` opens a fresh one. | `"shared"` / `"dedicated"` | `"shared"` |
+| `root_mode` | optional | string | Root filesystem mode for private Slurm container jobs. `"fakeroot"` uses the persistent writable sandbox shared by fakeroot jobs. `"clean"` starts an operator-prepared immutable base image and reports its digest. Target-level default; a submission can override it. Non-Slurm Docker targets ignore it. The key alias `root-mode` is also accepted. | `"fakeroot"` / `"clean"` | `"fakeroot"` |
+| `home_base` | optional | string | Host directory under which per-client container homes live. Shared jobs mount `<home_base>/shared/`; a private job of client X mounts `<home_base>/agents/X/`. The gateway exports it to the bundle as `COMPUTEMCP_HOME_BASE`. Unset falls back to the bundle default, normally `<system-dir>/home`. Also accepted as `home-base`. | e.g. `"/scratch/USER/computemcp/home"` | not set |
+| `clean_home` | optional | string | Default home subdirectory for a private job, resolved beneath the authenticated client's home. The request value (`target-sbatch --clean-home`, MCP `clean_home`, HTTP `clean_home`) wins over this target-level default. With neither set, the job uses the private home root `<home_base>/agents/<client>/`. A leading `/` is stripped, so `benchmarks/run-42` and `/benchmarks/run-42` name the same directory. Traversal, the home root, and symlink escapes are rejected. Shared jobs always use the shared home and reject `clean_home`. Also accepted as `clean-home`. | e.g. `"benchmarks/run-42"` | not set |
 | `sharing` | optional | string | Whether this system is dedicated to this task or shared with other users/jobs. Exposed via `computeMCP_targets()`; benchmark hygiene depends on it. | `"exclusive"` (dedicated), `"shared"`, `"unknown"` | `"unknown"` |
 | `node_info` | optional | array of strings | Free-form operator-authored hints about the system (unstructured; no fixed schema). Exposed to agents via `computeMCP_targets()` / `computeMCP_status()`. Use as a starting hypothesis only; verify actual hardware. | e.g. `["GPU nvidia A30", "x86 CPU", "100GbE"]` | `()` (no hints) |
 | `agent` | optional | array of tables | Ordered list of remote AI agents this target can delegate to. Each entry is an inline table with exactly the keys `agent` and `model`, both non-empty strings. List order is the retry priority order; an empty list means no remote agent. Unrelated to the SSH `user` account. | `[{ agent = "opencode", model = "qwen3.6-27b-fp8" }]` | `()` (no agent) |
@@ -322,11 +343,23 @@ independent stages:
   `srun` receives inside the batch job.
 
 Nothing is copied between stages: the two can map the same calculated value
-differently. The accepted TOML uses exactly four nested table names:
-`[targets.<name>.slurm.sbatch]`, `[targets.<name>.slurm.sbatch-map]`,
-`[targets.<name>.slurm.srun]`, `[targets.<name>.slurm.srun-map]`. An empty
-`[targets.<name>.slurm]` table is equivalent to no slurm block at all. A
-missing stage becomes an empty stage configuration (no args rendered).
+differently. A stage's mapping is accepted in two spellings:
+
+- the nested table `[targets.<name>.slurm.sbatch.mapping]` (the preferred
+  spelling);
+- the legacy sibling table `[targets.<name>.slurm.sbatch-map]`, still valid.
+
+The same pair exists for `srun`. Both spellings normalize to one mapping per
+stage. Keys from both merge, and the legacy sibling wins for a key it defines.
+A key defined by both spellings with different values is a configuration
+error, not a silent override. An identical duplicate is accepted. `mapping` is
+a reserved word inside a stage and is never treated as a manual option.
+
+The other accepted table names are `[targets.<name>.slurm.sbatch]`,
+`[targets.<name>.slurm.srun]`, and the legacy `sbatch-map`/`srun-map` pair
+above. An empty `[targets.<name>.slurm]` table is equivalent to no slurm block
+at all. A missing stage becomes an empty stage configuration (no args
+rendered).
 
 ### `account` (reserved first-class key, per stage)
 
@@ -395,6 +428,38 @@ not set in the plan emits nothing:
 | `cpus-per-node` | `"cpus-per-task"` | yes (when ≥ 1) | `--cpus-per-task=<N>` — see precondition |
 | `memory-per-node` | `"mem"` | yes (when > 0) | `--mem=<MiB>M` |
 | `exclusive` | `"exclusive"` | no: only emits `--exclusive` when the resolved plan is exclusive | request all node resources plus `--exclusive` |
+
+### Default emissions without a mapping
+
+The `sbatch` stage emits implicit defaults for calculated fields that a
+mapping does not name, even when the target has no mapping table. The `srun`
+stage never receives these defaults, so a job step does not inherit the whole
+allocation.
+
+| Calculated field | Default emission |
+|---|---|
+| Positive node count | `--nodes=N` |
+| Positive GPU count per node | `--gpus-per-node=N` |
+| CPUs per node | `--cpus-per-task=N`. When the task layout is unspecified, the gateway also emits `--ntasks-per-node=1`. An explicitly multi-task layout is refused. |
+| Memory per node in MiB | `--mem=NM` |
+| Exclusive allocation requested | `--exclusive` |
+
+A manual option that owns a resource family suppresses the implicit default for
+that family. For example, a manual `mem` suppresses the `memory-per-node`
+default, and the preview names the manual source. An explicit mapping for the
+same family remains a hard conflict with that manual option. An explicit
+mapping still owns its field when the plan currently has no value, so no
+default is emitted for it.
+
+To change one field's representation without touching the others, map just
+that field:
+
+```toml
+[targets.frontier.slurm.sbatch.mapping]
+gpus-per-node = "gres"
+```
+
+Four GPUs then emit `--gres=gpu:4`, and the other fields keep their defaults.
 
 **`cpus-per-node` → `cpus-per-task` precondition.** `--cpus-per-task` pins one
 task per node. The mapping is therefore only admitted when the stage's manual
@@ -531,6 +596,7 @@ a specific config value or blocks the whole request.
 | Flag | Required / optional | Default | Meaning |
 |---|---|---|---|
 | `--config PATH` | optional | default config path (see [Configuration files](#1-configuration-files)) | Path to `config.toml`. |
+| `--state-dir PATH` | optional | `COMPUTEMCP_STATE_DIR`, else `<config-dir>/state`; startup fails if none exists | Durable job state root for job records and the mux registry. There is no temporary fallback. For Slurm it must be on storage shared with the login/compute nodes at the same absolute path. |
 | `--listen HOST` | optional | from `server.listen` | Override `server.listen` after load. |
 | `--port PORT` | optional | from `server.port` | Override `server.port` after load. |
 | `--transport {tunnel,direct}` | optional | per-target inference | Force the transport kind for all targets after load; forces `tunnel` into a target with no `ssh_targets` by setting the target name as the single route entry. |
@@ -564,20 +630,48 @@ Global flags:
 Subcommands: `status`, `targets`, `clients`, `sessions`, `reload`,
 `enrollments`, `approve <request_id>`, `deny <request_id>`,
 `client <name>`, `target-connect <target>`, `target-refresh <target>`,
-`target-stop <target>`, `client-connect <name> [target]`,
+`target-stop <target>`, `target-open <target>`, `target-shared <target>`,
+`target-sbatch <target>`, `job-list [--target T]`, `job-status <job_id>`,
+`job-wait <job_id>`, `job-stop <job_id>`, `client-connect <name> [target]`,
 `client-refresh <name> [target]`, `client-stop <name> [target]`,
 `client-kill <name> [target]`. The subcommand is optional at parse time;
 `main` errors if neither a command nor `--add-target` is given.
-`target-connect` and `target-refresh` additionally accept:
 
-- `--2fa` — prompt on the terminal for the second factor (password/OTP) for
-  `interactive_auth` targets; input is hidden and the token is not accepted on
-  the command line;
-- `--set KEY=VALUE` (repeatable) — allocation overrides; accepted keys are
-  `nodes`, `gpus-per-node`, `cpus-per-node`, `mem-per-node`, `mode`;
-- `--timeout SECONDS` — per-request timeout override (default: target's
-  `provision_timeout` plus a 60 s margin);
-- `--dry-run` — preview the allocation without connecting (no allocation).
+`target-connect`, `target-refresh`, `target-open`, `target-shared`, and
+`target-sbatch` accept:
+
+- `--2fa`: prompt on the terminal for the second factor (password/OTP) for
+  `interactive_auth` targets. Input is hidden and the token is not accepted on
+  the command line. A dry-run never prompts.
+- `--set KEY=VALUE` (repeatable): allocation overrides. Accepted keys are
+  `nodes`, `gpus-per-node`, `cpus-per-node`, `mem-per-node`, `mode`.
+  `target-open` accepts the flag for symmetry but never allocates, so it
+  ignores it.
+- `--timeout SECONDS`: per-request timeout override. For connect/refresh/open
+  the default is the target's `provision_timeout` plus a 60 s margin. For
+  `job-wait` the default wait is 30 s and a timeout leaves the job intact.
+- `--dry-run`: preview the allocation without connecting, opening the route,
+  starting a shared job, or submitting a private job.
+
+`target-shared` also accepts `--root-mode {fakeroot,clean}` and
+`--clean-home PATH`. A shared job always mounts the shared home, so
+`--clean-home` changes the recorded request, not the shared-home mount.
+
+`target-sbatch` also accepts `--root-mode {fakeroot,clean}`,
+`--clean-home PATH`, and `--request-id ID` (an idempotency key; reusing it with
+different settings is rejected). Its `--2fa` factor is forwarded to route
+opening, so a single `target-sbatch --2fa` call can open an interactive route
+and submit the private job.
+
+`approve` accepts repeatable `--job-limit TARGET=N` entries. The gateway writes
+the map into the new `[clients.<id>.job_limits]` block, reloads the config, and
+returns the applied `job_limits` in the approval response. A limit of `0`
+disables private submissions on that target for the approved client.
+
+The interactive gateway console offers `open`, `shared`, `sbatch`,
+`jobs [target]`, `job <job-id>`, and `job-cancel <job-id>` for the same
+operations. The console `approve` does not accept `--job-limit`; use the CLI
+flag or edit the config and reload.
 
 ### `computeMCP-handshake`
 
@@ -610,6 +704,7 @@ error with a message pointing to the handshake flow.
 | `COMPUTEMCP_GATEWAY` | operator (per project) or generated by handshake / MCP | `computeMCP-gatewayctl`, `computeMCP-handshake`, `computeMCP-mcp` | Gateway base URL. For `gatewayctl`: `--gateway` flag wins, then this env, then `http://host:port`. For `handshake`: `--gateway` flag wins, then this env, then `http://host:port`. For `mcp`: required; its absence is a hard error. |
 | `COMPUTEMCP_TOKEN` | operator (per project) or generated by handshake / MCP | `computeMCP-gatewayctl`, `computeMCP-mcp` | Bearer token. For `gatewayctl`: `--token` flag wins, then `operator.token` file, then env, then the plaintext in tokens file (by the `--client` id). For `mcp`: required; its absence is a hard error. |
 | `COMPUTEMCP_SSH_USER` | operator (exported on the gateway host) | gateway dial path | Alternate login account inside the container when `container_user` is not set in the target. Emits into the provisioner contract (see below) only when a container or bundle block is present. |
+| `COMPUTEMCP_STATE_DIR` | operator (exported on the gateway host) | gateway job registry | Durable job state root. Resolution order: `--state-dir`, this variable, then `<config-dir>/state`. There is no temporary fallback; without one of the three the gateway fails at startup with `no durable job state root`. Jobs live under `<state_root>/jobs/<job_id>/` and the mux registry under `<state_root>/mux/<target>.json`. For a Slurm target this root MUST be on storage that the gateway and the login/compute nodes see at the same absolute path. |
 
 Note on `COMPUTEMCP_SSH_USER`: it is both an operator-side env variable (read
 by the gateway when resolving `container_user`) **and** a value emitted by the
@@ -660,12 +755,32 @@ The contract, with the condition under which each variable is emitted:
 | `COMPUTEMCP_SSH_PUBLIC_KEY` | Public key derived from `client_key`. Emitted **only** when a bundle block is present **and** the derived public key is non-empty. |
 | `COMPUTEMCP_PROVISION_ENV` | `bundle.provision_env` lines joined by newline. Emitted **only** when a bundle block is present. An empty tuple yields `""`. |
 
+### Job stage environment
+
+For a durable multi-job target, the bundle stage adapter adds these values to
+the same `COMPUTEMCP_*` environment for each job. They are per job and are not
+target-level settings.
+
+| Variable | Value |
+|---|---|
+| `COMPUTEMCP_JOB_ID` | The computeMCP job id, for example `job-<32 hex>`. |
+| `COMPUTEMCP_JOB_KIND` | `shared` or `private`. |
+| `COMPUTEMCP_CLIENT_ID` | The owner client id for a private job; `""` for the shared job. |
+| `COMPUTEMCP_ROOT_MODE` | The effective `fakeroot` or `clean` mode. A job value wins over `target.root_mode`. |
+| `COMPUTEMCP_CLEAN_HOME` | The resolved home path relative to the client's private home; `""` for a shared job or an unset clean home. |
+| `COMPUTEMCP_HOME_BASE` | `target.home_base`, or `""` when unset. The bundle then uses its own default. |
+| `COMPUTEMCP_CORRELATION_TOKEN` | The scheduler-visible token the bundle passes to `sbatch` as a job comment for reconciliation. |
+| `COMPUTEMCP_STATE_DIR` | The per-job state directory `<state_root>/jobs/<job_id>`. |
+
+The `COMPUTEMCP_STATE_DIR` in this job stage environment is the per-job
+directory. The operator-facing `COMPUTEMCP_STATE_DIR` in section 17 is the
+gateway's state root.
+
 Out of the gateway → provisioner contract (managed by the bundle, not the
 gateway, and listed here only to separate responsibilities):
-`COMPUTEMCP_STATE_DIR`, `COMPUTEMCP_SANDBOX_DIR`, `COMPUTEMCP_CONTAINER_PORT`,
+`COMPUTEMCP_SANDBOX_DIR`, `COMPUTEMCP_CONTAINER_PORT`,
 `COMPUTEMCP_SSH_WAIT_SECONDS`, `COMPUTEMCP_FORWARD_PORT`. The bundle derives
-or sets these from what the gateway exports; the gateway never sets them
-directly.
+or sets these from what the gateway exports.
 
 Additionally, SSH exec operations (the remote exec surface used by
 `computeMCP_exec` / session write) inject per-call environment variables into

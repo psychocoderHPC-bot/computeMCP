@@ -40,21 +40,33 @@ the wrong provisioning mode.
 
 from __future__ import annotations
 
+import ast
 import contextlib
+import hashlib
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
+
+_TEST_DIR = Path(__file__).resolve().parent
+if str(_TEST_DIR) not in sys.path:
+    sys.path.insert(0, str(_TEST_DIR))
+
+from fakes.conftest import fake_slurm_ctl, fake_slurm_env  # noqa: E402,F401
 
 REPO = Path(__file__).resolve().parent.parent
 BUNDLE_DIR = REPO / "src" / "compute_mcp" / "bundles" / "computemcp-slurm"
 PROVISION = BUNDLE_DIR / "computemcp-provision.sh"
 JOB = BUNDLE_DIR / "computemcp-job.sh"
 CONTAINER = BUNDLE_DIR / "computemcp-container.sh"
+FAKE_SLURM = REPO / "tests" / "fakes" / "fake_slurm.py"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None, reason="bash is required for the shell tests"
@@ -84,26 +96,51 @@ def _wait_port(port: int, timeout: float = 15.0) -> bool:
     return False
 
 
-def _kill_process(pattern: str) -> None:
-    """Best-effort pkill for a leaked helper process."""
-    subprocess.run(["pkill", "-f", pattern], check=False, stdout=subprocess.DEVNULL)
+# Per-test roots used by :func:`_cleanup`.  Parallel pytest workers in other
+# checkouts may run the same shell helpers; a global ``pkill`` would kill their
+# processes (and they ours).  Cleanup is therefore scoped to the test roots
+# registered here instead of matching a bare script name.
+_TEST_ROOTS: set[str] = set()
 
 
-def _pkill_pids(pattern: str) -> None:
-    procs = subprocess.run(
-        ["pgrep", "-f", pattern], capture_output=True, text=True, check=False
-    ).stdout.split()
-    for pid in procs:
-        with contextlib.suppress(OSError, ValueError):
-            subprocess.run(["kill", pid], check=False)
+def _register_root(path) -> None:
+    _TEST_ROOTS.add(str(path))
+
+
+def _scoped_pids(patterns) -> list[int]:
+    roots = [root for root in _TEST_ROOTS if root]
+    if not roots:
+        return []
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace"
+            )
+            cwd = os.readlink(entry / "cwd")
+        except (OSError, ValueError):
+            continue
+        if not any(name in cmdline for name in patterns):
+            continue
+        if any(root in cmdline or cwd.startswith(root) for root in roots):
+            pids.append(int(entry.name))
+    return pids
 
 
 def _cleanup() -> None:
-    """Stop the background helpers the tests may still be holding."""
-    _kill_process("banner_server.py")
-    _pkill_pids("computemcp-relay.py")
-    _pkill_pids("computemcp-job.sh")
-    _pkill_pids("connect_bridge.py")
+    """Stop the background helpers *this test* may still be holding."""
+    for pid in _scoped_pids(
+        (
+            "t8_banner_server.py",
+            "t8_connect_bridge.py",
+            "computemcp-relay.py",
+            "computemcp-job.sh",
+        )
+    ):
+        with contextlib.suppress(OSError, ValueError):
+            subprocess.run(["kill", str(pid)], check=False)
 
 
 def _docker_counts(log: Path) -> dict:
@@ -143,6 +180,28 @@ def _published_port(container_port: int) -> int:
 def _shell_quote(text: str) -> str:
     """Render a value the way bash ``printf %q`` does for the settings file."""
     return "'" + text.replace("'", "'\\''") + "'"
+
+
+def _embedded_python_blocks(script: Path) -> list[tuple[str, str]]:
+    """Extract ``python3 ... <<'TAG' ... TAG`` heredocs from a shell script.
+
+    Only blocks whose opening command mentions ``python`` are returned, and the
+    interpreter reads the body verbatim, so parsing the captured body is the
+    same source the shipped script executes.
+    """
+    text = script.read_text(encoding="utf-8")
+    blocks: list[tuple[str, str]] = []
+    for match in re.finditer(r"<<'([A-Za-z_][A-Za-z0-9_]*)'\n", text):
+        tag = match.group(1)
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        header = text[line_start:match.start()]
+        if "python" not in header:
+            continue
+        end = text.find("\n" + tag + "\n", match.end())
+        if end == -1:
+            continue
+        blocks.append((tag, text[match.end():end]))
+    return blocks
 
 
 # --- stub scripts ----------------------------------------------------------
@@ -478,8 +537,8 @@ class _Stubs:
         self.root = root
         base = root / "stubbin"
         base.mkdir()
-        self.banner = base / "banner_server.py"
-        self.bridge = base / "connect_bridge.py"
+        self.banner = base / "t8_banner_server.py"
+        self.bridge = base / "t8_connect_bridge.py"
         _write_stub(self.banner, BANNER_SERVER, executable=False)
         _write_stub(self.bridge, CONNECT_BRIDGE, executable=False)
         _write_stub(base / "docker", DOCKER_STUB)
@@ -586,6 +645,8 @@ def _base_env(system: str, storage_root: Path, port: int) -> dict:
     stray ``sbatch`` in /usr/bin would NOT be picked up before the stubs -
     matching the "stub first, system after" production layout.
     """
+    _register_root(storage_root)
+    _register_root(storage_root.parent)
     env = dict(os.environ)
     env.update(
         {
@@ -595,8 +656,8 @@ def _base_env(system: str, storage_root: Path, port: int) -> dict:
             "COMPUTEMCP_IMAGE": "docker://ubuntu:22.04",
             "COMPUTEMCP_CONTAINER_PORT": str(port),
             "COMPUTEMCP_FORWARD_PORT": str(port + 1),
-            "COMPUTEMCP_SSH_WAIT_SECONDS": "15",
-            "COMPUTEMCP_WAIT_SECONDS": "60",
+            "COMPUTEMCP_SSH_WAIT_SECONDS": "30",
+            "COMPUTEMCP_WAIT_SECONDS": "120",
             "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
             "COMPUTEMCP_NODES": "1",
             # Pin the runtime name so the existing assertions stay readable.
@@ -606,7 +667,7 @@ def _base_env(system: str, storage_root: Path, port: int) -> dict:
             # Both the direct ``docker start`` path (via the docker stub) and
             # the slurm ``srun --connect`` path (via the srun stub) need this.
             "BANNER_SERVER": str(stubs_banner_path()),
-            "CONNECT_BRIDGE": str(stubs_banner_path().with_name("connect_bridge.py")),
+            "CONNECT_BRIDGE": str(stubs_banner_path().with_name("t8_connect_bridge.py")),
         }
     )
     return env
@@ -629,7 +690,7 @@ def test_slurm_mode_submits_job_and_reports_relay_endpoint(tmp_path, stubs):
     workdir = tmp_path / "slurm"
     workdir.mkdir()
     storage = workdir / "storage"
-    state_dir = storage / "casetest" / "state"
+    state_dir = storage / "casetest" / "state" / "jobs" / "default"
 
     env = _base_env("casetest", storage, container_port)
     env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
@@ -722,7 +783,7 @@ def test_slurm_job_start_resources_settings_when_env_is_stripped(tmp_path, stubs
     workdir = tmp_path / "slurm-strip"
     workdir.mkdir()
     storage = workdir / "storage"
-    state_dir = storage / "striptest" / "state"
+    state_dir = storage / "striptest" / "state" / "jobs" / "default"
 
     env = _base_env("striptest", storage, container_port)
     env["COMPUTEMCP_FORWARD_PORT"] = str(forward_port)
@@ -1441,7 +1502,7 @@ def test_slurm_mode_settings_roundtrip_preserves_hook(tmp_path, stubs):
     env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
     env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
     env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
-    state_dir_slurm = storage / "slurmhk" / "state"
+    state_dir_slurm = storage / "slurmhk" / "state" / "jobs" / "default"
     env["SLURM_JOBID_FILE"] = str(state_dir_slurm / "jobid")
     env["SLURM_JOB_OUT"] = str(workdir / "slurm-job.out")
     env["PATH"] = stubs.slurm.shell_path
@@ -1481,7 +1542,7 @@ def test_slurm_mode_settings_roundtrip_preserves_hook(tmp_path, stubs):
             f"provision exited {result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-        settings = (storage / "slurmhk" / "state") / "srun-slurmhk.settings"
+        settings = (storage / "slurmhk" / "state" / "jobs" / "default") / "srun-slurmhk.settings"
         assert settings.exists()
         check = subprocess.run(
             ["bash", "-c",
@@ -1559,7 +1620,7 @@ def test_provision_compute_build_skips_login_build(tmp_path, stubs):
     workdir = tmp_path / "computebuild"
     workdir.mkdir()
     storage = workdir / "storage"
-    state_dir = storage / "archtest" / "state"
+    state_dir = storage / "archtest" / "state" / "jobs" / "default"
 
     env = _base_apptainer_env(
         "archtest", storage, container_port, "computemcp-archtest"
@@ -1612,7 +1673,7 @@ def test_provision_login_build_unchanged_by_default(tmp_path, stubs):
     workdir = tmp_path / "loginbuild"
     workdir.mkdir()
     storage = workdir / "storage"
-    state_dir = storage / "loginbuild" / "state"
+    state_dir = storage / "loginbuild" / "state" / "jobs" / "default"
 
     env = _base_apptainer_env(
         "loginbuild", storage, container_port, "computemcp-loginbuild"
@@ -3083,7 +3144,7 @@ def _slurm_env(tmp_path, stubs, system, container_port, forward_port=None):
     workdir = tmp_path / system
     workdir.mkdir()
     storage = workdir / "storage"
-    state_dir = storage / system / "state"
+    state_dir = storage / system / "state" / "jobs" / "default"
     env = _base_env(system, storage, container_port)
     # The default is dynamic allocation; only pin the override when asked.
     env.pop("COMPUTEMCP_FORWARD_PORT", None)
@@ -3235,3 +3296,1005 @@ def test_slurm_ready_file_carries_pid_and_port_never_zero(tmp_path, stubs):
     finally:
         teardown()
 
+
+# --- Multi-job stage tests (fake Slurm) ------------------------------------
+#
+# These tests reuse tests/fakes/fake_slurm.py (the durable JSON queue shared by
+# the multi-job design tests) and drive the REAL provision helper through its
+# explicit submit/observe/attach/cancel/detach stages.  Everything is scoped to
+# a per-test tmp tree; no global pkill or fixed PID names are used.
+
+
+def _fake_records(fake_slurm_env) -> list[dict]:
+    try:
+        text = fake_slurm_env.log_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _job_dir(storage: Path, system: str, job_id: str) -> Path:
+    return storage / system / "state" / "jobs" / job_id
+
+
+def _fake_env(
+    tmp_path: Path,
+    stubs: _Stubs,
+    fake_slurm_env,
+    system: str,
+    *,
+    job_id: str = "default",
+    extra: dict | None = None,
+):
+    """A gateway-style environment whose scheduler is the fake Slurm harness."""
+    workdir = tmp_path / system
+    workdir.mkdir()
+    storage = workdir / "storage"
+    env = _base_env(system, storage, _free_port())
+    # Derive a per-job instance name; co-located jobs must not share one.
+    env.pop("COMPUTEMCP_CONTAINER_NAME", None)
+    env.update(fake_slurm_env.environment())
+    env["PATH"] = str(fake_slurm_env.bin_dir) + os.pathsep + stubs.direct.shell_path
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["COMPUTEMCP_JOB_ID"] = job_id
+    env.pop("COMPUTEMCP_FORWARD_PORT", None)
+    if extra:
+        env.update({str(key): str(value) for key, value in extra.items()})
+    return workdir, storage, env
+
+
+def _bridged_fake_bin(tmp_path: Path, stubs: _Stubs, fake_slurm_env) -> Path:
+    """Fake Slurm commands plus a real srun -> container-port bridge."""
+    bin_dir = tmp_path / "bridged-bin"
+    bin_dir.mkdir()
+    for name in ("sbatch", "squeue", "scancel", "sinfo", "slurmctl"):
+        (bin_dir / name).symlink_to(fake_slurm_env.module_path)
+    _write_stub(bin_dir / "srun", SRUN)
+    shutil.copy2(stubs.slurm.bin / "docker", bin_dir / "docker")
+    return bin_dir
+
+
+def test_submit_returns_fast_and_observe_reports_each_state(
+    tmp_path, stubs, fake_slurm_env
+):
+    """submit returns on sbatch acceptance; observe tracks PENDING->READY.
+
+    ``submit`` must not wait in the queue: the fake job stays PENDING and the
+    call still returns.  ``observe`` then reports pending, starting once the
+    scheduler starts the job, ready after the job publishes its node, and
+    terminal after the scheduler marks it complete.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "stageflow", job_id="stage"
+    )
+    jobdir = _job_dir(storage, "stageflow", "stage")
+
+    started = time.monotonic()
+    submit = _run_provision(env, workdir, "submit")
+    elapsed = time.monotonic() - started
+    assert submit.returncode == 0, (submit.returncode, submit.stderr)
+    assert elapsed < 30, elapsed
+    assert "JOB_ID stage" in submit.stdout, submit.stdout
+    assert "SLURM_JOB_ID" in submit.stdout, submit.stdout
+    assert "STATE pending" in submit.stdout, submit.stdout
+    # Fast return: no relay was started and the numeric id is persisted.
+    assert not (jobdir / "relay.ready").exists()
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    def observe() -> subprocess.CompletedProcess:
+        return _run_provision(env, workdir, "observe", "stage")
+
+    pending = observe()
+    assert pending.returncode == 0, pending.stderr
+    assert "STATE pending" in pending.stdout, pending.stdout
+
+    ctl = fake_slurm_env.run("slurmctl", "start-job", slurm_id)
+    assert ctl.returncode == 0, ctl.stderr
+    starting = observe()
+    assert "STATE starting" in starting.stdout, starting.stdout
+
+    # The batch job publishes its node and the concrete container port.
+    (jobdir / "ready").write_text("fake-node\n", encoding="utf-8")
+    (jobdir / "container.port").write_text("23456\n", encoding="utf-8")
+    ready = observe()
+    assert "STATE ready" in ready.stdout, ready.stdout
+    assert "NODE fake-node" in ready.stdout, ready.stdout
+    assert "CONTAINER_PORT 23456" in ready.stdout, ready.stdout
+
+    assert fake_slurm_env.run(
+        "slurmctl", "set-state", slurm_id, "COMPLETED"
+    ).returncode == 0
+    terminal = observe()
+    assert "STATE terminal" in terminal.stdout, terminal.stdout
+
+
+def test_attach_starts_relay_only_after_ready(
+    tmp_path, stubs, fake_slurm_env, housekeeping
+):
+    """attach waits for readiness, then starts the job's own relay."""
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "attachflow", job_id="att"
+    )
+    env["PATH"] = (
+        str(_bridged_fake_bin(tmp_path, stubs, fake_slurm_env))
+        + os.pathsep
+        + stubs.direct.shell_path
+    )
+    jobdir = _job_dir(storage, "attachflow", "att")
+    container_port = _free_port()
+    env["COMPUTEMCP_CONTAINER_PORT"] = str(container_port)
+
+    submit = _run_provision(env, workdir, "submit")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+    assert fake_slurm_env.run("slurmctl", "start-job", slurm_id).returncode == 0
+    (jobdir / "ready").write_text("fake-node\n", encoding="utf-8")
+    (jobdir / "container.port").write_text(
+        str(container_port) + "\n", encoding="utf-8"
+    )
+    housekeeping.start_banner(container_port)
+    assert _wait_port(container_port, timeout=10)
+
+    attach = _run_provision(env, workdir, "attach", "att")
+    assert attach.returncode == 0, (attach.returncode, attach.stderr)
+    endpoint_line = next(
+        line for line in attach.stdout.splitlines() if line.strip().startswith("ENDPOINT")
+    )
+    port = int(endpoint_line.split()[1].rsplit(":", 1)[1])
+    assert _wait_port(port, timeout=15)
+    assert (jobdir / "relay.ready").exists()
+    relay_pid = int((jobdir / "relay.ready").read_text().split()[0])
+
+    try:
+        detach = _run_provision(env, workdir, "detach", "att")
+        assert detach.returncode == 0, detach.stderr
+        # detach removes the relay files but leaves the job record intact.
+        assert not (jobdir / "relay.ready").exists()
+        assert (jobdir / "jobid").exists()
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(relay_pid, 15)
+
+
+def test_detach_and_teardown_never_cancel_and_cancel_is_explicit(
+    tmp_path, stubs, fake_slurm_env
+):
+    """Shutdown-style detach/teardown emit zero scancel; cancel emits one."""
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "cancelrule", job_id="creq"
+    )
+    jobdir = _job_dir(storage, "cancelrule", "creq")
+    submit = _run_provision(env, workdir, "submit")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    assert _run_provision(env, workdir, "detach", "creq").returncode == 0
+    assert _run_provision(env, workdir, "teardown", "creq").returncode == 0
+    scancel_before = [r for r in _fake_records(fake_slurm_env) if r["command"] == "scancel"]
+    assert scancel_before == []
+
+    cancel = _run_provision(env, workdir, "cancel", "creq")
+    assert cancel.returncode == 0, cancel.stderr
+    scancel_after = [r for r in _fake_records(fake_slurm_env) if r["command"] == "scancel"]
+    assert len(scancel_after) == 1, scancel_after
+    assert scancel_after[0].get("cancelled") == [int(slurm_id)]
+    # Repeated cancel is safe and does not scancel a terminal job again.
+    assert _run_provision(env, workdir, "cancel", "creq").returncode == 0
+
+
+def _install_sacct_stub(
+    fake_slurm_env,
+    env: dict,
+    *,
+    job_id: str | None = None,
+    state: str = "",
+    comment: str = "",
+) -> None:
+    """Put a deterministic ``sacct`` on the fake cluster PATH.
+
+    The shipped code only shells out to ``sacct`` as a fallback, so the fake
+    Slurm harness does not model it.  With ``job_id=None`` the stub prints
+    nothing (a purged job); otherwise it prints one allocation row
+    ``JobID|State|Comment`` in the format the helper requests.
+    """
+    stub = fake_slurm_env.bin_dir / "sacct"
+    _write_stub(
+        stub,
+        "#!/usr/bin/env bash\n"
+        'if [ -n "${FAKE_SACCT_JOB_ID:-}" ]; then\n'
+        "  printf '%s|%s|%s\\n' "
+        '"$FAKE_SACCT_JOB_ID" "$FAKE_SACCT_STATE" "$FAKE_SACCT_COMMENT"\n'
+        "fi\n"
+        "exit 0\n",
+    )
+    if job_id is not None:
+        env["FAKE_SACCT_JOB_ID"] = str(job_id)
+        env["FAKE_SACCT_STATE"] = state
+        env["FAKE_SACCT_COMMENT"] = comment
+    else:
+        env.pop("FAKE_SACCT_JOB_ID", None)
+
+
+def test_submit_emits_correlation_comment_and_recovers_lost_id(
+    tmp_path, stubs, fake_slurm_env
+):
+    """submit persists and emits a --comment token; observe recovers a lost id.
+
+    The audit's crash window is between sbatch acceptance and
+    ``state/jobid`` persistence.  The token is written before sbatch, so
+    removing the id file (the crash) still lets observe find the job through
+    the scheduler comment.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "corrflow", job_id="corr"
+    )
+    jobdir = _job_dir(storage, "corrflow", "corr")
+
+    submit = _run_provision(env, workdir, "submit", "corr")
+    assert submit.returncode == 0, submit.stderr
+    token = (jobdir / "correlation_token").read_text().strip()
+    assert re.fullmatch(r"[A-Za-z0-9._:-]+", token), token
+    assert f"CORRELATION_TOKEN {token}" in submit.stdout, submit.stdout
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    sbatch_records = [
+        record for record in _fake_records(fake_slurm_env)
+        if record["command"] == "sbatch"
+    ]
+    assert len(sbatch_records) == 1, sbatch_records
+    assert sbatch_records[0]["comment"] == token, sbatch_records[0]
+    assert f"--comment={token}" in sbatch_records[0]["argv"], sbatch_records[0]
+
+    assert fake_slurm_env.run("slurmctl", "start-job", slurm_id).returncode == 0
+    # Simulate the crash: the numeric id was never persisted.
+    (jobdir / "jobid").unlink()
+    _install_sacct_stub(
+        fake_slurm_env, env, job_id=slurm_id, state="RUNNING", comment=token
+    )
+
+    recovered = _run_provision(env, workdir, "observe", "corr")
+    assert recovered.returncode == 0, recovered.stderr
+    assert f"SLURM_JOB_ID {slurm_id}" in recovered.stdout, recovered.stdout
+    assert "STATE starting" in recovered.stdout, recovered.stdout
+    # Recovery must re-persist the id for the next call.
+    assert (jobdir / "jobid").read_text().strip() == slurm_id
+
+
+def test_attach_recovers_lost_id_then_reports_terminal(
+    tmp_path, stubs, fake_slurm_env
+):
+    """attach also recovers by token and never starts a relay for a dead job."""
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "attachrec", job_id="arec"
+    )
+    jobdir = _job_dir(storage, "attachrec", "arec")
+    submit = _run_provision(env, workdir, "submit", "arec")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+    token = (jobdir / "correlation_token").read_text().strip()
+    assert fake_slurm_env.run(
+        "slurmctl", "set-state", slurm_id, "COMPLETED"
+    ).returncode == 0
+    (jobdir / "jobid").unlink()
+    _install_sacct_stub(
+        fake_slurm_env, env, job_id=slurm_id, state="COMPLETED", comment=token
+    )
+
+    attach = _run_provision(env, workdir, "attach", "arec")
+    assert attach.returncode != 0, attach.stdout
+    assert "terminal" in attach.stderr.lower(), attach.stderr
+    assert (jobdir / "jobid").read_text().strip() == slurm_id
+    assert not (jobdir / "relay.ready").exists()
+    assert not (jobdir / "relay.pid").exists()
+
+
+def test_observe_maps_every_terminal_state_and_purged_id(
+    tmp_path, stubs, fake_slurm_env
+):
+    """Every real terminal state, plus a purged id, reports terminal.
+
+    A terminal mapping that misses a state (PREEMPTED, a timeout) leaves the
+    gateway quota slot stuck, so all of them are asserted explicitly.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "termflow", job_id="term"
+    )
+    jobdir = _job_dir(storage, "termflow", "term")
+    submit = _run_provision(env, workdir, "submit", "term")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    for native in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL"):
+        assert fake_slurm_env.run(
+            "slurmctl", "set-state", slurm_id, native
+        ).returncode == 0, native
+        observed = _run_provision(env, workdir, "observe", "term")
+        assert observed.returncode == 0, (native, observed.stderr)
+        assert "STATE terminal" in observed.stdout, (native, observed.stdout)
+
+    # PREEMPTED is a real Slurm state the fake controller does not model, so
+    # inject it into the queue directly.
+    queue = json.loads(fake_slurm_env.queue_path.read_text(encoding="utf-8"))
+    queue["jobs"][slurm_id]["state"] = "PREEMPTED"
+    fake_slurm_env.queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    observed = _run_provision(env, workdir, "observe", "term")
+    assert "STATE terminal" in observed.stdout, observed.stdout
+
+    # Purged: neither squeue nor sacct knows the id any more.
+    queue = json.loads(fake_slurm_env.queue_path.read_text(encoding="utf-8"))
+    del queue["jobs"][slurm_id]
+    fake_slurm_env.queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    _install_sacct_stub(fake_slurm_env, env)
+    observed = _run_provision(env, workdir, "observe", "term")
+    assert observed.returncode == 0, observed.stderr
+    assert "STATE terminal" in observed.stdout, observed.stdout
+
+
+def _apptainer_stub(bin_dir: Path, log: Path, banner: Path) -> None:
+    _write_stub(
+        bin_dir / "apptainer",
+        r'''#!/usr/bin/env bash
+set -euo pipefail
+printf 'apptainer %s\n' "$*" >> "$APP_LOG"
+if [ "$1" = instance ] && [ "$2" = start ]; then
+    PORT="$(cat "$COMPUTEMCP_STATE_DIR/runtime/container.port")"
+    nohup python3 "$T8_BANNER" "$PORT" \
+        >"$COMPUTEMCP_STATE_DIR/runtime/banner.out" 2>&1 </dev/null 9>&- &
+    echo "$!" > "$COMPUTEMCP_STATE_DIR/runtime/banner.pid"
+fi
+if [ "$1" = instance ] && [ "$2" = stop ]; then
+    if [ -f "$COMPUTEMCP_STATE_DIR/runtime/banner.pid" ]; then
+        kill "$(cat "$COMPUTEMCP_STATE_DIR/runtime/banner.pid")" 2>/dev/null || true
+    fi
+fi
+exit 0
+''',
+    )
+    _write_stub(bin_dir / "ss", "#!/bin/sh\nexit 0\n")
+    (bin_dir / "apptainer.log.target").write_text(str(log), encoding="utf-8")
+
+
+def _apptainer_base_env(tmp_path: Path, stubs: _Stubs, *, system: str) -> dict:
+    root = tmp_path / "apptainer"
+    sandbox = _make_fake_sandbox(root)
+    configured, sandbox, host_home = _run_apptainer_configure(
+        tmp_path, "ubuntu", _free_port(), sandbox=sandbox
+    )
+    assert configured.returncode == 0, configured.stderr
+    bin_dir = tmp_path / "appbin"
+    bin_dir.mkdir()
+    log = tmp_path / "apptainer.log"
+    _apptainer_stub(bin_dir, log, stubs_banner_path())
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+            "COMPUTEMCP_SYSTEM": system,
+            "COMPUTEMCP_STORAGE_ROOT": str(tmp_path / "storage"),
+            "COMPUTEMCP_SANDBOX_DIR": str(sandbox),
+            "COMPUTEMCP_HOST_HOME": str(host_home),
+            "COMPUTEMCP_CONTAINER_PORT": "0",
+            "COMPUTEMCP_SSH_WAIT_SECONDS": "10",
+            "COMPUTEMCP_SSH_USER": "ubuntu",
+            "COMPUTEMCP_SSH_PUBLIC_KEY": "ssh-ed25519 AAAATEST fixture@test",
+            "COMPUTEMCP_ROOT_MODE": "fakeroot",
+            "APP_LOG": str(log),
+            "T8_BANNER": str(stubs_banner_path()),
+            "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        }
+    )
+    return env, sandbox, host_home, log
+
+
+def test_two_colocated_jobs_get_distinct_instance_ports_and_runtime_files(
+    tmp_path, stubs
+):
+    """Same node: distinct instance names, ports and runtime files."""
+    env, sandbox, host_home, log = _apptainer_base_env(
+        tmp_path, stubs, system="coloc"
+    )
+    state_root = tmp_path / "storage" / "coloc" / "state"
+    ports = {}
+    banners = []
+    for job_id in ("a", "b"):
+        job_env = dict(env)
+        job_env["COMPUTEMCP_JOB_ID"] = job_id
+        job_state = state_root / "jobs" / job_id
+        job_env["COMPUTEMCP_STATE_DIR"] = str(job_state)
+        result = subprocess.run(
+            ["bash", str(CONTAINER), "start"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=job_env,
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, (job_id, result.returncode, result.stderr)
+        ports[job_id] = int((job_state / "container.port").read_text().strip())
+        runtime = job_state / "runtime"
+        assert (runtime / "container.port").exists()
+        pid_file = runtime / "banner.pid"
+        if pid_file.exists():
+            banners.append(int(pid_file.read_text().strip()))
+    try:
+        assert ports["a"] != ports["b"], ports
+        text = log.read_text(encoding="utf-8")
+        assert any(name.endswith("-coloc-a") for name in text.split()), text
+        assert any(name.endswith("-coloc-b") for name in text.split()), text
+        # The runtime directories are per job, not shared.
+        assert (state_root / "jobs" / "a" / "runtime").is_dir()
+        assert (state_root / "jobs" / "b" / "runtime").is_dir()
+    finally:
+        for pid in banners:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(pid, 15)
+
+
+def test_fakeroot_and_clean_root_modes_differ_and_record_digest(tmp_path, stubs):
+    """fakeroot uses the writable sandbox; clean uses a SIF + digest."""
+    env, sandbox, host_home, log = _apptainer_base_env(
+        tmp_path, stubs, system="rootmode"
+    )
+    state_root = tmp_path / "storage" / "rootmode" / "state"
+    banners = []
+
+    def start(job_id: str, extra: dict) -> Path:
+        job_state = state_root / "jobs" / job_id
+        job_env = dict(env)
+        job_env.update({k: str(v) for k, v in extra.items()})
+        job_env["COMPUTEMCP_JOB_ID"] = job_id
+        job_env["COMPUTEMCP_STATE_DIR"] = str(job_state)
+        result = subprocess.run(
+            ["bash", str(CONTAINER), "start"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=job_env,
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, (job_id, result.returncode, result.stderr)
+        pid_file = job_state / "runtime" / "banner.pid"
+        if pid_file.exists():
+            banners.append(int(pid_file.read_text().strip()))
+        return job_state
+
+    try:
+        fake_state = start("fake", {"COMPUTEMCP_ROOT_MODE": "fakeroot"})
+        fake_line = [
+            line for line in log.read_text(encoding="utf-8").splitlines()
+            if "instance start" in line
+        ][-1]
+        assert "--fakeroot" in fake_line and "--writable" in fake_line, fake_line
+        assert str(sandbox) in fake_line, fake_line
+
+        image = tmp_path / "clean-base.sif"
+        image.write_bytes(b"immutable clean base\n")
+        clean_state = start(
+            "clean",
+            {
+                "COMPUTEMCP_ROOT_MODE": "clean",
+                "COMPUTEMCP_CLEAN_IMAGE": str(image),
+            },
+        )
+        clean_line = [
+            line for line in log.read_text(encoding="utf-8").splitlines()
+            if "instance start" in line
+        ][-1]
+        assert "--writable-tmpfs" in clean_line, clean_line
+        assert " --writable " not in clean_line, clean_line
+        assert str(image) in clean_line, clean_line
+        digest = (clean_state / "image.digest").read_text().strip()
+        assert digest == hashlib.sha256(image.read_bytes()).hexdigest()
+    finally:
+        for pid in banners:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(pid, 15)
+
+
+def test_home_selection_shared_private_and_clean_home(tmp_path, stubs, fake_slurm_env):
+    """Homes: shared, per-client private, and clean_home beneath the private one."""
+    home_base = tmp_path / "homes"
+    shared = _fake_env(
+        tmp_path,
+        stubs,
+        fake_slurm_env,
+        "homeshared",
+        job_id="s",
+        extra={"COMPUTEMCP_HOME_BASE": str(home_base), "COMPUTEMCP_JOB_KIND": "shared"},
+    )
+    wd, storage, env = shared
+    r = _run_provision(env, wd, "submit", "s")
+    assert r.returncode == 0, r.stderr
+    shared_home = (_job_dir(storage, "homeshared", "s") / "home").read_text().strip()
+    assert shared_home == str((home_base / "shared").resolve())
+
+    def private(job_id: str, clean_home: str):
+        wd, storage, env = _fake_env(
+            tmp_path,
+            stubs,
+            fake_slurm_env,
+            f"home{job_id}",
+            job_id=job_id,
+            extra={
+                "COMPUTEMCP_HOME_BASE": str(home_base),
+                "COMPUTEMCP_JOB_KIND": "private",
+                "COMPUTEMCP_CLIENT_ID": "agent-x",
+                "COMPUTEMCP_CLEAN_HOME": clean_home,
+            },
+        )
+        result = _run_provision(env, wd, "submit", job_id)
+        assert result.returncode == 0, (job_id, result.returncode, result.stderr)
+        return (
+            _job_dir(storage, f"home{job_id}", job_id) / "home"
+        ).read_text().strip()
+
+    absolute = private("abs", "/benchmarks/run-42")
+    relative = private("rel", "benchmarks/run-42")
+    expected = str((home_base / "agents" / "agent-x" / "benchmarks" / "run-42").resolve())
+    assert absolute == expected, absolute
+    assert relative == expected, relative
+
+
+def test_home_rejects_traversal_and_symlink_escape(tmp_path, stubs, fake_slurm_env):
+    home_base = tmp_path / "homes"
+    counter = {"n": 0}
+
+    def run(clean_home: str):
+        counter["n"] += 1
+        wd, storage, env = _fake_env(
+            tmp_path,
+            stubs,
+            fake_slurm_env,
+            f"homebad{counter['n']}",
+            job_id="bad",
+            extra={
+                "COMPUTEMCP_HOME_BASE": str(home_base),
+                "COMPUTEMCP_JOB_KIND": "private",
+                "COMPUTEMCP_CLIENT_ID": "agent-x",
+                "COMPUTEMCP_CLEAN_HOME": clean_home,
+            },
+        )
+        return _run_provision(env, wd, "submit", "bad")
+
+    traversal = run("../escape")
+    assert traversal.returncode == 2, (traversal.returncode, traversal.stderr)
+    assert "'..'" in traversal.stderr or ".." in traversal.stderr, traversal.stderr
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home_base / "agents" / "agent-x").mkdir(parents=True)
+    (home_base / "agents" / "agent-x" / "link").symlink_to(
+        outside, target_is_directory=True
+    )
+    symlink = run("link")
+    assert symlink.returncode == 2, (symlink.returncode, symlink.stderr)
+    assert "symlink" in symlink.stderr, symlink.stderr
+
+    # Rejections happen before any submission or container work.
+    assert not [r for r in _fake_records(fake_slurm_env) if r["command"] == "sbatch"]
+
+
+def test_submit_applies_provision_env_bootstrap(tmp_path, stubs, fake_slurm_env):
+    """The site hook runs on the login node and is carried into the settings."""
+    marker = tmp_path / "login-hook-marker"
+    wd, storage, env = _fake_env(
+        tmp_path,
+        stubs,
+        fake_slurm_env,
+        "envboot",
+        job_id="env",
+        extra={"COMPUTEMCP_PROVISION_ENV": f"touch {marker}"},
+    )
+    result = _run_provision(env, wd, "submit", "env")
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
+    settings = _job_dir(storage, "envboot", "env") / "srun-envboot.settings"
+    assert settings.exists()
+    assert "COMPUTEMCP_PROVISION_ENV" in settings.read_text()
+
+
+# --- Portability and prerequisite regressions ------------------------------
+#
+# R1/R2 review findings on the bundle: Python 3.8 compatibility of the embedded
+# helpers, the missing Apptainer account on bare base images, the Apptainer
+# prerequisite probe, the Slurm+Docker published-port bug, stale re-submit
+# state, the digest pin, and the relay argv guard.
+
+
+def test_embedded_container_python_is_python38_compatible():
+    """The embedded Python helpers must parse with the 3.8 grammar.
+
+    ``computemcp-container.sh`` embeds Python that runs on the node's
+    ``python3``.  A 3.9-only call (``Path.is_relative_to``) previously slipped
+    in, so every block is parsed with ``feature_version=(3, 8)``.
+    """
+    blocks = _embedded_python_blocks(CONTAINER)
+    tags = {tag for tag, _ in blocks}
+    assert {"PY", "CONFIGURE", "PYPORT", "PYDIGEST"} <= tags, tags
+    for tag, code in blocks:
+        ast.parse(
+            code,
+            filename=f"{CONTAINER.name}:{tag}",
+            feature_version=(3, 8),
+        )
+
+
+def test_relay_cli_rejects_missing_arguments():
+    """No argv or a partial mode must print usage, never an IndexError."""
+    relay = BUNDLE_DIR / "computemcp-relay.py"
+    noargs = subprocess.run(
+        [sys.executable, str(relay)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert noargs.returncode != 0, noargs.stdout
+    assert "usage:" in (noargs.stdout + noargs.stderr).lower(), noargs.stderr
+    assert "Traceback" not in noargs.stderr, noargs.stderr
+
+    partial = subprocess.run(
+        [sys.executable, str(relay), "--check"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert partial.returncode != 0, partial.stdout
+    assert "usage:" in (partial.stdout + partial.stderr).lower(), partial.stderr
+    assert "Traceback" not in partial.stderr, partial.stderr
+
+
+def _apptainer_probe_env(
+    tmp_path: Path,
+    version: str,
+    *,
+    exec_rc: int = 0,
+    starter: str | None = None,
+    userns_probe: str | None = None,
+) -> dict:
+    """Write a stub ``apptainer`` for the prerequisite probe and build its env.
+
+    ``exec_rc`` is the functional ``apptainer exec`` result, ``starter`` names a
+    setuid helper to create beside the CLI, and ``userns_probe`` overrides the
+    unprivileged-user-namespace check so a test never depends on the host's
+    policy.  The probe timeout is kept short because every stub returns at once.
+    """
+    root = tmp_path / "appprobe"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    stub = bin_dir / "apptainer"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = --version ]; then\n'
+        f"    printf 'apptainer version {version}\\n'\n"
+        "    exit 0\n"
+        "fi\n"
+        'if [ "${1:-}" = exec ]; then exit '
+        f"{exec_rc}\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    if starter:
+        helper = bin_dir / starter
+        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o4755)
+    env = dict(os.environ)
+    env.update(
+        {
+            "COMPUTEMCP_CONTAINER_RUNTIME": "apptainer",
+            "COMPUTEMCP_SYSTEM": "probe",
+            "COMPUTEMCP_STORAGE_ROOT": str(root / "storage"),
+            "COMPUTEMCP_SANDBOX_DIR": str(root / "sandbox"),
+            "COMPUTEMCP_HOST_HOME": str(root / "home"),
+            "COMPUTEMCP_CONTAINER_PORT": str(_free_port()),
+            "COMPUTEMCP_APPTAINER_PROBE_TIMEOUT": "2",
+        }
+    )
+    if userns_probe is not None:
+        env["COMPUTEMCP_APPTAINER_USERNS_PROBE"] = userns_probe
+    env["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+    return env
+
+
+def test_apptainer_prerequisites_reject_legacy_version(tmp_path):
+    """A legacy Singularity (major 0) fails with an actionable message."""
+    env = _apptainer_probe_env(tmp_path, "0.9.9")
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0, (result.returncode, result.stderr)
+    assert "1.x or newer is required" in result.stderr, result.stderr
+    assert "Singularity" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_accept_modern_version(tmp_path):
+    """Apptainer 1.x passes the probe and reaches the normal configure path."""
+    env = _apptainer_probe_env(tmp_path, "1.3.3")
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    # No sandbox exists, so configure stops there; the prerequisite check did
+    # not reject the version.
+    assert "1.x or newer is required" not in result.stderr, result.stderr
+    assert "Missing sandbox" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_accept_setuid_starter_fallback(tmp_path):
+    """A setuid install is accepted when the functional probe cannot run.
+
+    Regression: the probe tested ``[ -u "$BIN" ]``, but a setuid Apptainer
+    install puts the bit on ``starter-suid``.  On Ubuntu 24.04, where
+    unprivileged user namespaces are restricted, that falsely rejected a valid
+    install.  The fake ``starter-suid`` is setuid and the userns check is forced
+    off, so this passes on a locked-down host.
+    """
+    env = _apptainer_probe_env(
+        tmp_path,
+        "1.3.3",
+        exec_rc=1,
+        starter="starter-suid",
+        userns_probe="false",
+    )
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert "fakeroot is unavailable" not in result.stderr, result.stderr
+    assert "Missing sandbox" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_reject_without_fakeroot_capability(tmp_path):
+    """No probe, no setuid starter and no userns rejects with the site policy.
+
+    The userns check is forced off, so the rejection is independent of whether
+    the test host allows unprivileged user namespaces.
+    """
+    env = _apptainer_probe_env(
+        tmp_path, "1.3.3", exec_rc=1, userns_probe="false"
+    )
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0, (result.returncode, result.stderr)
+    assert "fakeroot is unavailable" in result.stderr, result.stderr
+    assert "site policy" in result.stderr, result.stderr
+    assert "starter-suid" in result.stderr, result.stderr
+    assert "user namespaces" in result.stderr, result.stderr
+
+
+def test_apptainer_prerequisites_probe_override_is_honored(tmp_path):
+    """``COMPUTEMCP_APPTAINER_PROBE`` decides the functional probe for stubs."""
+    env = _apptainer_probe_env(
+        tmp_path, "1.3.3", exec_rc=1, userns_probe="false"
+    )
+    env["COMPUTEMCP_APPTAINER_PROBE"] = "true"
+    result = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert "fakeroot is unavailable" not in result.stderr, result.stderr
+    assert "Missing sandbox" in result.stderr, result.stderr
+
+
+def test_apptainer_configure_creates_missing_account(tmp_path):
+    """A base image with only ``root`` gets a non-root account for the user.
+
+    Some images (the NVIDIA CUDA bases) ship no ``ubuntu`` account.  Configure
+    must create one with a free UID/GID instead of aborting.
+    """
+    root = tmp_path / "apptainer"
+    sandbox = _make_fake_sandbox(root)
+    (sandbox / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/bash\n")
+    (sandbox / "etc/shadow").write_text("root:*:19000:0:99999:7:::\n")
+    result, sandbox, host_home = _run_apptainer_configure(
+        tmp_path, "agent", _free_port(), sandbox=sandbox
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    accounts = _passwd_account(sandbox)
+    assert "agent" in accounts, accounts
+    line = accounts["agent"]
+    assert int(line[2]) >= 1000, line
+    assert line[2] == line[3], line
+    assert line[5] == "/home/agent", line
+    assert line[6] == "/usr/local/bin/computemcp-agent-shell", line
+
+    groups = {}
+    for group_line in (sandbox / "etc/group").read_text().splitlines():
+        fields = group_line.split(":")
+        groups[fields[0]] = fields
+    assert "agent" in groups, groups
+    assert groups["agent"][2] == line[3], groups
+    shadow = (sandbox / "etc/shadow").read_text()
+    assert any(row.startswith("agent:") for row in shadow.splitlines()), shadow
+    assert (host_home / ".ssh/authorized_keys").is_file()
+
+
+def test_clean_image_digest_pin_mismatch_fails(tmp_path, stubs):
+    """An operator-pinned digest aborts on a different clean base."""
+    env, _sandbox, _host_home, _log = _apptainer_base_env(
+        tmp_path, stubs, system="digest"
+    )
+    image = tmp_path / "clean-base.sif"
+    image.write_bytes(b"immutable clean base\n")
+    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    job_state = tmp_path / "storage" / "digest" / "state" / "jobs" / "pin"
+    job_env = dict(env)
+    job_env.update(
+        {
+            "COMPUTEMCP_ROOT_MODE": "clean",
+            "COMPUTEMCP_CLEAN_IMAGE": str(image),
+            "COMPUTEMCP_STATE_DIR": str(job_state),
+            "COMPUTEMCP_JOB_ID": "pin",
+        }
+    )
+
+    wrong = dict(job_env)
+    wrong["COMPUTEMCP_IMAGE_DIGEST"] = "0" * 64
+    rejected = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=wrong,
+        cwd=tmp_path,
+    )
+    assert rejected.returncode != 0, (rejected.returncode, rejected.stderr)
+    assert "digest mismatch" in rejected.stderr, rejected.stderr
+
+    pinned = dict(job_env)
+    pinned["COMPUTEMCP_IMAGE_DIGEST"] = "sha256:" + digest
+    accepted = subprocess.run(
+        ["bash", str(CONTAINER), "configure"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=pinned,
+        cwd=tmp_path,
+    )
+    assert accepted.returncode == 0, (accepted.returncode, accepted.stderr)
+    assert (job_state / "image.digest").read_text().strip() == digest
+
+
+def test_submit_clears_stale_runtime_state(tmp_path, stubs, fake_slurm_env):
+    """A re-submit drops the previous allocation's readiness files."""
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "staleflow", job_id="stale"
+    )
+    jobdir = _job_dir(storage, "staleflow", "stale")
+    jobdir.mkdir(parents=True, exist_ok=True)
+    stale = {
+        "ready": "dead-node\n",
+        "container.port": "23456\n",
+        "container.endpoint": "127.0.0.1:23456\n",
+        "cancelled": "cancelled\n",
+        "ready.ABC123": "dead-node\n",
+    }
+    for name, value in stale.items():
+        (jobdir / name).write_text(value, encoding="utf-8")
+
+    result = _run_provision(env, workdir, "submit", "stale")
+    assert result.returncode == 0, (result.returncode, result.stderr)
+    for name in stale:
+        assert not (jobdir / name).exists(), name
+
+
+def test_observe_and_attach_agree_on_non_terminal_states(
+    tmp_path, stubs, fake_slurm_env
+):
+    """SUSPENDED/COMPLETING/STOPPED are non-terminal in observe AND attach.
+
+    Regression: observe mapped them to ``starting`` while attach aborted with
+    "terminal", so the two stages disagreed about the same allocation.
+    """
+    workdir, storage, env = _fake_env(
+        tmp_path, stubs, fake_slurm_env, "agreeflow", job_id="agree"
+    )
+    jobdir = _job_dir(storage, "agreeflow", "agree")
+    submit = _run_provision(env, workdir, "submit", "agree")
+    assert submit.returncode == 0, submit.stderr
+    slurm_id = (jobdir / "jobid").read_text().strip()
+
+    attach_env = dict(env)
+    attach_env["COMPUTEMCP_WAIT_SECONDS"] = "1"
+    for native in ("SUSPENDED", "COMPLETING", "STOPPED"):
+        queue = json.loads(fake_slurm_env.queue_path.read_text(encoding="utf-8"))
+        queue["jobs"][slurm_id]["state"] = native
+        fake_slurm_env.queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+        observed = _run_provision(env, workdir, "observe", "agree")
+        assert observed.returncode == 0, observed.stderr
+        assert "STATE starting" in observed.stdout, (native, observed.stdout)
+
+        attached = _run_provision(attach_env, workdir, "attach", "agree")
+        assert attached.returncode != 0, (native, attached.stderr)
+        combined = (attached.stdout + attached.stderr).lower()
+        assert "timed out" in combined, (native, combined)
+        assert "is terminal" not in combined, (native, combined)
+
+
+def test_slurm_docker_port_zero_uses_published_host_port(tmp_path, stubs):
+    """Slurm+Docker: port 0 resolves to the concrete published host port.
+
+    Restriction: the request is 0 ("ephemeral"), so the readiness check and the
+    relay must dial the host port Docker published, never 0 and never the
+    in-container 2222.
+    """
+    published = _free_port()
+    forward = _free_port()
+    workdir = tmp_path / "portzero"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    state_dir = storage / "portzero" / "state" / "jobs" / "default"
+
+    env = _base_env("portzero", storage, 0)
+    env["COMPUTEMCP_CONTAINER_PORT"] = "0"
+    env["COMPUTEMCP_FORWARD_PORT"] = str(forward)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(published)
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["SLURM_JOB_OUT"] = str(workdir / "slurm-job.out")
+    env["SLURM_JOBID_FILE"] = str(state_dir / "jobid")
+    env["PATH"] = stubs.slurm.shell_path
+
+    result = subprocess.run(
+        ["bash", str(PROVISION), "provision"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=workdir,
+    )
+    job_pid_file = Path(env["SLURM_JOB_OUT"] + ".pid")
+
+    def teardown():
+        if job_pid_file.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(job_pid_file.read_text().strip()), 15)
+        _cleanup()
+
+    try:
+        assert result.returncode == 0, (
+            f"provision exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert (state_dir / "container.port").read_text().strip() == str(
+            published
+        )
+        endpoint_line = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("ENDPOINT")
+        )
+        assert endpoint_line.strip() == f"ENDPOINT 127.0.0.1:{forward}"
+        slurm_log = (workdir / "slurm.log").read_text()
+        assert f"--connect {published}" in slurm_log, slurm_log
+        assert "--connect 0" not in slurm_log, slurm_log
+        assert "--connect 2222" not in slurm_log, slurm_log
+    finally:
+        teardown()

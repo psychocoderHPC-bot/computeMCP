@@ -9,9 +9,11 @@ import pytest
 from compute_mcp.config import SSHConfig, TargetConfig, TransportConfig
 from compute_mcp.ssh_backend import SSHError, make_factor_prompter
 from compute_mcp.tunnel import (
+    JobRouteTunnel,
     TunnelError,
     TunnelManager,
     allocate_loopback_port,
+    mux_helper_argv,
     probe,
 )
 
@@ -1535,3 +1537,91 @@ async def test_route_tunnel_drain_aborts_a_channel_that_never_closes(monkeypatch
     assert channel.waited is True
     assert listener.closed is True
     assert conn.closed is False
+
+
+# ---------------------------------------------------------------------------
+# Job-scoped single-channel mux route (T5)
+# ---------------------------------------------------------------------------
+
+def test_mux_helper_argv_points_at_the_deployed_helper():
+    target = make_target("t", ("route",))
+    argv = mux_helper_argv(target, "/home/agent/cfg", "/home/agent/reg.json")
+    assert argv == (
+        "python3",
+        "/home/agent/cfg/computemcp-mux.py",
+        "--registry",
+        "/home/agent/reg.json",
+    )
+
+
+async def test_open_job_route_reuses_supplied_connection(monkeypatch):
+    """A supplied authenticated route is never redialed or provisioned again."""
+    target = make_target("t", ("route",))
+    conn = _FakeConn(("login", 22))
+    started = []
+
+    class FakeMux:
+        def __init__(self, connection, helper_argv, **kwargs):
+            started.append((connection, tuple(helper_argv)))
+            self.closed = False
+            self.connection = connection
+
+        async def start(self):
+            return 1
+
+        def is_alive(self):
+            return True
+
+        async def close(self):
+            self.closed = True
+
+    async def fail_dial(*args, **kwargs):
+        raise AssertionError("open_job_route must not redial a supplied connection")
+
+    monkeypatch.setattr("compute_mcp.tunnel.RouteMuxTransport", FakeMux)
+    monkeypatch.setattr("compute_mcp.tunnel._resolve_route", fail_dial)
+    mgr = TunnelManager(SSHConfig())
+    tunnel = await mgr.open_job_route(
+        target,
+        "route",
+        helper_argv=("python3", "/x/computemcp-mux.py"),
+        generation=4,
+        connection=conn,
+        provision=False,
+    )
+    assert isinstance(tunnel, JobRouteTunnel)
+    assert tunnel.connection is conn
+    assert tunnel.generation == 4
+    assert tunnel.is_current(4)
+    assert not tunnel.is_current(5)
+    assert started == [(conn, ("python3", "/x/computemcp-mux.py"))]
+
+
+async def test_job_route_stop_closes_transport_and_keeps_by_default_route():
+    target = make_target("t", ("route",))
+    conn = _FakeConn(("login", 22))
+    closed = []
+
+    class FakeMux:
+        def __init__(self, connection, helper_argv, **kwargs):
+            self.connection = connection
+
+        async def close(self):
+            closed.append("mux")
+
+        def is_alive(self):
+            return True
+
+    tunnel = JobRouteTunnel(
+        target=target,
+        route="route",
+        connection=conn,
+        mux=FakeMux(conn, ("h",)),
+        generation=1,
+    )
+    await tunnel.close_transport()
+    assert closed == ["mux"]
+    assert conn.is_closed() is False
+    await tunnel.stop()
+    assert closed == ["mux", "mux"]
+    assert conn.is_closed() is True
